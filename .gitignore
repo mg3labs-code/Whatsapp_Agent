@@ -1,0 +1,45 @@
+# ── Secrets & local Python (never commit / deploy) ──
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ── Local DB & test output ──
+test.db
+*.sqlite3
+test-results.txt
+
+# ── Cursor / AI dev (local only — not production app) ──
+.cursorrules
+CURSOR_PROMPTS.md
+HOW_TO_USE_CURSOR.md
+.cursor/
+
+# ── Client raw data (PDF/DOCX/XLSX stay local; run scripts/ → Pinecone/Postgres) ──
+data/
+*.pdf
+*.docx
+*.xlsx
+
+# ── Generated FAQ ingest outputs (rebuilt by scripts/normalize_chunks + faq_ingest) ──
+docs/faq_chunks.json
+docs/_faq_ingest_state.json
+
+# ── Dev / build docs (keep in repo: docs/AGENTS.md, docs/ARCHITECTURE.md) ──
+docs/SCENARIOS.md
+docs/PRODUCT_IMPORT.md
+
+# ── Private scratch scripts only (extract_*, normalize_chunks, probe_faq, etc. stay in git) ──
+scripts/_*.py
+scripts/write_integration_results.py
+
+# ── OS ──
+.DS_Store
+Thumbs.db
