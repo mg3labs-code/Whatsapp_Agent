@@ -1,12 +1,10 @@
 import logging
-import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from app.db.database import create_tables, engine
-from app.db.migrate import is_railway_production, run_alembic_upgrade_head
+from app.db.database import engine
 from app.utils.tracing import flush_langfuse
 from app.webhook.router import webhook_router
 
@@ -19,11 +17,8 @@ app = FastAPI(title="WASA - WhatsApp AI Sales Agent", version="1.0.0")
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    """Verify DB connectivity. Run schema migrations manually (alembic upgrade head)."""
     try:
-        if is_railway_production():
-            run_alembic_upgrade_head()
-        else:
-            create_tables()
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         logger.info("DB connected")
