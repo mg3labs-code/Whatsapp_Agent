@@ -101,7 +101,7 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
 
 @pytest.mark.asyncio
 async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
-    async def fake_run(message: str, phone: str = "") -> str:
+    async def fake_run(message: str, phone: str = "", session: dict | None = None) -> str:
         assert message == "what documents"
         assert phone == "+1"
         return "FAQ_REPLY"
@@ -160,6 +160,34 @@ async def test_order_agent_node_updates_session(monkeypatch):
     assert out["session"]["order_state"] == "COLLECT_QTY"
     assert out["session"]["phone"] == "+91999"
     assert closed == ["gen_finally"]
+
+
+def test_route_after_qualify_mid_flow_goes_to_send_reply():
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "Kenya",
+        "message_id": "x",
+        "session": {"qual_state": "COLLECT_COUNTRY"},
+        "intent": None,
+        "agent_response": "And which country?",
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    assert graph_mod._route_after_qualify(state) == "send_reply"
+
+
+def test_route_after_qualify_complete_routes_to_pending_agent():
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "no",
+        "message_id": "x",
+        "session": {"lead_qualified": True},
+        "intent": "faq",
+        "agent_response": "Thank you!",
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    assert graph_mod._route_after_qualify(state) == "faq"
 
 
 @pytest.mark.asyncio
@@ -229,6 +257,15 @@ def graph_order_db():
 @pytest.mark.asyncio
 async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db):
     """docs/AGENTS.md Scenario B — order flow through compiled_graph + Redis session."""
+    from app.agents import router as router_mod
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("order", 0.9)),
+    )
     phone = "+919876543210"
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
@@ -258,10 +295,12 @@ async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db
         ("m2", "Metformin 500mg"),
         ("m3", "0"),
         ("m4", "2000"),
-        ("m5", "Kenya"),
-        ("m6", "Nairobi"),
-        ("m7", "Priya Sharma, MedEx"),
-        ("m8", "T/T advance"),
+        ("m5", "done"),
+        ("m6", "Kenya"),
+        ("m7", "Nairobi"),
+        ("m8", "Priya Sharma, MedEx"),
+        ("m9", "T/T advance"),
+        ("m10", "confirm"),
     ]
 
     for mid, text in turns:
@@ -278,7 +317,7 @@ async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db
             }
         )
 
-    assert len(sent) == 8
+    assert len(sent) == 10
     final_reply = sent[-1][1].lower()
     assert "order confirmed" in final_reply
     assert "ord-" in final_reply

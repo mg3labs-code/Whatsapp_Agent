@@ -54,24 +54,23 @@ Context: {context}
 ---
 
 ## AGENT 3: ORDER COLLECTION AGENT (app/agents/order.py)
-Model: None — pure rule-based state machine
-Session keys used: order_state, order_sku, order_product_name,
-                   order_qty, order_country, order_city, order_contact, order_payment
+Model: GPT-4o-mini + function tools (rule-based fallback if `OPENAI_API_KEY` missing)
+Session keys used: order_state, order_cart (list of lines), order_sku/order_product_name/order_moq
+                   (while adding a line), order_country, order_city, order_contact, order_payment
 
 ### State Machine (COLLECT IN EXACT ORDER)
 ```
+COLLECT_SKU → COLLECT_QTY → CART_MENU (repeat add / edit / remove / qty commands)
+  CART_MENU: *add* another product | *done* checkout | *edit* | *remove 2* | *qty 1 500*
+
 COLLECT_SKU
-  Question: "I'll help you place your order! Which product would you like? (name or SKU)"
+  Question: "I'll help you place your order! Which product would you like to add? (name or SKU)"
   Validate: product exists in DB (fuzzy search)
-  On invalid: "I couldn't find that product. Could you try the full product name or SKU?"
-  On valid: save sku, product_name → advance to COLLECT_QTY
+  On valid: save pending line → COLLECT_QTY
 
 COLLECT_QTY
   Question: "How many units of {product_name}?"
-  Validate: is_integer AND qty > 0
-  On invalid qty: "Please enter a positive whole number of units."
-  On invalid format: "Please enter a number (e.g., 1000 or 5000)."
-  On valid: save qty → advance to COLLECT_COUNTRY
+  On valid: append/merge into order_cart → CART_MENU
 
 COLLECT_COUNTRY
   Question: "Which country should we ship to?"
@@ -91,15 +90,17 @@ COLLECT_CONTACT
 
 COLLECT_PAYMENT
   Question: "Preferred payment terms? (T/T Advance, Letter of Credit, or 30-day net)"
-  Validate: any non-empty response accepted
-  On valid: save payment_terms → ORDER_COMPLETE
+  On valid: save payment_terms → CONFIRM_ORDER (review summary)
 
-ORDER_COMPLETE
-  1. Generate: order_ref = f"ORD-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000,9999)}"
-  2. Write Order to DB
-  3. Call send_order_alert(order_dict) via Slack integration
-  4. Clear all order_* keys from session
-  5. Return confirmation:
+CONFIRM_ORDER
+  Show full cart + shipping + payment. User must reply *CONFIRM* (or yes/ok).
+  *edit* returns to CART_MENU. On CONFIRM → commit.
+
+ORDER_COMPLETE / commit
+  1. order_ref = ORD-YYYYMMDD-####; one DB row per cart line (order_ref-L01, L02, …)
+  2. Write Order rows + send_order_alert (all lines)
+  3. Clear order_* session keys
+  4. Return confirmation:
      "✅ *Order Confirmed!*
      📋 *Order Summary:*
      • Product: {product_name}

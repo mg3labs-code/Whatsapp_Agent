@@ -40,13 +40,43 @@ async def test_unqualified_order_routes_to_qualify(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_qualified_low_confidence_escalates(monkeypatch):
+async def test_unqualified_faq_routes_to_qualify(monkeypatch):
     monkeypatch.setattr(
         router_mod,
         "_classify_with_llm",
-        AsyncMock(return_value=("faq", 0.5)),
+        AsyncMock(return_value=("faq", 0.9)),
     )
-    intent, _ = await router_mod.classify_intent("something vague", {"lead_qualified": True})
+    intent, session = await router_mod.classify_intent("i need medicines", {})
+    assert intent == "qualify"
+    assert session["pending_intent"] == "faq"
+
+
+@pytest.mark.asyncio
+async def test_qualified_low_confidence_retries_faq_first(monkeypatch):
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("faq", 0.35)),
+    )
+    intent, session = await router_mod.classify_intent(
+        "something vague",
+        {"lead_qualified": True},
+    )
+    assert intent == "faq"
+    assert session["clarification_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_qualified_low_confidence_escalates_after_retries(monkeypatch):
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("faq", 0.35)),
+    )
+    intent, _ = await router_mod.classify_intent(
+        "something vague",
+        {"lead_qualified": True, "clarification_attempts": 1},
+    )
     assert intent == "escalate"
 
 
@@ -68,8 +98,9 @@ async def test_qualified_high_confidence_returns_intent(monkeypatch):
 @pytest.mark.asyncio
 async def test_keyword_fallback_when_no_api_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    intent, _ = await router_mod.classify_intent("what documents do you provide", {})
-    assert intent == "faq"
+    intent, session = await router_mod.classify_intent("what documents do you provide", {})
+    assert intent == "qualify"
+    assert session["pending_intent"] == "faq"
 
 
 def test_parse_classifier_response_valid():

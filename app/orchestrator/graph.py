@@ -2,7 +2,8 @@
 
 Wires up the full message pipeline per .cursorrules:
     load_session
-      -> pre_guardrails
+      -> ai_disclosure
+        -> pre_guardrails
         -> (blocked) send_reply -> END
         -> (ok) router
              -> (human_active) human_active -> END
@@ -33,6 +34,7 @@ from app.guardrails.check import (
     log_guardrail,
 )
 from app.integrations.whatsapp import send_message
+from app.messages.welcome import prepend_ai_disclosure
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
 
@@ -61,6 +63,14 @@ async def load_session_node(state: MessageState) -> dict:
     session = await get_session(state["phone"])
     session = enrich_session_from_message(session, state.get("message") or "")
     session["phone"] = state["phone"]
+    return {"session": session}
+
+
+async def ai_disclosure_node(state: MessageState) -> dict:
+    """First-turn pipeline step: disclosure is prepended once at send_reply."""
+    session = dict(state.get("session") or {})
+    if state.get("phone") and not session.get("phone"):
+        session["phone"] = state["phone"]
     return {"session": session}
 
 
@@ -99,6 +109,13 @@ async def router_node(state: MessageState) -> dict:
     return {"intent": intent, "session": session}
 
 
+def _merge_prior_reply(state: MessageState, new_reply: str) -> str:
+    prior = (state.get("agent_response") or "").strip()
+    if not prior:
+        return new_reply
+    return f"{prior}\n\n{new_reply}"
+
+
 async def pricing_agent_node(state: MessageState) -> dict:
     gen = _get_db_generator()
     db = next(gen)
@@ -111,7 +128,7 @@ async def pricing_agent_node(state: MessageState) -> dict:
             session,
             db,
         )
-        return {"agent_response": reply}
+        return {"agent_response": _merge_prior_reply(state, reply)}
     finally:
         gen.close()
 
@@ -120,8 +137,9 @@ async def faq_agent_node(state: MessageState) -> dict:
     reply = await run_faq_agent(
         state["message"],
         phone=state.get("phone") or "",
+        session=state.get("session") or {},
     )
-    return {"agent_response": reply}
+    return {"agent_response": _merge_prior_reply(state, reply)}
 
 
 async def order_agent_node(state: MessageState) -> dict:
@@ -136,7 +154,10 @@ async def order_agent_node(state: MessageState) -> dict:
             session,
             db,
         )
-        return {"agent_response": reply, "session": updated_session}
+        return {
+            "agent_response": _merge_prior_reply(state, reply),
+            "session": updated_session,
+        }
     finally:
         gen.close()
 
@@ -180,7 +201,10 @@ async def escalation_agent_node(state: MessageState) -> dict:
         _escalation_reason(state),
         phone=state.get("phone") or "",
     )
-    return {"agent_response": reply, "session": updated_session}
+    return {
+        "agent_response": _merge_prior_reply(state, reply),
+        "session": updated_session,
+    }
 
 
 async def human_active_node(state: MessageState) -> dict:
@@ -211,25 +235,34 @@ async def post_guardrails_node(state: MessageState) -> dict:
 async def send_reply_node(state: MessageState) -> dict:
     phone = state["phone"]
     final_reply = state.get("final_reply")
+    session = dict(state.get("session") or {})
 
     if final_reply:
+        final_reply, session = prepend_ai_disclosure(final_reply, session)
         try:
             await send_message(phone, final_reply)
         except Exception:
             logger.exception("send_message failed user_ref=%s", user_ref(phone))
 
     try:
-        await save_session(phone, state.get("session") or {})
+        await save_session(phone, session)
     except Exception:
         logger.exception("save_session failed user_ref=%s", user_ref(phone))
 
-    return {}
+    return {"session": session}
 
 
 def _route_after_pre_guardrails(state: MessageState) -> str:
     if state.get("guardrail_blocked"):
         return "send_reply"
     return "router"
+
+
+def _route_after_qualify(state: MessageState) -> str:
+    intent = state.get("intent")
+    if intent in {"pricing", "faq", "order", "escalate"}:
+        return intent
+    return "send_reply"
 
 
 def _route_to_agent(state: MessageState) -> str:
@@ -250,6 +283,7 @@ def _build_graph():
     graph = StateGraph(MessageState)
 
     graph.add_node("load_session", load_session_node)
+    graph.add_node("ai_disclosure", ai_disclosure_node)
     graph.add_node("pre_guardrails", pre_guardrails_node)
     graph.add_node("router", router_node)
     graph.add_node("pricing_agent", pricing_agent_node)
@@ -262,7 +296,8 @@ def _build_graph():
     graph.add_node("send_reply", send_reply_node)
 
     graph.set_entry_point("load_session")
-    graph.add_edge("load_session", "pre_guardrails")
+    graph.add_edge("load_session", "ai_disclosure")
+    graph.add_edge("ai_disclosure", "pre_guardrails")
 
     graph.add_conditional_edges(
         "pre_guardrails",
@@ -284,13 +319,19 @@ def _build_graph():
         },
     )
 
-    for agent_node in (
-        "pricing_agent",
-        "faq_agent",
-        "order_agent",
+    graph.add_conditional_edges(
         "qualify_agent",
-        "escalation_agent",
-    ):
+        _route_after_qualify,
+        {
+            "send_reply": "post_guardrails",
+            "pricing": "pricing_agent",
+            "faq": "faq_agent",
+            "order": "order_agent",
+            "escalate": "escalation_agent",
+        },
+    )
+
+    for agent_node in ("pricing_agent", "faq_agent", "order_agent", "escalation_agent"):
         graph.add_edge(agent_node, "post_guardrails")
 
     graph.add_edge("post_guardrails", "send_reply")

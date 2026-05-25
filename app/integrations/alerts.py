@@ -101,11 +101,22 @@ async def send_escalation_alert(phone: str, session: dict, reason: str) -> bool:
 
 async def send_order_alert(order: dict) -> bool:
     order = order or {}
+    lines = order.get("lines")
+    if lines:
+        product_block = "\n".join(
+            f"• {line.get('product_name', 'N/A')} — {line.get('quantity', 'N/A')} "
+            f"({line.get('sku', '')})"
+            for line in lines
+        )
+    else:
+        product_block = (
+            f"Product: {order.get('product_name', 'N/A')}\n"
+            f"Qty: {order.get('quantity', 'N/A')}"
+        )
     message = (
         "📦 *NEW ORDER*\n"
         f"Ref: {order.get('order_ref', 'N/A')}\n"
-        f"Product: {order.get('product_name', 'N/A')}\n"
-        f"Qty: {order.get('quantity', 'N/A')}\n"
+        f"{product_block}\n"
         f"Ship to: {order.get('city', '')}, {order.get('country', '')}\n"
         f"Contact: {order.get('contact_name', 'N/A')}\n"
         f"Phone: {order.get('phone', 'N/A')}"

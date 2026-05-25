@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,10 +17,14 @@ from app.agents.faq import (
     run_faq_agent,
 )
 from app.agents.order import (
+    CART_MENU,
     COLLECT_CITY,
     COLLECT_COUNTRY,
     COLLECT_QTY,
+    COLLECT_SKU,
+    CONFIRM_ORDER,
     SANCTIONED_COUNTRY_REFUSAL,
+    _resolve_product_row,
     run_order_agent,
 )
 from app.agents.pricing import get_product_by_name, run_pricing_agent
@@ -258,7 +263,7 @@ async def test_faq_agent_no_context(monkeypatch):
         patch("pinecone.Pinecone", return_value=mock_pc_instance),
         patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
     ):
-        out = await run_faq_agent("Any question")
+        out = await run_faq_agent("Any question", session={"lead_qualified": True})
 
     assert "connect you" in out.lower()
     assert out == NO_CONTEXT_REPLY
@@ -334,7 +339,9 @@ def order_db():
 
 
 @pytest.mark.asyncio
-async def test_order_agent_multi_turn_flow(order_db):
+async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     session = {"phone": "+919876543210"}
 
     reply, session = await run_order_agent("I want to order", session, order_db)
@@ -350,8 +357,12 @@ async def test_order_agent_multi_turn_flow(order_db):
     assert "minimum" in reply.lower() or "number" in reply.lower()
 
     reply, session = await run_order_agent("2000", session, order_db)
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 1
+    assert session["order_cart"][0]["quantity"] == 2000
+
+    reply, session = await run_order_agent("done", session, order_db)
     assert session["order_state"] == COLLECT_COUNTRY
-    assert session["order_qty"] == 2000
 
     reply, session = await run_order_agent("Kenya", session, order_db)
     assert session["order_state"] == COLLECT_CITY
@@ -364,6 +375,10 @@ async def test_order_agent_multi_turn_flow(order_db):
     assert "payment terms" in reply.lower()
 
     reply, session = await run_order_agent("T/T Advance", session, order_db)
+    assert session["order_state"] == CONFIRM_ORDER
+    assert "review" in reply.lower() or "confirm" in reply.lower()
+
+    reply, session = await run_order_agent("confirm", session, order_db)
     assert "order confirmed" in reply.lower()
     assert "ORD-" in reply
     assert "order_state" not in session
@@ -377,13 +392,155 @@ async def test_order_agent_multi_turn_flow(order_db):
 
 
 @pytest.mark.asyncio
-async def test_order_agent_sanctioned_country_resets_state(order_db):
+async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    db = order_db
+    db.add(
+        Product(
+            product_name="Amoxicillin 500mg",
+            salt_name="Amoxicillin",
+            manufacturing_company="Beta Pharma",
+            expiry_date=date(2027, 6, 1),
+            price_per_strip=1.10,
+            is_restricted=False,
+        )
+    )
+    db.commit()
+
+    session = {"phone": "+919876543211"}
+
+    await run_order_agent("I want to order", session, db)
+    _, session = await run_order_agent("Metformin 500mg", session, db)
+    _, session = await run_order_agent("1000", session, db)
+    assert session["order_state"] == CART_MENU
+
+    _, session = await run_order_agent("add", session, db)
+    _, session = await run_order_agent("Amoxicillin 500mg", session, db)
+    _, session = await run_order_agent("500", session, db)
+    assert len(session["order_cart"]) == 2
+
+    _, session = await run_order_agent("qty 2 600", session, db)
+    assert session["order_cart"][1]["quantity"] == 600
+
+    _, session = await run_order_agent("done", session, db)
+    _, session = await run_order_agent("Kenya", session, db)
+    _, session = await run_order_agent("Nairobi", session, db)
+    _, session = await run_order_agent("Jane Doe, PharmaCo", session, db)
+    reply, session = await run_order_agent("LC", session, db)
+    assert session["order_state"] == CONFIRM_ORDER
+
+    reply, session = await run_order_agent("yes", session, db)
+    assert "order confirmed" in reply.lower()
+    orders = db.query(Order).all()
+    assert len(orders) == 2
+    bases = {o.order_ref.rsplit("-L", 1)[0] for o in orders}
+    assert len(bases) == 1
+
+
+@pytest.mark.asyncio
+async def test_order_agent_payment_does_not_commit_without_confirm(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    session = {"phone": "+1"}
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg", session, order_db)
+    await run_order_agent("100", session, order_db)
+    await run_order_agent("done", session, order_db)
+    await run_order_agent("Kenya", session, order_db)
+    await run_order_agent("Nairobi", session, order_db)
+    await run_order_agent("Contact Name", session, order_db)
+    await run_order_agent("T/T", session, order_db)
+    assert order_db.query(Order).count() == 0
+
+
+def test_resolve_product_from_natural_language_sentence(order_db):
+    product, error = _resolve_product_row(
+        "I need 2000 units of metformin 500mg please",
+        order_db,
+    )
+    assert error is None
+    assert product is not None
+    assert "Metformin" in product.product_name
+
+
+@pytest.mark.asyncio
+async def test_order_agent_llm_add_product_natural_language(order_db, monkeypatch):
+    """LLM extracts product + quantity from one message."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
+
+    call_count = {"n": 0}
+
+    async def fake_create(*_args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] > 1:
+            response = MagicMock()
+            response.choices = [
+                MagicMock(
+                    message=MagicMock(
+                        content="Added *Metformin 500mg* — *2000* units to your cart.",
+                        tool_calls=None,
+                    )
+                )
+            ]
+            return response
+
+        tool_fn = MagicMock()
+        tool_fn.name = "add_to_cart"
+        tool_fn.arguments = json.dumps(
+            {"product_query": "metformin 500mg", "quantity": 2000}
+        )
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = tool_fn
+
+        response = MagicMock()
+        response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content=None,
+                    tool_calls=[tool_call],
+                )
+            )
+        ]
+        return response
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = fake_create
+    monkeypatch.setattr(
+        "app.agents.order.get_async_openai_client",
+        lambda **_: mock_client,
+    )
+
+    session = {"phone": "+1", "order_state": COLLECT_SKU}
+    reply, session = await run_order_agent(
+        "I need 2000 units of metformin 500mg",
+        session,
+        order_db,
+    )
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 1
+    assert session["order_cart"][0]["quantity"] == 2000
+    assert "Metformin" in session["order_cart"][0]["product_name"]
+    assert "2000" in reply or "cart" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_order_agent_sanctioned_country_resets_state(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     session = {
         "phone": "+1",
         "order_state": "COLLECT_COUNTRY",
-        "order_sku": "PROD-0001",
-        "order_product_name": "Metformin 500mg",
-        "order_qty": 100,
+        "order_cart": [
+            {
+                "sku": "PROD-0001",
+                "product_name": "Metformin 500mg",
+                "quantity": 100,
+                "moq": 1,
+            }
+        ],
     }
 
     reply, session = await run_order_agent("Iran", session, order_db)
@@ -465,6 +622,43 @@ def test_calculate_lead_score_compat_wrapper():
         "order_value_usd": 30,
     }
     assert calculate_lead_score(session) == score_lead(session).score
+
+
+@pytest.mark.asyncio
+async def test_qualification_rejects_generic_hi_as_company(qual_db):
+    session = {"phone": "+15550003333"}
+
+    reply, session, intent = await run_qualification_agent("hi", session, qual_db)
+
+    assert intent == "continue_qual"
+    assert "company" not in session
+    assert "welcome" in reply.lower() or "company" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_faq_agent_no_context_unqualified_prompts_qualification(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+
+    mock_index = MagicMock()
+    mock_index.query.return_value = MagicMock(matches=[])
+    mock_pc_instance = MagicMock()
+    mock_pc_instance.Index.return_value = mock_index
+
+    mock_emb = MagicMock()
+    mock_emb.data = [MagicMock(embedding=[0.01] * 8)]
+
+    mock_client = MagicMock()
+    mock_client.embeddings.create = AsyncMock(return_value=mock_emb)
+
+    with (
+        patch("pinecone.Pinecone", return_value=mock_pc_instance),
+        patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
+    ):
+        out = await run_faq_agent("i need medicines", session={})
+
+    assert "quick details" in out.lower()
+    assert "connect you" not in out.lower()
 
 
 @pytest.mark.asyncio

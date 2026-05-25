@@ -16,6 +16,7 @@ from app.guardrails.check import (
     check_pre_guardrails,
     log_guardrail,
 )
+from app.messages.welcome import AI_DISCLOSURE_MESSAGE
 from app.orchestrator import graph as graph_mod
 
 
@@ -184,6 +185,10 @@ def test_route_to_agent_human_active_silent_drop():
 
 @pytest.mark.asyncio
 async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
+    import fakeredis
+
+    from app.session import manager as session_manager
+
     sent: list[str] = []
 
     async def capture_send(phone: str, text: str) -> bool:
@@ -193,13 +198,15 @@ async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
     async def fail_classify(*_args, **_kwargs):
         raise AssertionError("router should not run when pre-guardrail blocks")
 
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(graph_mod, "send_message", capture_send)
     monkeypatch.setattr(graph_mod, "classify_intent", fail_classify)
     monkeypatch.setattr(graph_mod, "log_guardrail", AsyncMock())
 
     await graph_mod.compiled_graph.ainvoke(
         {
-            "phone": "+91999",
+            "phone": "+91999111",
             "message": "price for ketamine",
             "message_id": "m1",
             "session": {},
@@ -211,4 +218,5 @@ async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
     )
 
     assert len(sent) == 1
-    assert sent[0] == REFUSAL_RESTRICTED_PRODUCT
+    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in sent[0]
+    assert REFUSAL_RESTRICTED_PRODUCT in sent[0]

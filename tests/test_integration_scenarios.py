@@ -15,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from app.agents import escalation as escalation_mod
 from app.agents import router as router_mod
 from app.agents.faq import NO_CONTEXT_REPLY, run_faq_agent
+from app.messages.welcome import AI_DISCLOSURE_MESSAGE
 from app.agents.lead_scoring import score_lead
 from app.agents.qualification import run_qualification_agent
 from app.business import hours as business_hours
@@ -146,22 +147,34 @@ async def test_scenario_a_new_buyer_price_goes_to_qualify(graph_env, monkeypatch
     await _invoke(PHONE, "Hi, I need price for Amoxicillin 500mg", "a1", graph_env)
     session = await session_manager.get_session(PHONE)
     assert session.get("qual_state") or session.get("pending_intent") == "pricing"
-    reply = graph_env["sent_buyer"][-1].lower()
-    assert "company" in reply or "welcome" in reply or "country" in reply
+    assert session.get("ai_disclosure_sent") is True
+    reply = graph_env["sent_buyer"][-1]
+    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in reply
+    reply_lower = reply.lower()
+    assert "company" in reply_lower or "welcome" in reply_lower or "country" in reply_lower
 
 
 @pytest.mark.asyncio
-async def test_scenario_b_multi_turn_order(graph_env):
+async def test_scenario_b_multi_turn_order(graph_env, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("order", 0.9)),
+    )
     await session_manager.save_session(PHONE, {"lead_qualified": True})
     turns = [
         ("b1", "I want to order"),
         ("b2", "Metformin 500mg"),
         ("b3", "0"),
         ("b4", "2000"),
-        ("b5", "Kenya"),
-        ("b6", "Nairobi"),
-        ("b7", "Priya Sharma, MedEx"),
-        ("b8", "T/T advance"),
+        ("b5", "done"),
+        ("b6", "Kenya"),
+        ("b7", "Nairobi"),
+        ("b8", "Priya Sharma, MedEx"),
+        ("b9", "T/T advance"),
+        ("b10", "confirm"),
     ]
     for mid, text in turns:
         await _invoke(PHONE, text, mid, graph_env)
@@ -221,7 +234,9 @@ async def test_scenario_d_faq_returns_answer(graph_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_scenario_e_schedule_h_blocked(graph_env, integration_db):
     await _invoke(PHONE, "Do you sell Schedule H products?", "e1", graph_env)
-    assert graph_env["sent_buyer"][-1] == REFUSAL_RESTRICTED_PRODUCT
+    reply = graph_env["sent_buyer"][-1]
+    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in reply
+    assert REFUSAL_RESTRICTED_PRODUCT in reply
     logs = integration_db.query(GuardrailLog).all()
     assert len(logs) >= 1
     assert logs[-1].reason == "restricted_product"
@@ -287,7 +302,9 @@ async def test_scenario_10_unqualified_price_qualify_first(graph_env, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_scenario_11_order_resume_mid_flow(graph_env):
+async def test_scenario_11_order_resume_mid_flow(graph_env, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     await session_manager.save_session(
         PHONE,
         {
@@ -300,7 +317,7 @@ async def test_scenario_11_order_resume_mid_flow(graph_env):
     )
     await _invoke(PHONE, "2000", "s11", graph_env)
     session = await session_manager.get_session(PHONE)
-    assert session.get("order_state") == "COLLECT_COUNTRY" or session.get("order_qty") == 2000
+    assert session.get("order_state") == "CART_MENU" or session.get("order_cart")
 
 
 def test_scenario_12_hospital_uk_2m_hot_score():
@@ -352,7 +369,10 @@ async def test_scenario_13_faq_empty_pinecone_team_message(monkeypatch):
             "app.agents.faq._pinecone_query_sync",
             return_value=mock_query,
         ):
-            reply = await run_faq_agent("obscure regulatory question xyz123")
+            reply = await run_faq_agent(
+                "obscure regulatory question xyz123",
+                session={"lead_qualified": True},
+            )
     assert reply == NO_CONTEXT_REPLY
     assert "team" in reply.lower()
     mock_client.chat.completions.create.assert_not_called()

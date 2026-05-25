@@ -31,6 +31,26 @@ QUAL_COMPLETE = "QUAL_COMPLETE"
 
 CONTINUE_QUAL = "continue_qual"
 
+_GENERIC_WORDS = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+    "sure",
+    "thanks",
+    "thank you",
+    "pls",
+    "please",
+    "good",
+    "fine",
+    "noted",
+    "k",
+    "kk",
+})
+
 HOT_LEAD_MIN_SCORE = 80
 
 _NO_LICENSE_PHRASES = (
@@ -160,12 +180,16 @@ async def run_qualification_agent(
     return _prompt_collect_company(), session, CONTINUE_QUAL
 
 
+def _is_generic_reply(text: str) -> bool:
+    return (text or "").lower().strip() in _GENERIC_WORDS
+
+
 def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
-    if not text:
+    if not text or _is_generic_reply(text):
         return _prompt_collect_company(), session, CONTINUE_QUAL
 
     company = _extract_company(text)
-    if len(company) < 2:
+    if len(company) < 3:
         return (
             "Please share your company name so we can continue.",
             session,
@@ -179,7 +203,7 @@ def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
 
 def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
     country = text.strip()
-    if not country:
+    if not country or _is_generic_reply(text):
         return "And which country are you based in?", session, CONTINUE_QUAL
 
     if is_shipment_excluded_country(country):
@@ -196,7 +220,7 @@ def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
 
 
 def _handle_collect_biz_type(text: str, session: dict) -> tuple[str, dict, str]:
-    if not text.strip():
+    if not text.strip() or _is_generic_reply(text):
         return (
             "What type of business are you? (distributor, pharmacy/clinic, doctor, "
             "or independent buyer)",

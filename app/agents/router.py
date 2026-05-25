@@ -15,7 +15,8 @@ from app.utils.tracing import get_async_openai_client, set_span_io
 logger = logging.getLogger(__name__)
 
 CLASSIFIER_MODEL = "gpt-4o-mini"
-CONFIDENCE_ESCALATE_THRESHOLD = 0.65
+CONFIDENCE_ESCALATE_THRESHOLD = 0.40
+CLARIFICATION_ATTEMPTS_BEFORE_ESCALATE = 2
 
 VALID_INTENTS = frozenset({"pricing", "faq", "order", "qualify", "escalate"})
 
@@ -145,13 +146,21 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
         return "escalate", session
 
     phone = session.get("phone") or ""
+
+    if not session.get("lead_qualified"):
+        intent, _ = await _classify_with_llm(message, phone=phone)
+        if intent != "escalate":
+            session["pending_intent"] = intent
+            return "qualify", session
+
     intent, confidence = await _classify_with_llm(message, phone=phone)
 
-    if not session.get("lead_qualified") and intent in {"pricing", "order"}:
-        session["pending_intent"] = intent
-        return "qualify", session
-
     if confidence < CONFIDENCE_ESCALATE_THRESHOLD and session.get("lead_qualified"):
-        return "escalate", session
+        attempts = session.get("clarification_attempts", 0) + 1
+        session["clarification_attempts"] = attempts
+        if attempts >= CLARIFICATION_ATTEMPTS_BEFORE_ESCALATE:
+            return "escalate", session
+        return "faq", session
 
+    session.pop("clarification_attempts", None)
     return intent, session

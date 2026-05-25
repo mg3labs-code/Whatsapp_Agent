@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response
 from fastapi.responses import PlainTextResponse
@@ -9,8 +11,10 @@ from app.session.manager import _get_redis_client, get_session
 from app.utils.tracing import flush_langfuse, message_trace_context
 from app.webhook.parser import parse_meta_payload
 
-DEDUP_SET_KEY = "wasa:processed_ids"
 DEDUP_TTL_SECONDS = 86400
+LOCK_TTL_SECONDS = 30
+LOCK_RETRY_COUNT = 10
+LOCK_RETRY_DELAY_SECONDS = 0.1
 
 logger = logging.getLogger(__name__)
 
@@ -68,26 +72,35 @@ async def process_message(payload: dict) -> None:
             logger.info("Dropping duplicate message_id=%s", message_id)
             return
 
-        session = await get_session(phone)
+        lock_key = f"wasa:lock:{phone}"
+        async with _phone_lock(lock_key, ttl=LOCK_TTL_SECONDS) as acquired:
+            if not acquired:
+                logger.warning(
+                    "Could not acquire lock for phone; skipping message_id=%s",
+                    message_id,
+                )
+                return
 
-        state = {
-            "phone": phone,
-            "message": text,
-            "message_id": message_id,
-            "session": session,
-            "intent": None,
-            "agent_response": None,
-            "guardrail_blocked": False,
-            "final_reply": None,
-        }
+            session = await get_session(phone)
 
-        with message_trace_context(
-            trace_name="whatsapp_message",
-            phone=phone,
-            message_id=message_id,
-            feature="orchestrator",
-        ):
-            await compiled_graph.ainvoke(state)
+            state = {
+                "phone": phone,
+                "message": text,
+                "message_id": message_id,
+                "session": session,
+                "intent": None,
+                "agent_response": None,
+                "guardrail_blocked": False,
+                "final_reply": None,
+            }
+
+            with message_trace_context(
+                trace_name="whatsapp_message",
+                phone=phone,
+                message_id=message_id,
+                feature="orchestrator",
+            ):
+                await compiled_graph.ainvoke(state)
     except Exception:
         # SECURITY: log message_id / user_ref only — not message body or raw phone
         logger.exception("Orchestrator processing failed")
@@ -95,23 +108,44 @@ async def process_message(payload: dict) -> None:
         flush_langfuse()
 
 
+def _dedup_key(message_id: str) -> str:
+    return f"wasa:msgid:{message_id}"
+
+
 async def _is_duplicate(message_id: str) -> bool:
-    """Redis-backed dedup against the wasa:processed_ids set.
+    """Atomic dedup via SET NX — one key per message_id with its own TTL.
 
     Meta retries webhook deliveries when it doesn't get a 200 fast enough,
-    so the same message_id can arrive multiple times. We track seen IDs
-    in a single Redis set with a 24h sliding TTL.
+    so the same message_id can arrive multiple times concurrently.
 
     Returns True if message_id was already processed; False (and records it) if new.
     """
     try:
         client = _get_redis_client()
-        already_seen = await client.sismember(DEDUP_SET_KEY, message_id)
-        if already_seen:
-            return True
-        await client.sadd(DEDUP_SET_KEY, message_id)
-        await client.expire(DEDUP_SET_KEY, DEDUP_TTL_SECONDS)
-        return False
+        was_new = await client.set(
+            _dedup_key(message_id),
+            "1",
+            ex=DEDUP_TTL_SECONDS,
+            nx=True,
+        )
+        return was_new is None
     except Exception:
         logger.exception("Dedup check failed for message_id=%s; processing anyway", message_id)
         return False
+
+
+@asynccontextmanager
+async def _phone_lock(key: str, ttl: int = LOCK_TTL_SECONDS):
+    """Per-phone Redis lock — at most one pipeline active per phone at a time."""
+    client = _get_redis_client()
+    acquired = False
+    for _ in range(LOCK_RETRY_COUNT):
+        acquired = await client.set(key, "1", ex=ttl, nx=True)
+        if acquired:
+            break
+        await asyncio.sleep(LOCK_RETRY_DELAY_SECONDS)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            await client.delete(key)
