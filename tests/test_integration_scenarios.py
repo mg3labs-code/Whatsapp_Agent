@@ -90,6 +90,12 @@ def graph_env(monkeypatch, integration_db):
         return True
 
     monkeypatch.setattr(graph_mod, "send_message", capture_buyer)
+    monkeypatch.setattr("app.messages.welcome.send_message", capture_buyer)
+    monkeypatch.setattr(
+        "app.messages.welcome.send_interactive_list",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
     monkeypatch.setattr(alerts_mod, "send_leads_alert", capture_team)
     monkeypatch.setattr(alerts_mod, "send_order_team_alert", capture_team)
 
@@ -117,6 +123,11 @@ def graph_env(monkeypatch, integration_db):
     monkeypatch.setattr(graph_mod, "run_faq_agent", fake_faq)
 
     return {"sent_buyer": sent_buyer, "team_alerts": team_alerts, "redis": fake_redis}
+
+
+def _assert_disclosure_delivered(sent: list[str], session: dict) -> None:
+    assert session.get("greeted") is True
+    assert any("Hi! 👋 I'm the AI assistant for *New Life Medicare*" in msg for msg in sent)
 
 
 async def _invoke(phone: str, text: str, mid: str, graph_env: dict) -> None:
@@ -147,9 +158,8 @@ async def test_scenario_a_new_buyer_price_goes_to_qualify(graph_env, monkeypatch
     await _invoke(PHONE, "Hi, I need price for Amoxicillin 500mg", "a1", graph_env)
     session = await session_manager.get_session(PHONE)
     assert session.get("qual_state") or session.get("pending_intent") == "pricing"
-    assert session.get("ai_disclosure_sent") is True
+    _assert_disclosure_delivered(graph_env["sent_buyer"], session)
     reply = graph_env["sent_buyer"][-1]
-    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in reply
     reply_lower = reply.lower()
     assert "company" in reply_lower or "welcome" in reply_lower or "country" in reply_lower
 
@@ -235,7 +245,8 @@ async def test_scenario_d_faq_returns_answer(graph_env, monkeypatch):
 async def test_scenario_e_schedule_h_blocked(graph_env, integration_db):
     await _invoke(PHONE, "Do you sell Schedule H products?", "e1", graph_env)
     reply = graph_env["sent_buyer"][-1]
-    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in reply
+    session = await session_manager.get_session(PHONE)
+    _assert_disclosure_delivered(graph_env["sent_buyer"], session)
     assert REFUSAL_RESTRICTED_PRODUCT in reply
     logs = integration_db.query(GuardrailLog).all()
     assert len(logs) >= 1

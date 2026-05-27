@@ -80,12 +80,103 @@ META_STATUS_UPDATE_PAYLOAD = {
 }
 
 
+META_BUTTON_REPLY_PAYLOAD = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "id": "1234567890",
+            "changes": [
+                {
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15551234567",
+                            "phone_number_id": "PHONE_NUMBER_ID",
+                        },
+                        "contacts": [
+                            {
+                                "profile": {"name": "Test Buyer"},
+                                "wa_id": "919876543210",
+                            }
+                        ],
+                        "messages": [
+                            {
+                                "from": "919876543210",
+                                "id": "wamid.BUTTON_REPLY_789",
+                                "timestamp": "1715500002",
+                                "type": "interactive",
+                                "interactive": {
+                                    "type": "button_reply",
+                                    "button_reply": {
+                                        "id": "order",
+                                        "title": "Order Medicines",
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+
 def test_parse_text_message():
     result = parse_meta_payload(META_TEXT_MESSAGE_PAYLOAD)
     assert result is not None
     assert result["phone"] == "919876543210"
     assert result["text"] == "Hi, I need price for Amoxicillin 500mg"
     assert result["message_id"] == "wamid.TEST_MSG_ID_123"
+
+
+META_LIST_REPLY_PAYLOAD = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "id": "1234567890",
+            "changes": [
+                {
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "messages": [
+                            {
+                                "from": "919876543210",
+                                "id": "wamid.LIST_REPLY_321",
+                                "timestamp": "1715500003",
+                                "type": "interactive",
+                                "interactive": {
+                                    "type": "list_reply",
+                                    "list_reply": {
+                                        "id": "pricing",
+                                        "title": "Get Pricing",
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+
+def test_parse_list_reply_uses_row_id_as_text():
+    result = parse_meta_payload(META_LIST_REPLY_PAYLOAD)
+    assert result is not None
+    assert result["text"] == "pricing"
+    assert result["message_id"] == "wamid.LIST_REPLY_321"
+
+
+def test_parse_button_reply_uses_button_id_as_text():
+    result = parse_meta_payload(META_BUTTON_REPLY_PAYLOAD)
+    assert result is not None
+    assert result["phone"] == "919876543210"
+    assert result["text"] == "order"
+    assert result["message_id"] == "wamid.BUTTON_REPLY_789"
 
 
 def test_parse_status_update_returns_none():

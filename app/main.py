@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.db.database import engine
+from app.integrations.cashfree import start_overdue_scheduler
 from app.utils.tracing import flush_langfuse
 from app.webhook.router import webhook_router
 
@@ -22,6 +23,7 @@ async def startup_event() -> None:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         logger.info("DB connected")
+        start_overdue_scheduler()
     except Exception as exc:
         # SECURITY: do not expose connection strings or env details in error messages
         logger.exception("Database startup check failed")

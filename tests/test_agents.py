@@ -22,6 +22,7 @@ from app.agents.order import (
     COLLECT_COUNTRY,
     COLLECT_QTY,
     COLLECT_SKU,
+    COLLECT_SKU_CONFIRM,
     CONFIRM_ORDER,
     SANCTIONED_COUNTRY_REFUSAL,
     _resolve_product_row,
@@ -382,6 +383,9 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert "order confirmed" in reply.lower()
     assert "ORD-" in reply
     assert "order_state" not in session
+    assert session.get("lead_qualified") is True
+    assert session.get("greeted") is True
+    assert session.get("last_order_ref", "").startswith("ORD-")
 
     orders = order_db.query(Order).all()
     assert len(orders) == 1
@@ -432,6 +436,7 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
 
     reply, session = await run_order_agent("yes", session, db)
     assert "order confirmed" in reply.lower()
+    assert session.get("last_order_ref", "").startswith("ORD-")
     orders = db.query(Order).all()
     assert len(orders) == 2
     bases = {o.order_ref.rsplit("-L", 1)[0] for o in orders}
@@ -466,7 +471,7 @@ def test_resolve_product_from_natural_language_sentence(order_db):
 
 @pytest.mark.asyncio
 async def test_order_agent_llm_add_product_natural_language(order_db, monkeypatch):
-    """LLM extracts product + quantity from one message."""
+    """Natural language product match still asks quantity first."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
 
@@ -519,11 +524,124 @@ async def test_order_agent_llm_add_product_natural_language(order_db, monkeypatc
         session,
         order_db,
     )
+    assert session["order_state"] == COLLECT_SKU_CONFIRM
+    assert session.get("pending_product")
+    assert "did you mean" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_order_agent_requires_confirmation_for_suggested_product(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+
+    session = {"phone": "+1"}
+    reply, session = await run_order_agent(
+        "I need metformin 500mg please",
+        session,
+        order_db,
+    )
+    assert session["order_state"] == COLLECT_SKU_CONFIRM
+    assert "did you mean" in reply.lower()
+
+    reply, session = await run_order_agent("yes", session, order_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert "how many units" in reply.lower()
+    assert "metformin" in reply.lower()
+
+    reply, session = await run_order_agent("100", session, order_db)
     assert session["order_state"] == CART_MENU
-    assert len(session["order_cart"]) == 1
-    assert session["order_cart"][0]["quantity"] == 2000
-    assert "Metformin" in session["order_cart"][0]["product_name"]
-    assert "2000" in reply or "cart" in reply.lower()
+    assert any("Metformin" in line["product_name"] for line in session["order_cart"])
+
+
+@pytest.mark.asyncio
+async def test_order_agent_llm_add_with_suggested_product_waits_for_confirmation(
+    order_db, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
+
+    call_count = {"n": 0}
+
+    async def fake_create(*_args, **_kwargs):
+        call_count["n"] += 1
+        if call_count["n"] > 1:
+            response = MagicMock()
+            response.choices = [
+                MagicMock(
+                    message=MagicMock(
+                        content="Please confirm the product before I add it.",
+                        tool_calls=None,
+                    )
+                )
+            ]
+            return response
+
+        tool_fn = MagicMock()
+        tool_fn.name = "add_to_cart"
+        tool_fn.arguments = json.dumps(
+            {"product_query": "I need metformin 500mg please", "quantity": 100}
+        )
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = tool_fn
+
+        response = MagicMock()
+        response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content=None,
+                    tool_calls=[tool_call],
+                )
+            )
+        ]
+        return response
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = fake_create
+    monkeypatch.setattr(
+        "app.agents.order.get_async_openai_client",
+        lambda **_: mock_client,
+    )
+
+    session = {"phone": "+1", "order_state": COLLECT_SKU}
+    reply, session = await run_order_agent(
+        "100 units of metformin please",
+        session,
+        order_db,
+    )
+    assert session["order_state"] == COLLECT_SKU_CONFIRM
+    assert session.get("order_pending_qty") is None
+
+    # Confirm on next turn via deterministic fallback path.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    reply, session = await run_order_agent("yes", session, order_db)
+    assert session["order_state"] == COLLECT_QTY
+    reply, session = await run_order_agent("100", session, order_db)
+    assert session["order_state"] == CART_MENU
+    assert any("Metformin" in line["product_name"] for line in session["order_cart"])
+    assert "your cart" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+
+    session = {"phone": "+15550123456"}
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg", session, order_db)
+    _, session = await run_order_agent("100", session, order_db)
+    _, session = await run_order_agent("done", session, order_db)
+    _, session = await run_order_agent("Kenya", session, order_db)
+    _, session = await run_order_agent("Nairobi", session, order_db)
+    _, session = await run_order_agent("Contact Name", session, order_db)
+    _, session = await run_order_agent("T/T", session, order_db)
+    _, session = await run_order_agent("confirm", session, order_db)
+
+    reply, _ = await run_order_agent("where is my order", {"phone": "+15550123456"}, order_db)
+    assert "order ord-" in reply.lower()
+    assert "awaiting your payment transfer" in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -607,6 +725,44 @@ def test_restricted_country_disqualified():
     assert result.score < 40
 
 
+def test_illegal_product_request_disqualified():
+    session = {
+        "business_type": "distributor",
+        "country": "USA",
+        "company": "Test Co",
+        "order_value_usd": 500,
+    }
+    result = score_lead(session, "need banned medicine without prescription")
+    assert result.disqualified is True
+    assert result.score < 40
+
+
+def test_incomplete_identity_after_retries_disqualified():
+    session = {
+        "buyer_type": "new_individual",
+        "order_value_usd": 200,
+        "incomplete_after_retries": True,
+    }
+    result = score_lead(session, "price for amoxicillin")
+    assert result.disqualified is True
+
+
+def test_time_based_and_best_price_adjustments():
+    session = {
+        "buyer_type": "pharmacy_clinic",
+        "country": "India",
+        "company": "MediCare Plus",
+        "order_value_usd": 150,
+        "fast_response": True,
+        "active_conversation": True,
+        "no_response_hours": 24,
+        "repeated_best_price": True,
+    }
+    result = score_lead(session, "final quote please")
+    assert result.score >= 40
+    assert result.breakdown["buyer_type"] == 25
+
+
 def test_classify_lead_score_bands():
     assert classify_lead_score(85) == "hot"
     assert classify_lead_score(70) == "warm"
@@ -622,6 +778,47 @@ def test_calculate_lead_score_compat_wrapper():
         "order_value_usd": 30,
     }
     assert calculate_lead_score(session) == score_lead(session).score
+
+
+@pytest.mark.asyncio
+async def test_qualification_rejects_filler_biz_type(qual_db):
+    session = {
+        "phone": "+15550004444",
+        "company": "MedEx",
+        "country": "Kenya",
+        "qual_state": COLLECT_BIZ_TYPE,
+    }
+    reply, session, intent = await run_qualification_agent("bh", session, qual_db)
+    assert intent == "continue_qual"
+    assert session["qual_state"] == COLLECT_BIZ_TYPE
+    assert "business" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_complete_sends_post_qual_buttons(qual_db, monkeypatch):
+    sent: list[tuple[str, list]] = []
+
+    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
+        sent.append((phone, buttons))
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.qualification.send_interactive_buttons",
+        capture_buttons,
+    )
+
+    session = {"phone": "+15550005555", "pending_intent": "order"}
+    _, session, _ = await run_qualification_agent("Acme Pharma", session, qual_db)
+    _, session, _ = await run_qualification_agent("Kenya", session, qual_db)
+    _, session, _ = await run_qualification_agent("pharmacy", session, qual_db)
+    _, session, _ = await run_qualification_agent("$500", session, qual_db)
+    reply, session, intent = await run_qualification_agent("no", session, qual_db)
+
+    assert intent == "order"
+    assert "you're all set" in reply.lower()
+    assert sent
+    assert sent[0][0] == "+15550005555"
+    assert {b["id"] for b in sent[0][1]} == {"order", "pricing", "speak"}
 
 
 @pytest.mark.asyncio
@@ -684,16 +881,18 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
     assert session["business_type"] == "distributor"
     assert "volume" in reply.lower()
 
-    reply, session, intent = await run_qualification_agent("$50,000", session, qual_db)
-    assert session.get("annual_volume_usd") == 50_000.0 or session.get("order_value_usd")
+    reply, session, intent = await run_qualification_agent("$50", session, qual_db)
+    assert session.get("order_value_usd") == 50.0
     assert "license" in reply.lower()
 
     reply, session, intent = await run_qualification_agent("no", session, qual_db)
     assert session.get("qual_state") is None
     assert session["lead_qualified"] is True
+    assert session.get("qual_completed_at")
     assert session["lead_score"] >= 40
-    assert intent in {"pricing", "faq", "escalate"}
-    assert "thank you" in reply.lower()
+    assert session["lead_score"] < 80
+    assert intent == "pricing"
+    assert "you're all set" in reply.lower()
 
     leads = qual_db.query(Lead).all()
     assert len(leads) == 1

@@ -21,6 +21,7 @@ from app.business.countries import (
 )
 from app.db.models import Order, Product
 from app.integrations.alerts import send_order_alert
+from app.integrations.whatsapp import send_interactive_buttons
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ ORDER_MODEL = "gpt-4o-mini"
 MAX_TOOL_CALLS_PER_TURN = 8
 
 COLLECT_SKU = "COLLECT_SKU"
+COLLECT_SKU_CONFIRM = "COLLECT_SKU_CONFIRM"
 COLLECT_QTY = "COLLECT_QTY"
 CART_MENU = "CART_MENU"
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
@@ -38,7 +40,6 @@ COLLECT_PAYMENT = "COLLECT_PAYMENT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
 ORDER_COMPLETE = "ORDER_COMPLETE"
 
-DEFAULT_MOQ = 1
 SANCTIONED_COUNTRY_REFUSAL = SHIPMENT_EXCLUDED_REFUSAL
 
 ORDER_SESSION_KEYS = (
@@ -46,13 +47,16 @@ ORDER_SESSION_KEYS = (
     "order_cart",
     "order_sku",
     "order_product_name",
-    "order_moq",
     "order_qty",
     "order_country",
     "order_city",
     "order_contact",
     "order_payment",
     "order_ref",
+    "order_pending_sku",
+    "order_pending_product_name",
+    "order_pending_qty",
+    "pending_product",
 )
 
 ORDER_SYSTEM_PROMPT = (
@@ -243,11 +247,12 @@ def _migrate_legacy_single_line_session(session: dict) -> None:
                 "sku": sku,
                 "product_name": session.get("order_product_name") or sku,
                 "quantity": qty,
-                "moq": int(session.get("order_moq") or DEFAULT_MOQ),
+                "qty": qty,
+                "unit_price": float(session.get("order_unit_price") or 0.0),
             }
         ],
     )
-    for key in ("order_sku", "order_product_name", "order_moq", "order_qty"):
+    for key in ("order_sku", "order_product_name", "order_qty"):
         session.pop(key, None)
     if session.get("order_state") in {COLLECT_SKU, COLLECT_QTY, None}:
         session["order_state"] = CART_MENU
@@ -263,15 +268,55 @@ def _ensure_order_started(session: dict) -> None:
         session["order_state"] = COLLECT_SKU
 
 
+def _set_pending_product(
+    session: dict,
+    *,
+    sku: str,
+    product_name: str,
+    qty: int | None = None,
+) -> None:
+    session["order_pending_sku"] = sku
+    session["order_pending_product_name"] = product_name
+    if qty is None:
+        session.pop("order_pending_qty", None)
+    else:
+        session["order_pending_qty"] = int(qty)
+    session["pending_product"] = {
+        "sku": sku,
+        "name": product_name,
+    }
+
+
+def _clear_pending_product(session: dict) -> None:
+    for key in ("order_pending_sku", "order_pending_product_name", "order_pending_qty"):
+        session.pop(key, None)
+    session.pop("pending_product", None)
+
+
+def _item_qty(item: dict[str, Any]) -> int:
+    return int(item.get("qty", item.get("quantity", 0)) or 0)
+
+
+def _format_money(amount: float) -> str:
+    return f"${amount:,.2f}"
+
+
 def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
     if not cart:
-        return "_Empty cart._"
-    lines = []
+        return "🛒 *Your cart:*\n_Empty cart._"
+    lines = ["🛒 *Your cart:*"]
+    total = 0.0
     for idx, item in enumerate(cart, start=1):
         name = item.get("product_name") or item.get("sku")
-        qty = item.get("quantity", 0)
-        sku = item.get("sku", "")
-        lines.append(f"{idx}. {name} — {qty} units ({sku})")
+        qty = _item_qty(item)
+        unit_price = float(item.get("unit_price") or 0.0)
+        line_total = qty * unit_price
+        total += line_total
+        lines.append(f"{idx}. {name} × {qty} = {_format_money(line_total)}")
+    lines.append("─────────────────")
+    lines.append(f"Total: {_format_money(total)}")
+    lines.append("")
+    lines.append("Add more products or type *checkout* to proceed.")
     return "\n".join(lines)
 
 
@@ -294,6 +339,7 @@ def _session_snapshot(session: dict) -> dict[str, Any]:
         "contact": session.get("order_contact"),
         "payment": session.get("order_payment"),
         "pending_product": session.get("order_product_name"),
+        "pending_suggested_product": session.get("order_pending_product_name"),
     }
 
 
@@ -359,23 +405,31 @@ def _product_search_tokens(text: str) -> list[str]:
     return sorted(set(tokens), key=len, reverse=True)
 
 
-def _resolve_product_row(query: str, db: Session) -> tuple[Product | None, str | None]:
+def _resolve_product_match(
+    query: str, db: Session
+) -> tuple[Product | None, str | None, str]:
+    """Return (product, error, match_mode) where match_mode is direct|token|none."""
     text = (query or "").strip()
     if not text:
-        return None, "not_found"
+        return None, "not_found", "none"
 
     product, err = _lookup_product_query(text, db)
     if product is not None or err == "restricted":
-        return product, err
+        return product, err, "direct"
 
     for token in _product_search_tokens(text):
         product, err = _lookup_product_query(token, db)
         if product is not None:
-            return product, err
+            return product, err, "token"
         if err == "restricted":
-            return None, "restricted"
+            return None, "restricted", "token"
 
-    return None, "not_found"
+    return None, "not_found", "none"
+
+
+def _resolve_product_row(query: str, db: Session) -> tuple[Product | None, str | None]:
+    product, error, _ = _resolve_product_match(query, db)
+    return product, error
 
 
 def _suggest_products(query: str, db: Session) -> list[str]:
@@ -412,24 +466,38 @@ def _find_cart_line(cart: list[dict], line_number: int | None, product_query: st
     return None
 
 
-def _add_line_to_cart(session: dict, sku: str, product_name: str, qty: int, moq: int) -> None:
+def _add_line_to_cart(
+    session: dict,
+    sku: str,
+    product_name: str,
+    qty: int,
+    unit_price: float,
+) -> None:
     cart = _get_cart(session)
     for item in cart:
         if item.get("sku") == sku:
-            item["quantity"] = int(item.get("quantity", 0)) + qty
+            merged = _item_qty(item) + qty
+            item["quantity"] = merged
+            item["qty"] = merged
             item["product_name"] = product_name
-            item["moq"] = moq
+            item["unit_price"] = unit_price
             _set_cart(session, cart)
             return
     cart.append(
-        {"sku": sku, "product_name": product_name, "quantity": qty, "moq": moq}
+        {
+            "sku": sku,
+            "product_name": product_name,
+            "quantity": qty,
+            "qty": qty,
+            "unit_price": unit_price,
+        }
     )
     _set_cart(session, cart)
 
 
 def _tool_lookup_product(args: dict, db: Session) -> dict:
     query = (args.get("query") or "").strip()
-    product, error = _resolve_product_row(query, db)
+    product, error, match_mode = _resolve_product_match(query, db)
     if error == "restricted":
         return {"error": "product_restricted", "query": query}
     if product is None:
@@ -442,7 +510,7 @@ def _tool_lookup_product(args: dict, db: Session) -> dict:
         "product_name": product.product_name,
         "sku": _product_sku(product),
         "salt_name": product.salt_name or "",
-        "moq": DEFAULT_MOQ,
+        "match_mode": match_mode,
     }
 
 
@@ -455,7 +523,8 @@ def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
     if qty < 1:
         return {"error": "invalid_quantity", "message": "Quantity must be a positive integer."}
 
-    product, error = _resolve_product_row((args.get("product_query") or "").strip(), db)
+    product_query = (args.get("product_query") or "").strip()
+    product, error, match_mode = _resolve_product_match(product_query, db)
     if error == "restricted":
         return {"error": "product_restricted"}
     if product is None:
@@ -463,19 +532,42 @@ def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
             "error": "product_not_found",
             "suggestions": _suggest_products(args.get("product_query", ""), db),
         }
+    if match_mode == "token":
+        _set_pending_product(
+            session,
+            sku=_product_sku(product),
+            product_name=product.product_name,
+            qty=qty,
+        )
+        session["order_state"] = COLLECT_SKU_CONFIRM
+        return {
+            "error": "needs_product_confirmation",
+            "candidate": product.product_name,
+            "query": product_query,
+            "quantity": qty,
+        }
 
-    moq = DEFAULT_MOQ
-    if qty < moq:
-        return {"error": "below_moq", "moq": moq, "product_name": product.product_name}
-
-    _add_line_to_cart(session, _product_sku(product), product.product_name, qty, moq)
+    unit_price = float(product.price_per_strip or 0.0)
+    _clear_pending_product(session)
+    _add_line_to_cart(
+        session,
+        _product_sku(product),
+        product.product_name,
+        qty,
+        unit_price,
+    )
     session["order_state"] = CART_MENU
-    for key in ("order_sku", "order_product_name", "order_moq", "order_qty"):
+    for key in ("order_sku", "order_product_name", "order_qty", "order_unit_price"):
         session.pop(key, None)
     return {
         "ok": True,
         "cart": _get_cart(session),
-        "added": {"product_name": product.product_name, "quantity": qty},
+        "added": {
+            "product_name": product.product_name,
+            "quantity": qty,
+            "unit_price": unit_price,
+            "line_total": round(qty * unit_price, 2),
+        },
     }
 
 
@@ -494,10 +586,8 @@ def _tool_update_cart_line(args: dict, session: dict) -> dict:
     )
     if idx is None:
         return {"error": "line_not_found", "cart": cart}
-    moq = int(cart[idx].get("moq") or DEFAULT_MOQ)
-    if qty < moq:
-        return {"error": "below_moq", "moq": moq}
     cart[idx]["quantity"] = qty
+    cart[idx]["qty"] = qty
     _set_cart(session, cart)
     session["order_state"] = CART_MENU
     return {"ok": True, "cart": cart}
@@ -608,7 +698,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
                 contact_name=session["order_contact"],
                 payment_terms=session["order_payment"],
                 order_ref=f"{order_ref}-L{idx:02d}",
-                status="pending",
+                status="awaiting_payment",
             )
         )
     db.commit()
@@ -637,21 +727,67 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     contact = session.get("order_contact", "")
     payment = session.get("order_payment", "")
     product_lines = "\n".join(
-        f"• {item.get('product_name')} — {item.get('quantity')} units ({item.get('sku')})"
+        f"• {item.get('product_name')} — {_item_qty(item)} units ({item.get('sku')})"
         for item in cart
     )
     _clear_order_session(session)
+    session.pop("cart", None)
+    session.pop("pending_product", None)
+    session["lead_qualified"] = True
+    session["greeted"] = True
+    session["last_order_ref"] = order_ref
+    phone = session.get("phone") or ""
+    if phone:
+        await send_interactive_buttons(
+            phone,
+            (
+                f"✅ *Order {order_ref} confirmed!*\n"
+                "Our sales team will send your proforma invoice within 24 hours."
+            ),
+            [
+                {"id": "new_order", "title": "New Order"},
+                {"id": "order_status", "title": "Order Status"},
+                {"id": "speak", "title": "Speak to Team"},
+            ],
+        )
     reply = (
-        "✅ *Order Confirmed!*\n"
-        "📋 *Order Summary:*\n"
-        f"{product_lines}\n"
-        f"• Ship to: {city}, {country}\n"
-        f"• Contact: {contact}\n"
-        f"• Payment: {payment}\n"
-        f"• Order Ref: {order_ref}\n"
-        "Our sales team will contact you within 24 hours with the proforma invoice. Thank you!"
+        f"✅ *Order Confirmed!*\n"
+        f"Order Ref: {order_ref}\n"
+        "Our sales team will send your proforma invoice within 24 hours."
     )
     return reply, session
+
+
+def _extract_order_status_ref(text: str) -> str | None:
+    match = re.search(r"\b(ORD-[0-9][0-9\-]*)\b", (text or "").upper())
+    return match.group(1) if match else None
+
+
+def _is_order_status_query(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        "order status" in lowered
+        or "where is my order" in lowered
+        or bool(_extract_order_status_ref(text))
+    )
+
+
+def _status_message(status: str, eta: str = "") -> str:
+    mapping = {
+        "awaiting_payment": "Awaiting your payment transfer.",
+        "payment_received": "Payment received ✅ — processing your order.",
+        "processing": "Being prepared for shipment.",
+        "shipped": f"On the way! Expected delivery: {eta or 'To be shared soon.'}",
+        "delivered": "Delivered ✅",
+    }
+    return mapping.get(status, "We are reviewing your order and will update you shortly.")
+
+
+def _latest_order_by_phone(db: Session, phone: str, order_ref: str | None = None) -> Order | None:
+    q = db.query(Order).filter(Order.phone == phone)
+    if order_ref:
+        q = q.filter(Order.order_ref.ilike(f"{order_ref}%"))
+    return q.order_by(Order.created_at.desc(), Order.id.desc()).first()
 
 
 def _execute_order_tool(name: str, args: dict, session: dict, db: Session) -> dict:
@@ -688,6 +824,7 @@ def _phase_hint(session: dict) -> str:
     phase = session.get("order_state", COLLECT_SKU)
     hints = {
         COLLECT_SKU: "Collect products for the cart (natural language OK).",
+        COLLECT_SKU_CONFIRM: "Confirm suggested product before quantity/cart actions.",
         COLLECT_QTY: "Pending quantity for a product — use add_to_cart with quantity.",
         CART_MENU: "Cart building — add, edit, remove, or proceed_to_checkout.",
         COLLECT_COUNTRY: "Collect shipping country.",
@@ -859,8 +996,6 @@ def _try_cart_edit_commands(text: str, session: dict) -> tuple[str, dict] | None
     if qty_edit is not None:
         line_no, qty = qty_edit
         result = _tool_update_cart_line({"line_number": line_no, "quantity": qty}, session)
-        if result.get("error") == "below_moq":
-            return f"Minimum quantity is {result.get('moq')} units.", session
         if result.get("error"):
             return f"Could not update line {line_no}.", session
         return f"Updated line {line_no} to {qty} units.", session
@@ -871,6 +1006,26 @@ async def _run_order_rules(
     message: str, session: dict, db: Session
 ) -> tuple[str, dict]:
     text = (message or "").strip()
+    phone = session.get("phone") or ""
+    if phone and _is_order_status_query(text):
+        requested_ref = _extract_order_status_ref(text)
+        latest = _latest_order_by_phone(db, phone, requested_ref)
+        if not latest:
+            return (
+                "I couldn't find any recent order for this number yet. "
+                "Please share your order reference (e.g., ORD-12345).",
+                session,
+            )
+        ref = latest.order_ref or "ORD-UNKNOWN"
+        base_ref = ref.split("-L")[0]
+        status = (latest.status or "processing").strip().lower()
+        return (
+            f"📦 *Order {base_ref}*\n"
+            f"Status: {status}\n"
+            f"{_status_message(status)}",
+            session,
+        )
+
     state = session.get("order_state") or COLLECT_SKU
     session["order_state"] = state
 
@@ -878,10 +1033,45 @@ async def _run_order_rules(
     if edit_result and state in {CART_MENU, CONFIRM_ORDER}:
         return edit_result
 
+    if state == COLLECT_SKU_CONFIRM:
+        pending_sku = session.get("order_pending_sku")
+        pending_name = session.get("order_pending_product_name")
+        pending_qty = session.get("order_pending_qty")
+        if not pending_sku or not pending_name:
+            _clear_pending_product(session)
+            session["order_state"] = COLLECT_SKU
+            return "Which product would you like to add? (name or SKU)", session
+
+        if _normalize_menu_action(text) == "confirm":
+            if pending_qty:
+                _add_line_to_cart(session, pending_sku, pending_name, int(pending_qty), 0.0)
+                _clear_pending_product(session)
+                session["order_state"] = CART_MENU
+                return (
+                    f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}\n\n"
+                    "Reply *done* when finished adding products.",
+                    session,
+                )
+            session["order_sku"] = pending_sku
+            session["order_product_name"] = pending_name
+            _clear_pending_product(session)
+            session["order_state"] = COLLECT_QTY
+            return (
+                f"How many units of {session['order_product_name']}?",
+                session,
+            )
+
+        _clear_pending_product(session)
+        session["order_state"] = COLLECT_SKU
+        if not text:
+            return "Please share the exact product name or SKU.", session
+        # Treat non-confirm text as a fresh product query.
+        state = COLLECT_SKU
+
     if state == COLLECT_SKU:
         if not text:
             return "Which product would you like to add? (name or SKU)", session
-        product, error = _resolve_product_row(text, db)
+        product, error, match_mode = _resolve_product_match(text, db)
         if error == "restricted":
             return (
                 "I'm unable to assist with that product through this channel. "
@@ -896,17 +1086,36 @@ async def _run_order_rules(
             if suggestions:
                 reply += "\n\nDid you mean:\n• " + "\n• ".join(suggestions)
             return reply, session
+        if match_mode == "token":
+            _set_pending_product(
+                session,
+                sku=_product_sku(product),
+                product_name=product.product_name,
+            )
+            session["order_state"] = COLLECT_SKU_CONFIRM
+            return (
+                f"Did you mean *{product.product_name}*?\n"
+                "Reply *yes* to continue or share the exact product name/SKU.",
+                session,
+            )
+        _clear_pending_product(session)
         session["order_sku"] = _product_sku(product)
         session["order_product_name"] = product.product_name
+        session["order_unit_price"] = float(product.price_per_strip or 0.0)
+        session["pending_product"] = {
+            "name": product.product_name,
+            "sku": _product_sku(product),
+        }
         session["order_state"] = COLLECT_QTY
         return (
-            f"How many units of {product.product_name}? (Minimum: {DEFAULT_MOQ} units)",
+            f"Found: *{product.product_name}*\n"
+            "How many units?",
             session,
         )
 
     if state == COLLECT_QTY:
         qty = _extract_positive_int(text)
-        if qty is None or qty < DEFAULT_MOQ:
+        if qty is None or qty < 1:
             return "Please enter a positive number of units (e.g. 1000).", session
         result = _tool_add_to_cart(
             {
@@ -918,24 +1127,20 @@ async def _run_order_rules(
         )
         if result.get("error"):
             return "Could not add to cart. Please try again.", session
-        return (
-            f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}\n\n"
-            "Reply *done* when finished adding products.",
-            session,
-        )
+        return _format_cart_lines(_get_cart(session)), session
 
     if state == CART_MENU:
         action = _normalize_menu_action(text)
         if action == "add":
             session["order_state"] = COLLECT_SKU
             return "Which product would you like to add?", session
-        if action == "done":
+        if action == "done" or (text or "").strip().lower() == "checkout":
             result = _tool_proceed_to_checkout(session)
             if result.get("error"):
                 return "Your cart is empty.", session
             return "Which country should we ship to?", session
         if not text:
-            return f"Your cart:\n{_format_cart_lines(_get_cart(session))}", session
+            return _format_cart_lines(_get_cart(session)), session
         return "Reply *done* to checkout, or *add* for another product.", session
 
     if state == COLLECT_COUNTRY:
@@ -984,6 +1189,14 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     session = dict(session or {})
     _migrate_legacy_single_line_session(session)
     _ensure_order_started(session)
+    state = session.get("order_state") or COLLECT_SKU
+    text = (message or "").strip()
+
+    # Deterministic UX guards regardless of LLM mode.
+    if _is_order_status_query(text):
+        return await _run_order_rules(message, session, db)
+    if state in {COLLECT_SKU, COLLECT_QTY, COLLECT_SKU_CONFIRM}:
+        return await _run_order_rules(message, session, db)
 
     use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}
     if use_llm and os.getenv("OPENAI_API_KEY"):

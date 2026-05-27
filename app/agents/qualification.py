@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -19,6 +20,8 @@ from app.business.countries import (
 )
 from app.db.models import Lead
 from app.integrations.alerts import send_escalation_alert
+from app.integrations.whatsapp import send_interactive_buttons
+from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ QUAL_COMPLETE = "QUAL_COMPLETE"
 
 CONTINUE_QUAL = "continue_qual"
 
-_GENERIC_WORDS = frozenset({
+_FILLER_WORDS = frozenset({
     "hi",
     "hello",
     "hey",
@@ -49,7 +52,19 @@ _GENERIC_WORDS = frozenset({
     "noted",
     "k",
     "kk",
+    "test",
+    "testing",
+    "nothing",
+    "none",
+    "na",
+    "n/a",
 })
+
+_QUAL_COMPLETE_BUTTONS = [
+    {"id": "order", "title": "Order Medicines"},
+    {"id": "pricing", "title": "Get Pricing"},
+    {"id": "speak", "title": "Speak to Team"},
+]
 
 HOT_LEAD_MIN_SCORE = 80
 
@@ -180,18 +195,34 @@ async def run_qualification_agent(
     return _prompt_collect_company(), session, CONTINUE_QUAL
 
 
+def _is_filler_reply(text: str) -> bool:
+    return (text or "").lower().strip() in _FILLER_WORDS
+
+
 def _is_generic_reply(text: str) -> bool:
-    return (text or "").lower().strip() in _GENERIC_WORDS
+    lowered = (text or "").lower().strip()
+    return (
+        lowered in _FILLER_WORDS
+        or lowered in MENU_OPTION_IDS
+        or lowered == MAIN_MENU_ID
+    )
 
 
 def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
     if not text or _is_generic_reply(text):
         return _prompt_collect_company(), session, CONTINUE_QUAL
 
+    if _is_filler_reply(text) or len(text.strip()) < 3:
+        return (
+            "Please share your company or business name to continue.",
+            session,
+            CONTINUE_QUAL,
+        )
+
     company = _extract_company(text)
     if len(company) < 3:
         return (
-            "Please share your company name so we can continue.",
+            "Please share your company or business name to continue.",
             session,
             CONTINUE_QUAL,
         )
@@ -203,7 +234,7 @@ def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
 
 def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
     country = text.strip()
-    if not country or _is_generic_reply(text):
+    if not country or _is_generic_reply(text) or _is_filler_reply(text):
         return "And which country are you based in?", session, CONTINUE_QUAL
 
     if is_shipment_excluded_country(country):
@@ -220,7 +251,12 @@ def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
 
 
 def _handle_collect_biz_type(text: str, session: dict) -> tuple[str, dict, str]:
-    if not text.strip() or _is_generic_reply(text):
+    if (
+        not text.strip()
+        or _is_generic_reply(text)
+        or _is_filler_reply(text)
+        or len(text.strip()) < 3
+    ):
         return (
             "What type of business are you? (distributor, pharmacy/clinic, doctor, "
             "or independent buyer)",
@@ -301,6 +337,7 @@ async def _handle_qual_complete(
     session["manual_review_only"] = result.manual_review_only
     session["lifecycle_stage"] = "qualified"
     session.pop("qual_state", None)
+    session["qual_completed_at"] = datetime.now(timezone.utc).isoformat()
 
     if not session.get("buyer_type"):
         session["buyer_type"] = map_business_type_to_buyer_type(
@@ -352,9 +389,22 @@ async def _handle_qual_complete(
         return reply, session, "escalate"
 
     reply = (
-        "Thank you! I now have everything I need. Let me help with your query..."
+        "Thank you! ✅ You're all set.\n\n"
+        "What would you like to do?\n"
+        "• 💊 *Order medicines* — share product names or a list\n"
+        "• 💰 *Get pricing* — ask about any product\n"
+        "• ❓ *FAQs* — shipping, documents, timelines\n\n"
+        "Or reply *human* to speak with our team."
     )
     next_intent = session.get("pending_intent") or "faq"
+
+    if phone:
+        await send_interactive_buttons(
+            phone,
+            "Choose an option below:",
+            _QUAL_COMPLETE_BUTTONS,
+        )
+
     return reply, session, next_intent
 
 

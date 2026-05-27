@@ -10,6 +10,7 @@ from typing import Any
 
 from langfuse import observe
 
+from app.messages.conversation_ui import MENU_OPTION_IDS, mark_menu_selection
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -48,9 +49,22 @@ def _matches_human_keyword(message: str) -> bool:
     return any(keyword in text for keyword in HUMAN_KEYWORDS)
 
 
+def _menu_button_intent(message: str) -> str | None:
+    """Map WhatsApp quick-reply button ids to orchestrator intents."""
+    key = (message or "").strip().lower()
+    if key == "speak":
+        return "escalate"
+    if key in MENU_OPTION_IDS:
+        return key
+    return None
+
+
 def _keyword_fallback_intent(message: str) -> tuple[str, float]:
     """Heuristic intent when LLM is unavailable (no API key or error)."""
     text = (message or "").lower()
+    menu = _menu_button_intent(message)
+    if menu:
+        return menu, 0.95
     order_markers = (
         "place an order",
         "place order",
@@ -145,22 +159,35 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
     if _matches_human_keyword(message):
         return "escalate", session
 
-    phone = session.get("phone") or ""
-
-    if not session.get("lead_qualified"):
-        intent, _ = await _classify_with_llm(message, phone=phone)
-        if intent != "escalate":
-            session["pending_intent"] = intent
+    menu_intent = _menu_button_intent(message)
+    if menu_intent:
+        session = mark_menu_selection(session, message)
+        if not session.get("lead_qualified") and menu_intent != "escalate":
+            if menu_intent != "qualify":
+                session["pending_intent"] = menu_intent
             return "qualify", session
+        return menu_intent, session
 
+    phone = session.get("phone") or ""
     intent, confidence = await _classify_with_llm(message, phone=phone)
 
-    if confidence < CONFIDENCE_ESCALATE_THRESHOLD and session.get("lead_qualified"):
-        attempts = session.get("clarification_attempts", 0) + 1
-        session["clarification_attempts"] = attempts
-        if attempts >= CLARIFICATION_ATTEMPTS_BEFORE_ESCALATE:
+    if not session.get("lead_qualified"):
+        if intent != "escalate":
+            if intent != "qualify":
+                session["pending_intent"] = intent
+            return "qualify", session
+
+    if confidence < 0.45 and session.get("lead_qualified"):
+        prior_count = session.get("clarification_count", session.get("clarification_attempts", 0))
+        count = prior_count + 1
+        session["clarification_count"] = count
+        session["clarification_attempts"] = count
+        if count >= 2:
+            session["clarification_count"] = 0
+            session["clarification_attempts"] = 0
             return "escalate", session
         return "faq", session
 
+    session.pop("clarification_count", None)
     session.pop("clarification_attempts", None)
     return intent, session

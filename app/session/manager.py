@@ -23,12 +23,15 @@ async def get_session(phone: str) -> dict:
         client = _get_redis_client()
         raw_data = await client.get(key)
         if not raw_data:
-            return {}
-        return json.loads(raw_data)
+            return {"greeted": False}
+        data = json.loads(raw_data)
+        if isinstance(data, dict):
+            return data
+        return {"greeted": False}
     except (redis.RedisError, json.JSONDecodeError) as exc:
         # SECURITY: hashed user ref in logs — not raw phone
         logger.exception("Failed to get session user_ref=%s", user_ref(phone))
-        return {}
+        return {"greeted": False}
 
 
 async def save_session(phone: str, data: dict) -> None:

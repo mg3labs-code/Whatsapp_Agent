@@ -77,3 +77,123 @@ async def send_message(phone: str, text: str) -> bool:
         # SECURITY: hashed user ref in logs — not raw phone
         logger.exception("WhatsApp send failed user_ref=%s", user_ref(normalized_phone))
         return False
+
+
+async def _post_whatsapp_payload(phone: str, payload: dict) -> bool:
+    """Shared POST helper for WhatsApp Cloud API message payloads."""
+    token = os.getenv("WHATSAPP_TOKEN")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+
+    if not token or not phone_number_id:
+        logger.warning("WhatsApp credentials not set; skipping interactive send")
+        return False
+
+    normalized_phone = phone.lstrip("+")
+    url = f"{META_GRAPH_BASE}/{META_API_VERSION}/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {**payload, "to": normalized_phone}
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return True
+    except Exception:
+        logger.exception(
+            "WhatsApp interactive send failed user_ref=%s",
+            user_ref(normalized_phone),
+        )
+        return False
+
+
+async def send_interactive_list(
+    phone: str,
+    *,
+    header_text: str,
+    body_text: str,
+    footer_text: str,
+    button_text: str,
+    rows: list[dict],
+    section_title: str = "Services",
+) -> bool:
+    """Send a WhatsApp list message (View Options style, up to 10 rows)."""
+    list_rows = [
+        {
+            "id": row["id"],
+            "title": row["title"][:24],
+            **(
+                {"description": row["description"][:72]}
+                if row.get("description")
+                else {}
+            ),
+        }
+        for row in rows[:10]
+    ]
+    payload = {
+        "messaging_product": "whatsapp",
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "header": {"type": "text", "text": header_text[:60]},
+            "body": {"text": body_text[:1024]},
+            "footer": {"text": footer_text[:60]},
+            "action": {
+                "button": button_text[:20],
+                "sections": [
+                    {
+                        "title": section_title[:24],
+                        "rows": list_rows,
+                    }
+                ],
+            },
+        },
+    }
+    return await _post_whatsapp_payload(phone, payload)
+
+
+async def send_interactive_buttons(
+    phone: str,
+    body_text: str,
+    buttons: list[dict],
+) -> bool:
+    """Send a WhatsApp interactive message with up to 3 quick reply buttons.
+
+    Args:
+        phone: Buyer's phone number. Leading '+' is stripped automatically.
+        body_text: Message body shown above the buttons.
+        buttons: List of {"id": str, "title": str} (max 3; titles truncated to 20 chars).
+
+    Returns:
+        True on 2xx response, False otherwise. Never raises.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": btn["id"],
+                            "title": btn["title"][:20],
+                        },
+                    }
+                    for btn in buttons[:3]
+                ]
+            },
+        },
+    }
+    return await _post_whatsapp_payload(phone, payload)
+
+
+async def send_navigation_footer(phone: str) -> bool:
+    """Send 'Anything else?' with a Main Menu quick-reply button."""
+    from app.messages.conversation_ui import MAIN_MENU_BUTTON, NAV_FOOTER_BODY
+
+    return await send_interactive_buttons(phone, NAV_FOOTER_BODY, MAIN_MENU_BUTTON)

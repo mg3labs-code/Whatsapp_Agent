@@ -28,6 +28,29 @@ async def test_unqualified_pricing_routes_to_qualify(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_menu_button_order_unqualified_without_llm():
+    intent, session = await router_mod.classify_intent("order", {})
+    assert intent == "qualify"
+    assert session["pending_intent"] == "order"
+
+
+@pytest.mark.asyncio
+async def test_menu_button_speak_routes_to_escalate():
+    intent, session = await router_mod.classify_intent("speak", {"lead_qualified": True})
+    assert intent == "escalate"
+
+
+@pytest.mark.asyncio
+async def test_menu_button_pricing_qualified_without_llm():
+    intent, session = await router_mod.classify_intent(
+        "pricing",
+        {"lead_qualified": True},
+    )
+    assert intent == "pricing"
+    assert "pending_intent" not in session
+
+
+@pytest.mark.asyncio
 async def test_unqualified_order_routes_to_qualify(monkeypatch):
     monkeypatch.setattr(
         router_mod,
@@ -117,6 +140,23 @@ def test_parse_classifier_response_invalid_intent_defaults_faq():
     )
     assert intent == "faq"
     assert conf == 0.9
+
+
+@pytest.mark.asyncio
+async def test_graph_router_node_main_menu_routes_to_menu_refresh():
+    out = await graph_mod.router_node(
+        {
+            "phone": "1",
+            "message": "main_menu",
+            "message_id": "m1",
+            "session": {"order_state": "COLLECT_QTY"},
+            "intent": None,
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": None,
+        }
+    )
+    assert out == {"intent": "menu_refresh", "session": {"order_state": "COLLECT_QTY"}}
 
 
 @pytest.mark.asyncio

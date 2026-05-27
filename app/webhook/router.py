@@ -1,11 +1,18 @@
 import asyncio
+from datetime import datetime
+import hashlib
+import hmac
 import logging
 import os
-from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response
 from fastapi.responses import PlainTextResponse
 
+from app.db.database import get_db
+from app.db.models import Order
+from app.integrations.alerts import send_order_team_alert
+from app.integrations.cashfree import handle_cashfree_webhook
+from app.integrations.whatsapp import send_message
 from app.orchestrator.graph import compiled_graph
 from app.session.manager import _get_redis_client, get_session
 from app.utils.tracing import flush_langfuse, message_trace_context
@@ -57,6 +64,111 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     return Response(status_code=200)
 
 
+def _verify_cashfree_signature(raw_body: bytes, signature: str) -> bool:
+    secret = os.getenv("CASHFREE_WEBHOOK_SECRET", "")
+    if not secret or not signature:
+        return False
+    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature.strip())
+
+
+def _parse_payment_time(raw: str) -> datetime | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+@webhook_router.post("/webhook/cashfree")
+async def receive_cashfree_webhook(request: Request) -> Response:
+    raw = await request.body()
+    signature = request.headers.get("X-Cashfree-Signature", "")
+    if not _verify_cashfree_signature(raw, signature):
+        return Response(status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return Response(status_code=400)
+
+    event = handle_cashfree_webhook(payload)
+    if event.get("status") == "ignored":
+        return Response(status_code=200)
+
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        order = None
+        va_id = event.get("virtual_account_id")
+        order_ref = (event.get("order_ref") or "").strip()
+        if va_id:
+            order = (
+                db.query(Order)
+                .filter(Order.virtual_account_id == va_id)
+                .order_by(Order.created_at.desc(), Order.id.desc())
+                .first()
+            )
+        if not order and order_ref:
+            order = (
+                db.query(Order)
+                .filter(Order.order_ref.ilike(f"{order_ref}%"))
+                .order_by(Order.created_at.desc(), Order.id.desc())
+                .first()
+            )
+        if not order:
+            logger.warning("Cashfree webhook order not found: %s", event)
+            return Response(status_code=200)
+
+        base_ref = (order.order_ref or "").rsplit("-L", 1)[0]
+        amount = float(event.get("amount") or 0)
+        remitter = event.get("remitter_name") or "Unknown"
+        utr = event.get("utr") or ""
+        payment_time = event.get("payment_time") or ""
+        paid_at = _parse_payment_time(str(payment_time))
+
+        q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
+        q.update(
+            {
+                "payment_status": "payment_received",
+                "status": "payment_received",
+                "utr_number": utr,
+                "payment_id": event.get("payment_id"),
+                "payment_received_at": paid_at,
+                "virtual_account_id": va_id or Order.virtual_account_id,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+
+        await send_message(
+            order.phone,
+            f"✅ Payment of ${amount:,.2f} received! Order is being processed.",
+        )
+        await send_order_team_alert(
+            f"💰 Payment confirmed — {base_ref} — ${amount:,.2f} from {remitter} — UTR: {utr or 'N/A'}"
+        )
+        return Response(status_code=200)
+    except Exception:
+        logger.exception("Cashfree webhook processing failed")
+        return Response(status_code=200)
+    finally:
+        db_gen.close()
+
+
+async def _is_duplicate(message_id: str, client) -> bool:
+    """Atomic dedup via SET NX — returns True if message_id was already seen."""
+    key = f"wasa:msgid:{message_id}"
+    try:
+        was_new = await client.set(key, "1", ex=DEDUP_TTL_SECONDS, nx=True)
+        return was_new is None  # None means key existed = duplicate
+    except Exception:
+        logger.exception("Dedup check failed for message_id=%s; processing anyway", message_id)
+        return False
+
+
 async def process_message(payload: dict) -> None:
     """Background pipeline for a single inbound webhook payload."""
     try:
@@ -68,19 +180,28 @@ async def process_message(payload: dict) -> None:
         text = parsed["text"]
         message_id = parsed["message_id"]
 
-        if await _is_duplicate(message_id):
+        client = _get_redis_client()
+
+        if await _is_duplicate(message_id, client):
             logger.info("Dropping duplicate message_id=%s", message_id)
             return
 
         lock_key = f"wasa:lock:{phone}"
-        async with _phone_lock(lock_key, ttl=LOCK_TTL_SECONDS) as acquired:
-            if not acquired:
-                logger.warning(
-                    "Could not acquire lock for phone; skipping message_id=%s",
-                    message_id,
-                )
-                return
+        acquired = False
+        for _ in range(LOCK_RETRY_COUNT):
+            acquired = await client.set(lock_key, "1", ex=LOCK_TTL_SECONDS, nx=True)
+            if acquired:
+                break
+            await asyncio.sleep(LOCK_RETRY_DELAY_SECONDS)
 
+        if not acquired:
+            logger.warning(
+                "Could not acquire lock for phone; skipping message_id=%s",
+                message_id,
+            )
+            return
+
+        try:
             session = await get_session(phone)
 
             state = {
@@ -101,51 +222,9 @@ async def process_message(payload: dict) -> None:
                 feature="orchestrator",
             ):
                 await compiled_graph.ainvoke(state)
+        finally:
+            await client.delete(lock_key)
     except Exception:
-        # SECURITY: log message_id / user_ref only — not message body or raw phone
-        logger.exception("Orchestrator processing failed")
+        logger.exception("process_message failed")
     finally:
         flush_langfuse()
-
-
-def _dedup_key(message_id: str) -> str:
-    return f"wasa:msgid:{message_id}"
-
-
-async def _is_duplicate(message_id: str) -> bool:
-    """Atomic dedup via SET NX — one key per message_id with its own TTL.
-
-    Meta retries webhook deliveries when it doesn't get a 200 fast enough,
-    so the same message_id can arrive multiple times concurrently.
-
-    Returns True if message_id was already processed; False (and records it) if new.
-    """
-    try:
-        client = _get_redis_client()
-        was_new = await client.set(
-            _dedup_key(message_id),
-            "1",
-            ex=DEDUP_TTL_SECONDS,
-            nx=True,
-        )
-        return was_new is None
-    except Exception:
-        logger.exception("Dedup check failed for message_id=%s; processing anyway", message_id)
-        return False
-
-
-@asynccontextmanager
-async def _phone_lock(key: str, ttl: int = LOCK_TTL_SECONDS):
-    """Per-phone Redis lock — at most one pipeline active per phone at a time."""
-    client = _get_redis_client()
-    acquired = False
-    for _ in range(LOCK_RETRY_COUNT):
-        acquired = await client.set(key, "1", ex=ttl, nx=True)
-        if acquired:
-            break
-        await asyncio.sleep(LOCK_RETRY_DELAY_SECONDS)
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            await client.delete(key)

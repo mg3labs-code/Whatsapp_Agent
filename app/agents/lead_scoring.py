@@ -100,6 +100,15 @@ RISKY_PRODUCT_KEYWORDS = P6_KEYWORDS + [
     "xanax",
 ]
 
+ILLEGAL_PRODUCT_KEYWORDS = [
+    "illegal",
+    "banned medicine",
+    "banned drug",
+    "without prescription",
+    "no prescription",
+    "fake prescription",
+]
+
 @dataclass
 class LeadScoreResult:
     score: int
@@ -303,6 +312,8 @@ def apply_bonuses_penalties(
         score += 5
     if session.get("fast_response"):
         score += 5
+    if session.get("active_conversation"):
+        score += 5
     if session.get("payment_proof_shared"):
         score += 15
     elif session.get("asked_payment_details"):
@@ -312,8 +323,17 @@ def apply_bonuses_penalties(
 
     if session.get("suspicious_behavior"):
         score -= 20
+    if session.get("unrealistic_pricing_negotiation") or session.get("repeated_best_price"):
+        score -= 5
     if session.get("incomplete_after_retries"):
         score -= 10
+
+    no_response_hours = float(session.get("no_response_hours") or 0)
+    if no_response_hours >= 24:
+        score -= 10
+    elif no_response_hours >= 12:
+        score -= 5
+
     if product_manual and country_high_risk:
         score -= 10
         manual_review = True
@@ -369,7 +389,19 @@ def score_lead(session: dict[str, Any], message: str = "") -> LeadScoreResult:
 
     base = sum(breakdown.values())
     manual_review = product_manual or restricted
-    disqualified = restricted or session.get("disqualified", False)
+    has_identity = bool(session.get("company")) and bool(session.get("country"))
+    illegal_request = bool(session.get("illegal_product_request")) or any(
+        k in text.lower() for k in ILLEGAL_PRODUCT_KEYWORDS
+    )
+    disqualified = bool(
+        restricted
+        or session.get("disqualified", False)
+        or illegal_request
+        or (
+            session.get("incomplete_after_retries")
+            and (session.get("fake_identity", False) or not has_identity)
+        )
+    )
 
     if session.get("is_suspicious"):
         manual_review = True
@@ -388,6 +420,17 @@ def score_lead(session: dict[str, Any], message: str = "") -> LeadScoreResult:
     category = classify_lead_score(final)
     if manual_review and not disqualified:
         category = "warm" if final >= 60 else "low_priority"
+
+    # Optional human override knobs (from CRM/admin actions).
+    if session.get("manual_override_disqualified") is not None:
+        disqualified = bool(session.get("manual_override_disqualified"))
+    if session.get("manual_override_manual_review_only") is not None:
+        manual_review = bool(session.get("manual_override_manual_review_only"))
+    if session.get("manual_override_score") is not None:
+        final = max(0, min(int(session.get("manual_override_score")), 100))
+        category = classify_lead_score(final)
+    if session.get("manual_override_category"):
+        category = str(session.get("manual_override_category"))
 
     return LeadScoreResult(
         score=final,
@@ -427,6 +470,14 @@ def enrich_session_from_message(session: dict, message: str) -> dict:
         session["payment_proof_shared"] = True
     if any(k in lowered for k in ("scam", "fake", "fraud")):
         session["suspicious_behavior"] = True
+    if any(k in lowered for k in ("fake company", "not a company", "random", "dummy")):
+        session["fake_identity"] = True
+    if any(k in lowered for k in ILLEGAL_PRODUCT_KEYWORDS):
+        session["illegal_product_request"] = True
+    if any(k in lowered for k in ("best price", "lowest price", "too expensive")):
+        session["best_price_asks"] = int(session.get("best_price_asks") or 0) + 1
+        if session["best_price_asks"] >= 2:
+            session["repeated_best_price"] = True
 
     order_val = extract_order_value_from_text(message)
     if order_val is not None:
