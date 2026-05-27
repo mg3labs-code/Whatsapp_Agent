@@ -1,6 +1,8 @@
 from datetime import datetime
+from uuid import uuid4
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, Numeric, String
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Integer, Numeric, String, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -61,6 +63,11 @@ class Order(Base):
     contact_name = Column(String, nullable=False)
     payment_terms = Column(String, nullable=False)
     status = Column(String, default="pending")
+    payment_status = Column(String, default="awaiting_payment")
+    virtual_account_id = Column(String, nullable=True)
+    utr_number = Column(String, nullable=True)
+    payment_id = Column(String, nullable=True)
+    payment_received_at = Column(DateTime, nullable=True)
     order_ref = Column(String, unique=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -80,3 +87,24 @@ class GuardrailLog(Base):
 
     def __repr__(self) -> str:
         return f"<GuardrailLog trigger_type={self.trigger_type!r}>"
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(
+        UUID(as_uuid=False).with_variant(String(36), "sqlite"),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    phone_number = Column(String, index=True)
+    session_id = Column(String)
+    messages = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
+    current_agent = Column(String, default="qualifier")
+    conversation_state = Column(String, default="active")
+    lead_score = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return f"<Conversation phone_number={self.phone_number!r}>"

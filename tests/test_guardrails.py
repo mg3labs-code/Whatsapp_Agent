@@ -201,6 +201,12 @@ async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(graph_mod, "send_message", capture_send)
+    monkeypatch.setattr("app.messages.welcome.send_message", capture_send)
+    monkeypatch.setattr(
+        "app.messages.welcome.send_interactive_list",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
     monkeypatch.setattr(graph_mod, "classify_intent", fail_classify)
     monkeypatch.setattr(graph_mod, "log_guardrail", AsyncMock())
 
@@ -217,6 +223,5 @@ async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
         }
     )
 
-    assert len(sent) == 1
-    assert AI_DISCLOSURE_MESSAGE.split("\n")[0] in sent[0]
-    assert REFUSAL_RESTRICTED_PRODUCT in sent[0]
+    assert REFUSAL_RESTRICTED_PRODUCT in sent[-1]
+    assert any("AI assistant" in msg or "AI sales assistant" in msg for msg in sent)

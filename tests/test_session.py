@@ -22,7 +22,7 @@ async def test_empty_session(monkeypatch):
 
     data = await manager.get_session("0000000000")
 
-    assert data == {}
+    assert data == {"greeted": False}
 
 
 @pytest.mark.asyncio
@@ -34,4 +34,4 @@ async def test_delete_session(monkeypatch):
     await manager.delete_session("5555555555")
     data = await manager.get_session("5555555555")
 
-    assert data == {}
+    assert data == {"greeted": False}
