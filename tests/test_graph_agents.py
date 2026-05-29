@@ -66,7 +66,7 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
 
     async def fake_run(message: str, session: dict, db):
         assert message == "hi"
-        assert session == {"company": "Acme", "phone": "+1"}
+        assert session == {"company": "Acme", "phone": "+1", "last_agent": "pricing"}
         assert db is mock_db
         return "PRICE_REPLY"
 
@@ -95,7 +95,10 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
         "final_reply": None,
     }
     out = await graph_mod.pricing_agent_node(state)
-    assert out == {"agent_response": "PRICE_REPLY"}
+    assert out == {
+        "agent_response": "PRICE_REPLY",
+        "session": {"company": "Acme", "phone": "+1", "last_agent": "pricing"},
+    }
     assert closed == ["gen_finally"]
 
 
@@ -118,7 +121,10 @@ async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
         "final_reply": None,
     }
     out = await graph_mod.faq_agent_node(state)
-    assert out == {"agent_response": "FAQ_REPLY"}
+    assert out == {
+        "agent_response": "FAQ_REPLY",
+        "session": {"phone": "+1", "last_agent": "faq"},
+    }
 
 
 @pytest.mark.asyncio

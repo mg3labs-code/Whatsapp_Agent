@@ -12,7 +12,7 @@ async def test_save_and_get_session(monkeypatch):
     await manager.save_session("1234567890", {"company": "TestCo"})
     data = await manager.get_session("1234567890")
 
-    assert data == {"company": "TestCo"}
+    assert data == {"company": "TestCo", "phone": "1234567890"}
 
 
 @pytest.mark.asyncio

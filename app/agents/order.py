@@ -36,8 +36,8 @@ CART_MENU = "CART_MENU"
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_CITY = "COLLECT_CITY"
 COLLECT_CONTACT = "COLLECT_CONTACT"
-COLLECT_PAYMENT = "COLLECT_PAYMENT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
+PAYMENT_METHOD = "T/T Advance"
 ORDER_COMPLETE = "ORDER_COMPLETE"
 
 SANCTIONED_COUNTRY_REFUSAL = SHIPMENT_EXCLUDED_REFUSAL
@@ -51,7 +51,6 @@ ORDER_SESSION_KEYS = (
     "order_country",
     "order_city",
     "order_contact",
-    "order_payment",
     "order_ref",
     "order_pending_sku",
     "order_pending_product_name",
@@ -69,11 +68,12 @@ ORDER_SYSTEM_PROMPT = (
     "- add_to_cart requires a positive integer quantity (parse '2k' as 2000, 'two thousand' as 2000).\n"
     "- update_cart_line / remove_from_cart: use line_number OR product_query.\n"
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
-    "- set_shipping / set_contact / set_payment_terms: extract from natural phrases.\n"
+    "- set_shipping / set_contact: extract from natural phrases.\n"
+    f"- Payment is always {PAYMENT_METHOD}; never ask for other payment terms.\n"
     "- confirm_order ONLY when the buyer clearly confirms (yes, confirm, place order) and phase is CONFIRM_ORDER.\n"
     "- If lookup fails, show suggestions from the tool and ask for a clearer product name.\n"
     "- Use *single asterisks* for bold (WhatsApp). Be concise and professional.\n"
-    "- Do not commit the order without confirm_order after payment terms are collected."
+    "- Do not commit the order without confirm_order after shipping and contact are collected."
 )
 
 ORDER_TOOLS = [
@@ -186,20 +186,6 @@ ORDER_TOOLS = [
                     "contact": {"type": "string"},
                 },
                 "required": ["contact"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_payment_terms",
-            "description": "Payment terms (e.g. T/T Advance, LC, 30-day net). Shows order review.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "payment_terms": {"type": "string"},
-                },
-                "required": ["payment_terms"],
             },
         },
     },
@@ -326,7 +312,7 @@ def _format_order_review(session: dict) -> str:
         f"cart:\n{_format_cart_lines(_get_cart(session))}\n"
         f"ship_to: {session.get('order_city', '')}, {session.get('order_country', '')}\n"
         f"contact: {session.get('order_contact', '')}\n"
-        f"payment: {session.get('order_payment', '')}"
+        f"payment: {PAYMENT_METHOD}"
     )
 
 
@@ -337,7 +323,7 @@ def _session_snapshot(session: dict) -> dict[str, Any]:
         "country": session.get("order_country"),
         "city": session.get("order_city"),
         "contact": session.get("order_contact"),
-        "payment": session.get("order_payment"),
+        "payment": PAYMENT_METHOD,
         "pending_product": session.get("order_product_name"),
         "pending_suggested_product": session.get("order_pending_product_name"),
     }
@@ -646,18 +632,9 @@ def _tool_set_contact(args: dict, session: dict) -> dict:
     contact = (args.get("contact") or "").strip()
     if len(contact) < 3:
         return {"error": "contact_too_short"}
-    session["order_contact"] = contact
-    session["order_state"] = COLLECT_PAYMENT
-    return {"ok": True, "phase": COLLECT_PAYMENT, "next": "collect_payment"}
-
-
-def _tool_set_payment_terms(args: dict, session: dict) -> dict:
-    terms = (args.get("payment_terms") or "").strip()
-    if not terms:
-        return {"error": "missing_payment_terms"}
     if not _get_cart(session):
         return {"error": "empty_cart"}
-    session["order_payment"] = terms
+    session["order_contact"] = contact
     session["order_state"] = CONFIRM_ORDER
     return {"ok": True, "phase": CONFIRM_ORDER, "review": _format_order_review(session)}
 
@@ -665,7 +642,7 @@ def _tool_set_payment_terms(args: dict, session: dict) -> dict:
 async def _tool_confirm_order(session: dict, db: Session) -> dict:
     if session.get("order_state") != CONFIRM_ORDER:
         return {"error": "wrong_phase", "phase": session.get("order_state")}
-    required = ("order_country", "order_city", "order_contact", "order_payment")
+    required = ("order_country", "order_city", "order_contact")
     missing = [k for k in required if not session.get(k)]
     if missing:
         return {"error": "incomplete", "missing": missing}
@@ -696,9 +673,9 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
                 country=session["order_country"],
                 city=session["order_city"],
                 contact_name=session["order_contact"],
-                payment_terms=session["order_payment"],
                 order_ref=f"{order_ref}-L{idx:02d}",
-                status="awaiting_payment",
+                status="pending",
+                payment_status="awaiting_payment",
             )
         )
     db.commit()
@@ -710,7 +687,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
             "city": session.get("order_city"),
             "country": session.get("order_country"),
             "contact_name": session.get("order_contact"),
-            "payment_terms": session.get("order_payment"),
+            "payment_method": PAYMENT_METHOD,
             "lines": [
                 {
                     "product_name": item.get("product_name"),
@@ -725,7 +702,6 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     city = session.get("order_city", "")
     country = session.get("order_country", "")
     contact = session.get("order_contact", "")
-    payment = session.get("order_payment", "")
     product_lines = "\n".join(
         f"• {item.get('product_name')} — {_item_qty(item)} units ({item.get('sku')})"
         for item in cart
@@ -807,8 +783,6 @@ def _execute_order_tool(name: str, args: dict, session: dict, db: Session) -> di
         return _tool_set_shipping(args, session)
     if name == "set_contact":
         return _tool_set_contact(args, session)
-    if name == "set_payment_terms":
-        return _tool_set_payment_terms(args, session)
     return {"error": "unknown_tool", "name": name}
 
 
@@ -830,7 +804,6 @@ def _phase_hint(session: dict) -> str:
         COLLECT_COUNTRY: "Collect shipping country.",
         COLLECT_CITY: "Collect city/port of entry.",
         COLLECT_CONTACT: "Collect buyer name and company.",
-        COLLECT_PAYMENT: "Collect payment terms, then show review.",
         CONFIRM_ORDER: "Show review; confirm_order only after explicit buyer confirmation.",
     }
     return hints.get(phase, "Order flow active.")
@@ -1018,11 +991,22 @@ async def _run_order_rules(
             )
         ref = latest.order_ref or "ORD-UNKNOWN"
         base_ref = ref.split("-L")[0]
-        status = (latest.status or "processing").strip().lower()
+        payment_status = (latest.payment_status or "").strip().lower()
+        order_status = (latest.status or "processing").strip().lower()
+        if payment_status in {
+            "awaiting_payment",
+            "payment_received",
+            "processing",
+            "shipped",
+            "delivered",
+        }:
+            display_status = payment_status
+        else:
+            display_status = order_status
         return (
             f"📦 *Order {base_ref}*\n"
-            f"Status: {status}\n"
-            f"{_status_message(status)}",
+            f"Status: {display_status.replace('_', ' ')}\n"
+            f"{_status_message(display_status)}",
             session,
         )
 
@@ -1160,16 +1144,11 @@ async def _run_order_rules(
         if len(text) < 3:
             return "Please share your name and company.", session
         session["order_contact"] = text
-        session["order_state"] = COLLECT_PAYMENT
-        return "Preferred payment terms? (T/T Advance, LC, or 30-day net)", session
-
-    if state == COLLECT_PAYMENT:
-        result = _tool_set_payment_terms({"payment_terms": text}, session)
-        if result.get("error"):
-            return "Please provide payment terms.", session
+        session["order_state"] = CONFIRM_ORDER
         return (
             "Please review your order:\n"
             f"{_format_cart_lines(_get_cart(session))}\n\n"
+            f"Payment method: *{PAYMENT_METHOD}*\n\n"
             "Reply *CONFIRM* to place the order."
         ), session
 

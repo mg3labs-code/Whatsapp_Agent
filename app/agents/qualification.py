@@ -89,6 +89,31 @@ def calculate_lead_score(lead: dict) -> int:
     return score_lead(lead).score
 
 
+def _extract_company_country(text: str) -> tuple[str | None, str | None]:
+    """Parse combined replies like 'Andrew from US' or 'Acme Pharma, USA'."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+
+    from_match = re.search(
+        r"^(.+?)\s+from\s+([A-Za-z][A-Za-z\s\-]{1,60})$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if from_match:
+        company = from_match.group(1).strip(" ,")
+        country = from_match.group(2).strip()
+        if len(company) >= 3 and len(country) >= 2:
+            return company, country
+
+    if "," in stripped:
+        parts = [p.strip() for p in stripped.split(",", 1)]
+        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
+            return parts[0], parts[1]
+
+    return None, None
+
+
 def _extract_company(text: str) -> str:
     stripped = (text or "").strip()
     if not stripped:
@@ -219,7 +244,9 @@ def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
             CONTINUE_QUAL,
         )
 
-    company = _extract_company(text)
+    company, country = _extract_company_country(text)
+    if not company:
+        company = _extract_company(text)
     if len(company) < 3:
         return (
             "Please share your company or business name to continue.",
@@ -228,6 +255,16 @@ def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
         )
 
     session["company"] = company
+    if country and not is_shipment_excluded_country(country):
+        session["country"] = country
+        session["qual_state"] = COLLECT_BIZ_TYPE
+        return (
+            "What type of business are you? (distributor, pharmacy/clinic, doctor, "
+            "or independent buyer)",
+            session,
+            CONTINUE_QUAL,
+        )
+
     session["qual_state"] = COLLECT_COUNTRY
     return "And which country are you based in?", session, CONTINUE_QUAL
 

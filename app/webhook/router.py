@@ -14,7 +14,8 @@ from app.integrations.alerts import send_order_team_alert
 from app.integrations.cashfree import handle_cashfree_webhook
 from app.integrations.whatsapp import send_message
 from app.orchestrator.graph import compiled_graph
-from app.session.manager import _get_redis_client, get_session
+from app.session.manager import _get_redis_client, get_session, save_session
+from app.utils.security import user_ref
 from app.utils.tracing import flush_langfuse, message_trace_context
 from app.webhook.parser import parse_meta_payload
 
@@ -176,7 +177,9 @@ async def process_message(payload: dict) -> None:
         if parsed is None:
             return
 
-        phone = parsed["phone"]
+        from app.session.manager import normalize_phone
+
+        phone = normalize_phone(parsed["phone"])
         text = parsed["text"]
         message_id = parsed["message_id"]
 
@@ -221,7 +224,17 @@ async def process_message(payload: dict) -> None:
                 message_id=message_id,
                 feature="orchestrator",
             ):
-                await compiled_graph.ainvoke(state)
+                result = await compiled_graph.ainvoke(state)
+            updated = (result or {}).get("session")
+            if updated:
+                try:
+                    await save_session(phone, updated)
+                except Exception:
+                    logger.exception(
+                        "Backup session save failed user_ref=%s message_id=%s",
+                        user_ref(phone),
+                        message_id,
+                    )
         finally:
             await client.delete(lock_key)
     except Exception:
