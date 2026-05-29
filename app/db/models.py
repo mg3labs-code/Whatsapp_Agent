@@ -61,7 +61,6 @@ class Order(Base):
     country = Column(String, nullable=False)
     city = Column(String, nullable=False)
     contact_name = Column(String, nullable=False)
-    payment_terms = Column(String, nullable=False)
     status = Column(String, default="pending")
     payment_status = Column(String, default="awaiting_payment")
     virtual_account_id = Column(String, nullable=True)
@@ -97,7 +96,7 @@ class Conversation(Base):
         primary_key=True,
         default=lambda: str(uuid4()),
     )
-    phone_number = Column(String, index=True)
+    phone_number = Column(String, index=True)  # stores hashed user ref, not raw phone
     session_id = Column(String)
     messages = Column(JSON().with_variant(JSONB, "postgresql"), default=list)
     current_agent = Column(String, default="qualifier")

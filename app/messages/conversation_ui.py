@@ -86,9 +86,16 @@ def apply_menu_selection_ack(reply: str, session: dict) -> tuple[str, dict]:
 
 
 def should_send_navigation_footer(session: dict) -> bool:
+    """Show 'Anything else?' only after qualification/order flows — not mid-qual."""
     session = session or {}
     if session.get("human_active"):
         return False
     if session.get(SESSION_SUPPRESS_NAV_FOOTER):
+        return False
+    if session.get("qual_state"):
+        return False
+    if session.get("order_state"):
+        return False
+    if not session.get("lead_qualified"):
         return False
     return True

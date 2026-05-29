@@ -373,10 +373,8 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert "name and company" in reply.lower()
 
     reply, session = await run_order_agent("Priya Sharma, MedEx", session, order_db)
-    assert "payment terms" in reply.lower()
-
-    reply, session = await run_order_agent("T/T Advance", session, order_db)
     assert session["order_state"] == CONFIRM_ORDER
+    assert "t/t advance" in reply.lower()
     assert "review" in reply.lower() or "confirm" in reply.lower()
 
     reply, session = await run_order_agent("confirm", session, order_db)
@@ -636,7 +634,6 @@ async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
     _, session = await run_order_agent("Kenya", session, order_db)
     _, session = await run_order_agent("Nairobi", session, order_db)
     _, session = await run_order_agent("Contact Name", session, order_db)
-    _, session = await run_order_agent("T/T", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     reply, _ = await run_order_agent("where is my order", {"phone": "+15550123456"}, order_db)

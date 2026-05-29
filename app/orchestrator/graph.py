@@ -63,21 +63,44 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _summarize_user_turn(message: str, session: dict) -> str:
+    qual = session.get("qual_state")
+    if qual:
+        return f"Qualification step ({qual})"
+    if session.get("order_state"):
+        return f"Order step ({session.get('order_state')})"
+    intent = session.get("pending_intent") or ""
+    if intent:
+        return f"User message (intent={intent})"
+    return "User message"
+
+
+def _summarize_bot_turn(session: dict) -> str:
+    agent = session.get("last_agent", "unknown")
+    qual = session.get("qual_state")
+    if qual:
+        return f"Qualification prompt ({qual})"
+    if session.get("order_state"):
+        return f"Order flow ({session.get('order_state')})"
+    return f"{agent} agent response"
+
+
 def _persist_conversation(phone: str, user_msg: str, bot_reply: str, session: dict) -> None:
-    """Upsert conversation row and append user/assistant turns."""
+    """Upsert conversation row with privacy-safe summaries (no full message bodies)."""
     gen = _get_db_generator()
     db = next(gen)
+    phone_ref = user_ref(phone)
     try:
         conv = (
             db.query(Conversation)
-            .filter(Conversation.phone_number == phone)
+            .filter(Conversation.phone_number == phone_ref)
             .order_by(Conversation.created_at.desc())
             .first()
         )
         if not conv:
             conv = Conversation(
-                phone_number=phone,
-                session_id=str(session.get("session_id") or phone),
+                phone_number=phone_ref,
+                session_id=phone_ref,
             )
             db.add(conv)
 
@@ -85,7 +108,7 @@ def _persist_conversation(phone: str, user_msg: str, bot_reply: str, session: di
         messages.append(
             {
                 "role": "user",
-                "content": user_msg or "",
+                "summary": _summarize_user_turn(user_msg, session),
                 "agent_role": "user",
                 "ts": _now_iso(),
             }
@@ -93,15 +116,18 @@ def _persist_conversation(phone: str, user_msg: str, bot_reply: str, session: di
         messages.append(
             {
                 "role": "assistant",
-                "content": bot_reply or "",
+                "summary": _summarize_bot_turn(session),
                 "agent_role": session.get("last_agent", "unknown"),
                 "ts": _now_iso(),
             }
         )
-
-        conv.messages = messages
+        # Keep last 100 summary entries per user
+        conv.messages = messages[-100:]
         conv.current_agent = session.get("last_agent", "unknown")
         conv.lead_score = int(session.get("lead_score") or 0)
+        conv.conversation_state = "active"
+        if session.get("lead_qualified"):
+            conv.conversation_state = "qualified"
         conv.updated_at = datetime.now(timezone.utc)
         db.commit()
     finally:
@@ -133,10 +159,13 @@ WELCOME_BUTTONS = [
 
 
 async def load_session_node(state: MessageState) -> dict:
-    session = await get_session(state["phone"])
+    from app.session.manager import normalize_phone
+
+    phone = normalize_phone(state["phone"])
+    session = await get_session(phone)
     session = enrich_session_from_message(session, state.get("message") or "")
-    session["phone"] = state["phone"]
-    return {"session": session}
+    session["phone"] = phone
+    return {"session": session, "phone": phone}
 
 
 async def greeting_node(state: MessageState) -> dict:
@@ -208,29 +237,34 @@ def _merge_prior_reply(state: MessageState, new_reply: str) -> str:
 
 
 async def pricing_agent_node(state: MessageState) -> dict:
+    session = dict(state.get("session") or {})
     gen = _get_db_generator()
     db = next(gen)
-    session = dict(state.get("session") or {})
     if state.get("phone") and not session.get("phone"):
         session["phone"] = state["phone"]
+    session["last_agent"] = "pricing"
     try:
         reply = await run_pricing_agent(
             state["message"],
             session,
             db,
         )
-        return {"agent_response": _merge_prior_reply(state, reply)}
+        return {"agent_response": _merge_prior_reply(state, reply), "session": session}
     finally:
         gen.close()
 
 
 async def faq_agent_node(state: MessageState) -> dict:
+    session = dict(state.get("session") or {})
+    if state.get("phone") and not session.get("phone"):
+        session["phone"] = state["phone"]
+    session["last_agent"] = "faq"
     reply = await run_faq_agent(
         state["message"],
         phone=state.get("phone") or "",
-        session=state.get("session") or {},
+        session=session,
     )
-    return {"agent_response": _merge_prior_reply(state, reply)}
+    return {"agent_response": _merge_prior_reply(state, reply), "session": session}
 
 
 async def order_agent_node(state: MessageState) -> dict:
@@ -245,6 +279,7 @@ async def order_agent_node(state: MessageState) -> dict:
             session,
             db,
         )
+        updated_session["last_agent"] = "order"
         return {
             "agent_response": _merge_prior_reply(state, reply),
             "session": updated_session,
@@ -265,6 +300,7 @@ async def qualify_agent_node(state: MessageState) -> dict:
             session,
             db,
         )
+        updated_session["last_agent"] = "qualifier"
         result: dict = {"agent_response": reply, "session": updated_session}
         if next_intent != "continue_qual":
             result["intent"] = next_intent
@@ -292,6 +328,7 @@ async def escalation_agent_node(state: MessageState) -> dict:
         _escalation_reason(state),
         phone=state.get("phone") or "",
     )
+    updated_session["last_agent"] = "escalation"
     return {
         "agent_response": _merge_prior_reply(state, reply),
         "session": updated_session,
@@ -324,9 +361,12 @@ async def post_guardrails_node(state: MessageState) -> dict:
 
 
 async def send_reply_node(state: MessageState) -> dict:
-    phone = state["phone"]
+    from app.session.manager import normalize_phone
+
+    phone = normalize_phone(state["phone"])
     final_reply = state.get("final_reply")
     session = dict(state.get("session") or {})
+    session["phone"] = phone
 
     if final_reply:
         final_reply, session = apply_menu_selection_ack(final_reply, session)
