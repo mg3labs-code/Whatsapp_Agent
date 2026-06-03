@@ -63,15 +63,22 @@ async def test_unqualified_order_routes_to_qualify(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unqualified_faq_routes_to_qualify(monkeypatch):
+async def test_unqualified_faq_routes_directly_to_faq(monkeypatch):
     monkeypatch.setattr(
         router_mod,
         "_classify_with_llm",
         AsyncMock(return_value=("faq", 0.9)),
     )
-    intent, session = await router_mod.classify_intent("i need medicines", {})
-    assert intent == "qualify"
-    assert session["pending_intent"] == "faq"
+    intent, session = await router_mod.classify_intent("what are your shipping timelines", {})
+    assert intent == "faq"
+    assert "pending_intent" not in session
+
+
+@pytest.mark.asyncio
+async def test_unqualified_faq_menu_button_skips_qualification():
+    intent, session = await router_mod.classify_intent("faq", {})
+    assert intent == "faq"
+    assert "pending_intent" not in session
 
 
 @pytest.mark.asyncio
@@ -122,8 +129,8 @@ async def test_qualified_high_confidence_returns_intent(monkeypatch):
 async def test_keyword_fallback_when_no_api_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     intent, session = await router_mod.classify_intent("what documents do you provide", {})
-    assert intent == "qualify"
-    assert session["pending_intent"] == "faq"
+    assert intent == "faq"
+    assert "pending_intent" not in session
 
 
 def test_parse_classifier_response_valid():

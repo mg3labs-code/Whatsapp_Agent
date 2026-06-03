@@ -221,7 +221,7 @@ async def test_qualify_agent_node_redirects_intent_after_complete(monkeypatch):
         "phone": "+91999",
         "message": "no",
         "message_id": "x",
-        "session": {"qual_state": "COLLECT_LICENSE"},
+        "session": {"qual_state": "COLLECT_BIZ_TYPE", "country": "Kenya"},
         "intent": "qualify",
         "agent_response": None,
         "guardrail_blocked": False,

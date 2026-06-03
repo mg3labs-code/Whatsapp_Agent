@@ -260,16 +260,18 @@ def score_product_category(text: str) -> tuple[int, bool, str | None]:
 
 
 def score_response_quality(session: dict) -> int:
-    has_company = bool(session.get("company"))
     has_country = bool(session.get("country"))
     has_biz = bool(session.get("business_type") or session.get("buyer_type"))
+    has_company = bool(session.get("company"))
     has_value = bool(
         session.get("order_value_usd") or session.get("annual_volume_usd")
     )
 
-    if has_company and has_country and has_biz and has_value:
+    if has_country and has_biz:
         return 10
-    if has_company and has_country and (has_biz or has_value):
+    if has_country or has_biz:
+        return 5
+    if has_company and has_value:
         return 5
     return 0
 

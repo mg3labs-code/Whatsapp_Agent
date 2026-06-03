@@ -15,7 +15,6 @@ from typing import Any
 import pinecone
 from langfuse import observe
 
-from app.agents.qualification import _prompt_collect_company
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -121,11 +120,6 @@ async def run_faq_agent(
 
         if not context_chunks:
             set_span_io(output_data={"status": "no_context"})
-            if not (session or {}).get("lead_qualified"):
-                return (
-                    "To help you with that, I first need a few quick details. "
-                    + _prompt_collect_company()
-                )
             return NO_CONTEXT_REPLY
 
         context = "\n\n".join(context_chunks)

@@ -171,15 +171,15 @@ async def test_send_reply_node_prepends_disclosure_once(monkeypatch):
         "intent": "qualify",
         "agent_response": None,
         "guardrail_blocked": False,
-        "final_reply": "May I get your company name?",
+        "final_reply": "Which country are you based in?",
         "greeting": True,
     }
     await graph_mod.send_reply_node(state)
 
     assert len(sent) == 1
     assert sent[0].startswith("Hi! 👋 I'm the AI assistant for *New Life Medicare*")
-    assert "company name" in sent[0].lower()
-    assert saved[0] == {}
+    assert "country" in sent[0].lower()
+    assert saved[0].get("phone") == "91999"
     assert sent_buttons == ["+91999"]
 
 
