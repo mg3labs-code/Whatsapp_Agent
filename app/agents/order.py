@@ -941,13 +941,26 @@ async def _handle_payment_selection(
     )
 
 
+def _is_payment_button_message(text: str, session: dict) -> bool:
+    lowered = (text or "").strip().lower()
+    if lowered in PAYMENT_BUTTON_IDS:
+        return True
+    if session.get("order_state") == SELECT_PAYMENT:
+        return True
+    if lowered in {"bank transfer", "debit / credit card"}:
+        return True
+    if "bank transfer" in lowered or "debit" in lowered or "credit card" in lowered:
+        return True
+    return False
+
+
 async def _try_payment_actions(
     message: str, session: dict, db: Session
 ) -> tuple[str, dict] | None:
     text = (message or "").strip().lower()
     state = session.get("order_state")
 
-    if text in PAYMENT_BUTTON_IDS or state == SELECT_PAYMENT:
+    if _is_payment_button_message(message, session):
         return await _handle_payment_selection(message, session, db)
 
     if text == "new_order":
