@@ -1,11 +1,10 @@
-"""Lead qualification agent — rule-based multi-turn state machine."""
+"""Lead qualification agent — country + business type only."""
 
 from __future__ import annotations
 
 import logging
 import re
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -16,21 +15,23 @@ from app.agents.lead_scoring import (
 )
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
+    classify_country,
     is_shipment_excluded_country,
 )
-from app.db.models import Lead
+from app.session.lead_persistence import upsert_lead_from_session
+from app.session.manager import normalize_phone
 from app.integrations.alerts import send_escalation_alert
 from app.integrations.whatsapp import send_interactive_buttons
 from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS
 
 logger = logging.getLogger(__name__)
 
-COLLECT_COMPANY = "COLLECT_COMPANY"
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_BIZ_TYPE = "COLLECT_BIZ_TYPE"
-COLLECT_VOLUME = "COLLECT_VOLUME"
-COLLECT_LICENSE = "COLLECT_LICENSE"
 QUAL_COMPLETE = "QUAL_COMPLETE"
+
+# Legacy states from older deployments — map to current steps
+_LEGACY_COMPANY = "COLLECT_COMPANY"
 
 CONTINUE_QUAL = "continue_qual"
 
@@ -66,22 +67,18 @@ _QUAL_COMPLETE_BUTTONS = [
     {"id": "speak", "title": "Speak to Team"},
 ]
 
-HOT_LEAD_MIN_SCORE = 80
+_PENDING_INTENT_HANDOFF: dict[str, str] = {
+    "order": (
+        "Thank you! ✅ You're all set.\n\n"
+        "Which product(s) would you like to order? Share product names or SKUs."
+    ),
+    "pricing": (
+        "Thank you! ✅ You're all set.\n\n"
+        "Please share the product name and quantity you need a quote for."
+    ),
+}
 
-_NO_LICENSE_PHRASES = (
-    "no",
-    "nope",
-    "none",
-    "n/a",
-    "na",
-    "don't have",
-    "do not have",
-    "dont have",
-    "not yet",
-    "no license",
-    "without license",
-    "i don't",
-)
+HOT_LEAD_MIN_SCORE = 80
 
 
 def calculate_lead_score(lead: dict) -> int:
@@ -89,44 +86,55 @@ def calculate_lead_score(lead: dict) -> int:
     return score_lead(lead).score
 
 
-def _extract_company_country(text: str) -> tuple[str | None, str | None]:
-    """Parse combined replies like 'Andrew from US' or 'Acme Pharma, USA'."""
+def _normalize_qual_state(state: str | None) -> str:
+    if not state or state in {_LEGACY_COMPANY, "COLLECT_VOLUME", "COLLECT_LICENSE"}:
+        return COLLECT_COUNTRY
+    if state == COLLECT_BIZ_TYPE:
+        return COLLECT_BIZ_TYPE
+    if state == QUAL_COMPLETE:
+        return QUAL_COMPLETE
+    return COLLECT_COUNTRY
+
+
+def _is_plausible_country(candidate: str) -> bool:
+    """Reject full sentences mistaken for a country name."""
+    stripped = (candidate or "").strip()
+    if len(stripped) < 2 or len(stripped) > 45:
+        return False
+    if len(stripped.split()) > 4:
+        return False
+    tier = classify_country(stripped)
+    if tier == "missing" and len(stripped.split()) > 1:
+        return False
+    return True
+
+
+def _extract_country(text: str) -> str | None:
+    """Parse country from replies like 'USA', 'from UK', or 'Nairobi, Kenya'."""
     stripped = (text or "").strip()
     if not stripped:
-        return None, None
+        return None
 
     from_match = re.search(
-        r"^(.+?)\s+from\s+([A-Za-z][A-Za-z\s\-]{1,60})$",
+        r"\bfrom\s+([A-Za-z][A-Za-z\s\-]{1,60})$",
         stripped,
         re.IGNORECASE,
     )
     if from_match:
-        company = from_match.group(1).strip(" ,")
-        country = from_match.group(2).strip()
-        if len(company) >= 3 and len(country) >= 2:
-            return company, country
+        return from_match.group(1).strip()
 
     if "," in stripped:
         parts = [p.strip() for p in stripped.split(",", 1)]
-        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
-            return parts[0], parts[1]
+        if len(parts) == 2 and len(parts[1]) >= 2:
+            return parts[1]
 
-    return None, None
-
-
-def _extract_company(text: str) -> str:
-    stripped = (text or "").strip()
-    if not stripped:
-        return ""
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    if len(lines) == 1:
-        return lines[0]
-    first_sentence = re.split(r"[.!?]", lines[0])[0].strip()
-    return first_sentence or lines[0]
+    return stripped if len(stripped) >= 2 else None
 
 
 def _extract_business_type(text: str) -> str:
     lowered = (text or "").lower()
+    if any(k in lowered for k in ("independent buyer", "independent", "personal buyer")):
+        return "independent_buyer"
     if any(k in lowered for k in ("pharmacy chain", "chain pharmacy", "retail chain")):
         return "pharmacy_chain"
     if any(k in lowered for k in ("hospital", "clinic", "medical center")):
@@ -138,54 +146,6 @@ def _extract_business_type(text: str) -> str:
     if any(k in lowered for k in ("pharmacy", "chemist", "drugstore")):
         return "pharmacy"
     return "other"
-
-
-def _extract_volume_usd(text: str) -> float | None:
-    raw = (text or "").strip().lower()
-    if not raw:
-        return None
-
-    million = re.search(
-        r"(\d[\d,]*(?:\.\d+)?)\s*(?:million|mil\b|m\b)",
-        raw,
-    )
-    if million:
-        return float(million.group(1).replace(",", "")) * 1_000_000
-
-    thousand = re.search(
-        r"(\d[\d,]*(?:\.\d+)?)\s*(?:thousand|k\b)",
-        raw,
-    )
-    if thousand:
-        return float(thousand.group(1).replace(",", "")) * 1_000
-
-    money = re.search(r"\$?\s*(\d[\d,]*(?:\.\d+)?)", raw)
-    if money:
-        value = float(money.group(1).replace(",", ""))
-        if "k" in raw and value < 1000:
-            value *= 1000
-        return value
-
-    return None
-
-
-def _extract_license_number(text: str) -> str | None:
-    stripped = (text or "").strip()
-    if not stripped:
-        return None
-
-    lowered = stripped.lower()
-    if any(phrase in lowered for phrase in _NO_LICENSE_PHRASES):
-        return None
-
-    code_match = re.search(r"[A-Za-z0-9][A-Za-z0-9\-/]{3,}", stripped)
-    if code_match:
-        return stripped
-
-    if re.search(r"\d", stripped):
-        return stripped
-
-    return None
 
 
 async def run_qualification_agent(
@@ -200,24 +160,18 @@ async def run_qualification_agent(
     session = dict(session or {})
     session = enrich_session_from_message(session, message)
     text = (message or "").strip()
-    state = session.get("qual_state") or COLLECT_COMPANY
+    state = _normalize_qual_state(session.get("qual_state"))
     session["qual_state"] = state
 
-    if state == COLLECT_COMPANY:
-        return _handle_collect_company(text, session)
     if state == COLLECT_COUNTRY:
         return _handle_collect_country(text, session)
     if state == COLLECT_BIZ_TYPE:
-        return _handle_collect_biz_type(text, session)
-    if state == COLLECT_VOLUME:
-        return _handle_collect_volume(text, session)
-    if state == COLLECT_LICENSE:
-        return await _handle_collect_license(text, session, db)
+        return await _handle_collect_biz_type(text, session, db)
     if state == QUAL_COMPLETE:
         return await _handle_qual_complete(session, db, message)
 
-    session["qual_state"] = COLLECT_COMPANY
-    return _prompt_collect_company(), session, CONTINUE_QUAL
+    session["qual_state"] = COLLECT_COUNTRY
+    return _prompt_collect_country(), session, CONTINUE_QUAL
 
 
 def _is_filler_reply(text: str) -> bool:
@@ -233,46 +187,13 @@ def _is_generic_reply(text: str) -> bool:
     )
 
 
-def _handle_collect_company(text: str, session: dict) -> tuple[str, dict, str]:
-    if not text or _is_generic_reply(text):
-        return _prompt_collect_company(), session, CONTINUE_QUAL
-
-    if _is_filler_reply(text) or len(text.strip()) < 3:
-        return (
-            "Please share your company or business name to continue.",
-            session,
-            CONTINUE_QUAL,
-        )
-
-    company, country = _extract_company_country(text)
-    if not company:
-        company = _extract_company(text)
-    if len(company) < 3:
-        return (
-            "Please share your company or business name to continue.",
-            session,
-            CONTINUE_QUAL,
-        )
-
-    session["company"] = company
-    if country and not is_shipment_excluded_country(country):
-        session["country"] = country
-        session["qual_state"] = COLLECT_BIZ_TYPE
-        return (
-            "What type of business are you? (distributor, pharmacy/clinic, doctor, "
-            "or independent buyer)",
-            session,
-            CONTINUE_QUAL,
-        )
-
-    session["qual_state"] = COLLECT_COUNTRY
-    return "And which country are you based in?", session, CONTINUE_QUAL
-
-
 def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
-    country = text.strip()
-    if not country or _is_generic_reply(text) or _is_filler_reply(text):
-        return "And which country are you based in?", session, CONTINUE_QUAL
+    if not text or _is_generic_reply(text) or _is_filler_reply(text):
+        return _prompt_collect_country(), session, CONTINUE_QUAL
+
+    country = _extract_country(text)
+    if not country or not _is_plausible_country(country):
+        return _prompt_collect_country(), session, CONTINUE_QUAL
 
     if is_shipment_excluded_country(country):
         return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_QUAL
@@ -287,7 +208,11 @@ def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
     )
 
 
-def _handle_collect_biz_type(text: str, session: dict) -> tuple[str, dict, str]:
+async def _handle_collect_biz_type(
+    text: str,
+    session: dict,
+    db: Session,
+) -> tuple[str, dict, str]:
     if (
         not text.strip()
         or _is_generic_reply(text)
@@ -303,51 +228,6 @@ def _handle_collect_biz_type(text: str, session: dict) -> tuple[str, dict, str]:
 
     session["business_type"] = _extract_business_type(text)
     session["buyer_type"] = map_business_type_to_buyer_type(session["business_type"], text)
-    session["qual_state"] = COLLECT_VOLUME
-    return (
-        "What is your typical order value in USD for one purchase? "
-        "(e.g., $150, $500, or $2,000 — or share annual volume like $500,000)",
-        session,
-        CONTINUE_QUAL,
-    )
-
-
-def _handle_collect_volume(text: str, session: dict) -> tuple[str, dict, str]:
-    volume = _extract_volume_usd(text)
-    if volume is None:
-        return (
-            "Could you share an approximate USD amount? (e.g., $500 per order or $100,000/year)",
-            session,
-            CONTINUE_QUAL,
-        )
-
-    if volume >= 10_000:
-        session["annual_volume_usd"] = volume
-    else:
-        session["order_value_usd"] = volume
-    session["qual_state"] = COLLECT_LICENSE
-    return (
-        "Do you hold a pharmaceutical import/distribution license? "
-        "If yes, please share the license number. (This field is optional)",
-        session,
-        CONTINUE_QUAL,
-    )
-
-
-async def _handle_collect_license(
-    text: str,
-    session: dict,
-    db: Session,
-) -> tuple[str, dict, str]:
-    if not text.strip():
-        return (
-            "Do you hold a pharmaceutical import/distribution license? "
-            "If yes, please share the license number. (This field is optional)",
-            session,
-            CONTINUE_QUAL,
-        )
-
-    session["license_number"] = _extract_license_number(text)
     session["qual_state"] = QUAL_COMPLETE
     return await _handle_qual_complete(session, db, text)
 
@@ -381,24 +261,9 @@ async def _handle_qual_complete(
             session.get("business_type"), message
         )
 
-    phone = session.get("phone") or ""
-    order_val = session.get("order_value_usd")
-    lead = Lead(
-        phone=phone,
-        company=session.get("company"),
-        country=session.get("country"),
-        business_type=session.get("business_type"),
-        buyer_type=session.get("buyer_type"),
-        license_number=session.get("license_number"),
-        annual_volume_usd=Decimal(str(session.get("annual_volume_usd") or 0)),
-        order_value_usd=Decimal(str(order_val)) if order_val else None,
-        lead_score=result.score,
-        lead_category=result.category,
-        lifecycle_stage="qualified",
-        manual_review_only=result.manual_review_only,
-    )
-    db.add(lead)
-    db.commit()
+    phone = normalize_phone(session.get("phone") or "")
+    session["phone"] = phone
+    upsert_lead_from_session(session, db)
 
     if result.disqualified:
         reply = (
@@ -425,6 +290,11 @@ async def _handle_qual_complete(
         session = await _apply_escalation_handoff(session, "hot_lead")
         return reply, session, "escalate"
 
+    pending = session.pop("pending_intent", None)
+    if pending in _PENDING_INTENT_HANDOFF:
+        return _PENDING_INTENT_HANDOFF[pending], session, pending
+
+    next_intent = pending or "faq"
     reply = (
         "Thank you! ✅ You're all set.\n\n"
         "What would you like to do?\n"
@@ -433,7 +303,6 @@ async def _handle_qual_complete(
         "• ❓ *FAQs* — shipping, documents, timelines\n\n"
         "Or reply *human* to speak with our team."
     )
-    next_intent = session.get("pending_intent") or "faq"
 
     if phone:
         await send_interactive_buttons(
@@ -445,8 +314,13 @@ async def _handle_qual_complete(
     return reply, session, next_intent
 
 
-def _prompt_collect_company() -> str:
+def _prompt_collect_country() -> str:
     return (
         "Welcome to New Life Medicare! To provide accurate pricing and ensure "
-        "compliance with export regulations, may I get your company name and country?"
+        "compliance with export regulations, which country are you based in?"
     )
+
+
+def _prompt_collect_company() -> str:
+    """Backward-compatible alias for FAQ/tests that referenced the old prompt."""
+    return _prompt_collect_country()

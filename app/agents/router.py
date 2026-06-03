@@ -21,6 +21,9 @@ CLARIFICATION_ATTEMPTS_BEFORE_ESCALATE = 2
 
 VALID_INTENTS = frozenset({"pricing", "faq", "order", "qualify", "escalate"})
 
+# Order and pricing require lead qualification; FAQ and general chat do not.
+INTENTS_REQUIRING_QUALIFICATION = frozenset({"order", "pricing"})
+
 HUMAN_KEYWORDS: tuple[str, ...] = (
     "human",
     "agent",
@@ -150,7 +153,9 @@ async def _classify_with_llm(message: str, phone: str = "") -> tuple[str, float]
 
 
 async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
-    """Classify buyer message and apply qualify-before-pricing / low-confidence rules.
+    """Classify buyer message and apply qualify-before-order/pricing rules.
+
+    FAQ is available without qualification. Order and pricing require a qualified lead.
 
     Returns (intent, updated_session).
     """
@@ -162,9 +167,10 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
     menu_intent = _menu_button_intent(message)
     if menu_intent:
         session = mark_menu_selection(session, message)
-        if not session.get("lead_qualified") and menu_intent != "escalate":
-            if menu_intent != "qualify":
-                session["pending_intent"] = menu_intent
+        if menu_intent == "escalate":
+            return "escalate", session
+        if not session.get("lead_qualified") and menu_intent in INTENTS_REQUIRING_QUALIFICATION:
+            session["pending_intent"] = menu_intent
             return "qualify", session
         return menu_intent, session
 
@@ -172,10 +178,17 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
     intent, confidence = await _classify_with_llm(message, phone=phone)
 
     if not session.get("lead_qualified"):
-        if intent != "escalate":
-            if intent != "qualify":
-                session["pending_intent"] = intent
+        if intent == "escalate":
+            return "escalate", session
+        if intent == "faq":
+            return "faq", session
+        if intent in INTENTS_REQUIRING_QUALIFICATION:
+            session["pending_intent"] = intent
             return "qualify", session
+        if intent == "qualify":
+            return "qualify", session
+        session["pending_intent"] = intent
+        return "qualify", session
 
     if confidence < 0.45 and session.get("lead_qualified"):
         prior_count = session.get("clarification_count", session.get("clarification_attempts", 0))

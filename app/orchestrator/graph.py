@@ -46,6 +46,7 @@ from app.messages.conversation_ui import (
     is_main_menu_request,
     should_send_navigation_footer,
 )
+from app.session.lead_hydration import hydrate_session_from_db
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
 
@@ -163,6 +164,13 @@ async def load_session_node(state: MessageState) -> dict:
 
     phone = normalize_phone(state["phone"])
     session = await get_session(phone)
+    if not session.get("lead_qualified"):
+        gen = _get_db_generator()
+        db = next(gen)
+        try:
+            session = hydrate_session_from_db(phone, session, db)
+        finally:
+            gen.close()
     session = enrich_session_from_message(session, state.get("message") or "")
     session["phone"] = phone
     return {"session": session, "phone": phone}

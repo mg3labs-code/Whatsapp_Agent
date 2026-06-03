@@ -116,7 +116,7 @@ def graph_env(monkeypatch, integration_db):
     async def fake_pricing(message: str, session: dict, db):
         return "Quote: Metformin 500mg at $0.95/strip.", session
 
-    async def fake_faq(message: str) -> str:
+    async def fake_faq(message: str, phone: str = "", session: dict | None = None) -> str:
         return "We ship via DHL worldwide."
 
     monkeypatch.setattr(graph_mod, "run_pricing_agent", fake_pricing)
@@ -205,11 +205,8 @@ async def test_scenario_c_hot_lead_escalation(graph_env, monkeypatch):
         {"pending_intent": "pricing", "phone": PHONE},
     )
     steps = [
-        "NHS Supply Chain",
         "United Kingdom",
-        "hospital",
-        "$2 million annual",
-        "LIC-UK-99",
+        "hospital wholesale bulk container diabetes",
     ]
     for i, text in enumerate(steps, start=1):
         await _invoke(PHONE, text, f"c{i}", graph_env)
@@ -349,11 +346,8 @@ def test_scenario_12_hospital_uk_2m_hot_score():
 async def test_scenario_12_qual_complete_escalates(integration_db):
     session = {"phone": PHONE, "pending_intent": "pricing"}
     for text in (
-        "NHS Supply Chain",
         "United Kingdom",
-        "hospital",
-        "$2 million",
-        "LIC-99",
+        "hospital wholesale bulk container diabetes metformin",
     ):
         _, session, intent = await run_qualification_agent(text, session, integration_db)
     assert session["lead_score"] >= 80

@@ -35,7 +35,7 @@ from app.agents.lead_scoring import (
 )
 from app.agents.qualification import (
     COLLECT_BIZ_TYPE,
-    COLLECT_COUNTRY as QUAL_COLLECT_COUNTRY,
+    COLLECT_COUNTRY,
     calculate_lead_score,
     run_qualification_agent,
 )
@@ -781,7 +781,6 @@ def test_calculate_lead_score_compat_wrapper():
 async def test_qualification_rejects_filler_biz_type(qual_db):
     session = {
         "phone": "+15550004444",
-        "company": "MedEx",
         "country": "Kenya",
         "qual_state": COLLECT_BIZ_TYPE,
     }
@@ -792,7 +791,7 @@ async def test_qualification_rejects_filler_biz_type(qual_db):
 
 
 @pytest.mark.asyncio
-async def test_qualification_complete_sends_post_qual_buttons(qual_db, monkeypatch):
+async def test_qualification_complete_with_pending_order_skips_menu(qual_db, monkeypatch):
     sent: list[tuple[str, list]] = []
 
     async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
@@ -805,16 +804,37 @@ async def test_qualification_complete_sends_post_qual_buttons(qual_db, monkeypat
     )
 
     session = {"phone": "+15550005555", "pending_intent": "order"}
-    _, session, _ = await run_qualification_agent("Acme Pharma", session, qual_db)
     _, session, _ = await run_qualification_agent("Kenya", session, qual_db)
-    _, session, _ = await run_qualification_agent("pharmacy", session, qual_db)
-    _, session, _ = await run_qualification_agent("$500", session, qual_db)
-    reply, session, intent = await run_qualification_agent("no", session, qual_db)
+    reply, session, intent = await run_qualification_agent("pharmacy", session, qual_db)
 
     assert intent == "order"
     assert "you're all set" in reply.lower()
+    assert "product" in reply.lower()
+    assert sent == []
+    assert session.get("pending_intent") is None
+    leads = qual_db.query(Lead).filter(Lead.phone == "15550005555").all()
+    assert len(leads) == 1
+
+
+@pytest.mark.asyncio
+async def test_qualification_complete_without_pending_sends_buttons(qual_db, monkeypatch):
+    sent: list[tuple[str, list]] = []
+
+    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
+        sent.append((phone, buttons))
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.qualification.send_interactive_buttons",
+        capture_buttons,
+    )
+
+    session = {"phone": "+15550006666"}
+    _, session, _ = await run_qualification_agent("Kenya", session, qual_db)
+    reply, session, intent = await run_qualification_agent("pharmacy", session, qual_db)
+
+    assert intent == "faq"
     assert sent
-    assert sent[0][0] == "+15550005555"
     assert {b["id"] for b in sent[0][1]} == {"order", "pricing", "speak"}
 
 
@@ -825,12 +845,12 @@ async def test_qualification_rejects_generic_hi_as_company(qual_db):
     reply, session, intent = await run_qualification_agent("hi", session, qual_db)
 
     assert intent == "continue_qual"
-    assert "company" not in session
-    assert "welcome" in reply.lower() or "company" in reply.lower()
+    assert "country" not in session
+    assert "welcome" in reply.lower() or "country" in reply.lower()
 
 
 @pytest.mark.asyncio
-async def test_faq_agent_no_context_unqualified_prompts_qualification(monkeypatch):
+async def test_faq_agent_no_context_returns_escalation_without_qualification(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
 
@@ -851,8 +871,8 @@ async def test_faq_agent_no_context_unqualified_prompts_qualification(monkeypatc
     ):
         out = await run_faq_agent("i need medicines", session={})
 
-    assert "quick details" in out.lower()
-    assert "connect you" not in out.lower()
+    assert out == NO_CONTEXT_REPLY or "connect you" in out.lower()
+    assert "quick details" not in out.lower()
 
 
 @pytest.mark.asyncio
@@ -860,29 +880,18 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
     session = {"phone": "+15550001111", "pending_intent": "pricing"}
 
     reply, session, intent = await run_qualification_agent("", session, qual_db)
-    assert "welcome" in reply.lower()
-    assert intent == "continue_qual"
-
-    reply, session, intent = await run_qualification_agent("MedEx Distributors LLC", session, qual_db)
-    assert session["qual_state"] == QUAL_COLLECT_COUNTRY
-    assert session["company"] == "MedEx Distributors LLC"
     assert "country" in reply.lower()
+    assert intent == "continue_qual"
 
     reply, session, intent = await run_qualification_agent("Kenya", session, qual_db)
     assert session["qual_state"] == COLLECT_BIZ_TYPE
     assert session["country"] == "Kenya"
+    assert "business" in reply.lower()
 
     reply, session, intent = await run_qualification_agent(
         "pharmaceutical distributor", session, qual_db
     )
     assert session["business_type"] == "distributor"
-    assert "volume" in reply.lower()
-
-    reply, session, intent = await run_qualification_agent("$50", session, qual_db)
-    assert session.get("order_value_usd") == 50.0
-    assert "license" in reply.lower()
-
-    reply, session, intent = await run_qualification_agent("no", session, qual_db)
     assert session.get("qual_state") is None
     assert session["lead_qualified"] is True
     assert session.get("qual_completed_at")
@@ -893,7 +902,6 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
 
     leads = qual_db.query(Lead).all()
     assert len(leads) == 1
-    assert leads[0].company == "MedEx Distributors LLC"
     assert leads[0].country == "Kenya"
     assert leads[0].business_type == "distributor"
 
@@ -902,11 +910,11 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
 async def test_qualification_high_score_escalates(qual_db):
     session = {"phone": "+15550002222"}
 
-    _, session, _ = await run_qualification_agent("NHS Supply Chain", session, qual_db)
+    session["pending_intent"] = "pricing"
     _, session, _ = await run_qualification_agent("UK", session, qual_db)
-    _, session, _ = await run_qualification_agent("distributor wholesale", session, qual_db)
-    _, session, _ = await run_qualification_agent("$2 million", session, qual_db)
-    reply, session, intent = await run_qualification_agent("LIC-998877", session, qual_db)
+    reply, session, intent = await run_qualification_agent(
+        "distributor wholesale bulk container diabetes metformin", session, qual_db
+    )
 
     assert session["lead_score"] >= 80
     assert session.get("lead_category") == "hot"
