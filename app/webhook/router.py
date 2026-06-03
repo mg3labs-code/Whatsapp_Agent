@@ -1,7 +1,5 @@
 import asyncio
-from datetime import datetime
-import hashlib
-import hmac
+import json
 import logging
 import os
 
@@ -9,10 +7,11 @@ from fastapi import APIRouter, BackgroundTasks, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from app.db.database import get_db
-from app.db.models import Order
-from app.integrations.alerts import send_order_team_alert
-from app.integrations.cashfree import handle_cashfree_webhook
-from app.integrations.whatsapp import send_message
+from app.integrations.cashfree import (
+    handle_cashfree_webhook,
+    process_cashfree_webhook_event,
+    verify_cashfree_webhook_signature,
+)
 from app.orchestrator.graph import compiled_graph
 from app.session.manager import _get_redis_client, get_session, save_session
 from app.utils.security import user_ref
@@ -65,98 +64,60 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     return Response(status_code=200)
 
 
-def _verify_cashfree_signature(raw_body: bytes, signature: str) -> bool:
-    secret = os.getenv("CASHFREE_WEBHOOK_SECRET", "")
-    if not secret or not signature:
-        return False
-    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, signature.strip())
-
-
-def _parse_payment_time(raw: str) -> datetime | None:
-    value = (raw or "").strip()
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-@webhook_router.post("/webhook/cashfree")
-async def receive_cashfree_webhook(request: Request) -> Response:
-    raw = await request.body()
-    signature = request.headers.get("X-Cashfree-Signature", "")
-    if not _verify_cashfree_signature(raw, signature):
-        return Response(status_code=401)
-
-    try:
-        payload = await request.json()
-    except Exception:
-        return Response(status_code=400)
-
+async def _process_cashfree_payload(payload: dict) -> None:
     event = handle_cashfree_webhook(payload)
     if event.get("status") == "ignored":
-        return Response(status_code=200)
+        logger.info("Cashfree webhook ignored event=%s", event.get("event_type"))
+        return
 
     db_gen = get_db()
     db = next(db_gen)
     try:
-        order = None
-        va_id = event.get("virtual_account_id")
-        order_ref = (event.get("order_ref") or "").strip()
-        if va_id:
-            order = (
-                db.query(Order)
-                .filter(Order.virtual_account_id == va_id)
-                .order_by(Order.created_at.desc(), Order.id.desc())
-                .first()
-            )
-        if not order and order_ref:
-            order = (
-                db.query(Order)
-                .filter(Order.order_ref.ilike(f"{order_ref}%"))
-                .order_by(Order.created_at.desc(), Order.id.desc())
-                .first()
-            )
-        if not order:
-            logger.warning("Cashfree webhook order not found: %s", event)
-            return Response(status_code=200)
-
-        base_ref = (order.order_ref or "").rsplit("-L", 1)[0]
-        amount = float(event.get("amount") or 0)
-        remitter = event.get("remitter_name") or "Unknown"
-        utr = event.get("utr") or ""
-        payment_time = event.get("payment_time") or ""
-        paid_at = _parse_payment_time(str(payment_time))
-
-        q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
-        q.update(
-            {
-                "payment_status": "payment_received",
-                "status": "payment_received",
-                "utr_number": utr,
-                "payment_id": event.get("payment_id"),
-                "payment_received_at": paid_at,
-                "virtual_account_id": va_id or Order.virtual_account_id,
-            },
-            synchronize_session=False,
-        )
-        db.commit()
-
-        await send_message(
-            order.phone,
-            f"✅ Payment of ${amount:,.2f} received! Order is being processed.",
-        )
-        await send_order_team_alert(
-            f"💰 Payment confirmed — {base_ref} — ${amount:,.2f} from {remitter} — UTR: {utr or 'N/A'}"
-        )
-        return Response(status_code=200)
+        await process_cashfree_webhook_event(event, db)
     except Exception:
         logger.exception("Cashfree webhook processing failed")
-        return Response(status_code=200)
     finally:
         db_gen.close()
+
+
+@webhook_router.get("/payment/return")
+async def payment_return() -> Response:
+    """Buyer lands here after card checkout — status comes via webhook, not redirect."""
+    return PlainTextResponse(
+        "Payment submitted. You can close this page and return to WhatsApp — "
+        "we will confirm your payment in the chat shortly."
+    )
+
+
+@webhook_router.post("/webhook/cashfree")
+async def receive_cashfree_webhook(
+    request: Request, background_tasks: BackgroundTasks
+) -> Response:
+    """Cashfree payment / payment-link / settlement webhooks."""
+    try:
+        raw = await request.body()
+    except Exception:
+        logger.warning("Cashfree webhook body read failed")
+        return Response(status_code=200)
+
+    verified = verify_cashfree_webhook_signature(
+        raw,
+        webhook_signature=request.headers.get("x-webhook-signature"),
+        webhook_timestamp=request.headers.get("x-webhook-timestamp"),
+        legacy_signature=request.headers.get("X-Cashfree-Signature"),
+    )
+    if not verified:
+        logger.warning("Cashfree webhook signature mismatch — ignoring payload")
+        return Response(status_code=200)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        logger.warning("Cashfree webhook JSON parse failed")
+        return Response(status_code=200)
+
+    background_tasks.add_task(_process_cashfree_payload, payload)
+    return Response(status_code=200)
 
 
 async def _is_duplicate(message_id: str, client) -> bool:

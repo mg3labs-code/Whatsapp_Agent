@@ -10,6 +10,7 @@ from typing import Any
 
 from langfuse import observe
 
+from app.agents.order import SELECT_PAYMENT
 from app.messages.conversation_ui import MENU_OPTION_IDS, mark_menu_selection
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -35,6 +36,8 @@ HUMAN_KEYWORDS: tuple[str, ...] = (
     "talk to someone",
     "connect me",
 )
+
+ORDER_ACTION_IDS = frozenset({"pay_bank", "pay_card", "new_order", "order_status"})
 
 CLASSIFIER_SYSTEM_PROMPT = (
     "Classify this pharmaceutical B2B WhatsApp message. Return ONLY valid JSON.\n"
@@ -163,6 +166,14 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
 
     if _matches_human_keyword(message):
         return "escalate", session
+
+    key = (message or "").strip().lower()
+    if key in ORDER_ACTION_IDS:
+        if key == "speak":
+            return "escalate", session
+        return "order", session
+    if session.get("order_state") == SELECT_PAYMENT:
+        return "order", session
 
     menu_intent = _menu_button_intent(message)
     if menu_intent:

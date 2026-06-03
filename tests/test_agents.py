@@ -24,7 +24,10 @@ from app.agents.order import (
     COLLECT_SKU,
     COLLECT_SKU_CONFIRM,
     CONFIRM_ORDER,
+    PAY_BANK_BUTTON,
+    PAY_CARD_BUTTON,
     SANCTIONED_COUNTRY_REFUSAL,
+    SELECT_PAYMENT,
     _resolve_product_row,
     run_order_agent,
 )
@@ -380,7 +383,8 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     reply, session = await run_order_agent("confirm", session, order_db)
     assert "order confirmed" in reply.lower()
     assert "ORD-" in reply
-    assert "order_state" not in session
+    assert session["order_state"] == SELECT_PAYMENT
+    assert session.get("last_order_total", 0) > 0
     assert session.get("lead_qualified") is True
     assert session.get("greeted") is True
     assert session.get("last_order_ref", "").startswith("ORD-")
@@ -639,6 +643,96 @@ async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
     reply, _ = await run_order_agent("where is my order", {"phone": "+15550123456"}, order_db)
     assert "order ord-" in reply.lower()
     assert "awaiting your payment transfer" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+
+    sent_messages: list[str] = []
+
+    async def fake_send_message(phone, text):
+        sent_messages.append(text)
+        return True
+
+    async def fake_send_buttons(phone, body, buttons):
+        sent_messages.append(body)
+        return True
+
+    async def fake_create_va(order_ref, amount, customer_phone):
+        return {
+            "virtual_account_id": "va_test_1",
+            "account_number": "1234567890",
+            "ifsc": "CF0000001",
+            "iban": "GB00TEST",
+            "swift_code": "CFSWIFT",
+            "amount": amount,
+        }
+
+    monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
+    monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
+    monkeypatch.setattr("app.agents.order.create_virtual_account", fake_create_va)
+
+    session = {"phone": "+91999"}
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg", session, order_db)
+    await run_order_agent("100", session, order_db)
+    await run_order_agent("done", session, order_db)
+    await run_order_agent("Kenya", session, order_db)
+    await run_order_agent("Nairobi", session, order_db)
+    await run_order_agent("Jane Doe", session, order_db)
+    _, session = await run_order_agent("confirm", session, order_db)
+    assert session["order_state"] == SELECT_PAYMENT
+
+    reply, session = await run_order_agent(PAY_BANK_BUTTON, session, order_db)
+    assert "bank transfer" in reply.lower()
+    assert session.get("payment_method_chosen") == "bank_transfer"
+    assert "order_state" not in session
+    assert any("Payment Instructions" in msg for msg in sent_messages)
+    assert order_db.query(Order).first().virtual_account_id == "va_test_1"
+
+
+@pytest.mark.asyncio
+async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+
+    sent_messages: list[str] = []
+
+    async def fake_send_message(phone, text):
+        sent_messages.append(text)
+        return True
+
+    async def fake_send_buttons(phone, body, buttons):
+        sent_messages.append(body)
+        return True
+
+    async def fake_create_link(order_ref, amount, customer_phone, customer_name=""):
+        return {
+            "link_url": "https://payments-test.cashfree.com/links/test123",
+            "link_id": order_ref,
+            "amount": amount,
+        }
+
+    monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
+    monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
+    monkeypatch.setattr("app.agents.order.create_payment_link", fake_create_link)
+
+    session = {"phone": "+91999"}
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg", session, order_db)
+    await run_order_agent("100", session, order_db)
+    await run_order_agent("done", session, order_db)
+    await run_order_agent("Kenya", session, order_db)
+    await run_order_agent("Nairobi", session, order_db)
+    await run_order_agent("Contact Name", session, order_db)
+    _, session = await run_order_agent("confirm", session, order_db)
+
+    reply, session = await run_order_agent(PAY_CARD_BUTTON, session, order_db)
+    assert "payment link" in reply.lower()
+    assert session.get("payment_method_chosen") == "card"
+    assert any("payments-test.cashfree.com" in msg for msg in sent_messages)
 
 
 @pytest.mark.asyncio
