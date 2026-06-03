@@ -225,7 +225,10 @@ async def router_node(state: MessageState) -> dict:
     if is_main_menu_request(state.get("message") or ""):
         return {"intent": "menu_refresh", "session": session}
 
-    if msg_key in PAYMENT_BUTTON_IDS or session.get("order_state") == SELECT_PAYMENT:
+    if msg_key in PAYMENT_BUTTON_IDS or msg_key in {
+        "bank transfer",
+        "debit / credit card",
+    } or session.get("order_state") == SELECT_PAYMENT:
         return {"intent": "order", "session": session}
 
     if session.get("order_state"):
