@@ -28,6 +28,7 @@ from app.agents.order import (
     PAY_CARD_BUTTON,
     SANCTIONED_COUNTRY_REFUSAL,
     SELECT_PAYMENT,
+    _resolve_pending_payment,
     _resolve_product_row,
     run_order_agent,
 )
@@ -733,6 +734,28 @@ async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
     assert "payment link" in reply.lower()
     assert session.get("payment_method_chosen") == "card"
     assert any("payments-test.cashfree.com" in msg for msg in sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_payment_resolves_from_db_when_session_missing(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+
+    session = {"phone": "+91999"}
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg", session, order_db)
+    await run_order_agent("100", session, order_db)
+    await run_order_agent("done", session, order_db)
+    await run_order_agent("Kenya", session, order_db)
+    await run_order_agent("Nairobi", session, order_db)
+    await run_order_agent("Jane Doe", session, order_db)
+    _, session = await run_order_agent("confirm", session, order_db)
+
+    empty_session = {"phone": "+91999"}
+    restored = _resolve_pending_payment(empty_session, order_db)
+    assert restored.get("last_order_ref", "").startswith("ORD-")
+    assert float(restored.get("last_order_total") or 0) > 0
+    assert restored.get("order_state") == SELECT_PAYMENT
 
 
 @pytest.mark.asyncio
