@@ -14,6 +14,7 @@ from langfuse import observe
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.agents.pricing import get_product_by_name
 from app.session.lead_hydration import phone_lookup_variants
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
