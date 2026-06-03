@@ -24,7 +24,7 @@ from langgraph.graph import END, StateGraph
 
 from app.agents.faq import run_faq_agent
 from app.agents.lead_scoring import enrich_session_from_message
-from app.agents.order import run_order_agent
+from app.agents.order import PAYMENT_BUTTON_IDS, SELECT_PAYMENT, run_order_agent
 from app.agents.pricing import run_pricing_agent
 from app.agents.escalation import run_escalation_agent
 from app.agents.qualification import run_qualification_agent
@@ -220,9 +220,13 @@ async def menu_refresh_node(state: MessageState) -> dict:
 
 async def router_node(state: MessageState) -> dict:
     session = dict(state.get("session") or {})
+    msg_key = (state.get("message") or "").strip().lower()
 
     if is_main_menu_request(state.get("message") or ""):
         return {"intent": "menu_refresh", "session": session}
+
+    if msg_key in PAYMENT_BUTTON_IDS or session.get("order_state") == SELECT_PAYMENT:
+        return {"intent": "order", "session": session}
 
     if session.get("order_state"):
         return {"intent": "order", "session": session}

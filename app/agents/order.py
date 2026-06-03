@@ -14,7 +14,7 @@ from langfuse import observe
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.agents.pricing import get_product_by_name
+from app.session.lead_hydration import phone_lookup_variants
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
     is_shipment_excluded_country,
@@ -763,10 +763,71 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
 
 
 def _latest_order_by_phone(db: Session, phone: str, order_ref: str | None = None) -> Order | None:
-    q = db.query(Order).filter(Order.phone == phone)
+    variants = phone_lookup_variants(phone)
+    if not variants:
+        return None
+    q = db.query(Order).filter(Order.phone.in_(variants))
     if order_ref:
         q = q.filter(Order.order_ref.ilike(f"{order_ref}%"))
     return q.order_by(Order.created_at.desc(), Order.id.desc()).first()
+
+
+def _orders_for_base_ref(db: Session, phone: str, base_ref: str) -> list[Order]:
+    variants = phone_lookup_variants(phone)
+    if not variants:
+        return []
+    return (
+        db.query(Order)
+        .filter(Order.phone.in_(variants), Order.order_ref.ilike(f"{base_ref}%"))
+        .order_by(Order.order_ref.asc())
+        .all()
+    )
+
+
+def _order_total_from_lines(db: Session, lines: list[Order]) -> float:
+    total = 0.0
+    for line in lines:
+        sku = line.sku or ""
+        match = re.fullmatch(r"PROD-(\d+)", sku, re.IGNORECASE)
+        if not match:
+            continue
+        product = db.query(Product).filter(Product.id == int(match.group(1))).first()
+        if product is None:
+            continue
+        total += float(product.price_per_strip or 0) * int(line.quantity or 0)
+    return round(total, 2)
+
+
+def _resolve_pending_payment(session: dict, db: Session) -> dict:
+    """Restore payment context from session or latest awaiting_payment order in DB."""
+    session = dict(session or {})
+    if session.get("last_order_ref") and float(session.get("last_order_total") or 0) > 0:
+        return session
+
+    phone = session.get("phone") or ""
+    latest = _latest_order_by_phone(db, phone)
+    if latest is None:
+        return session
+
+    status = (latest.payment_status or latest.status or "").strip().lower()
+    if status not in {"awaiting_payment", "pending", ""}:
+        return session
+
+    base_ref = (latest.order_ref or "").rsplit("-L", 1)[0]
+    if not base_ref:
+        return session
+
+    lines = _orders_for_base_ref(db, phone, base_ref)
+    total = _order_total_from_lines(db, lines)
+    if total <= 0:
+        total = float(session.get("last_order_total") or 1.0)
+
+    session["last_order_ref"] = base_ref
+    session["last_order_total"] = total
+    session["order_state"] = SELECT_PAYMENT
+    if latest.contact_name and not session.get("last_order_contact"):
+        session["last_order_contact"] = latest.contact_name
+    return session
 
 
 def _update_orders_virtual_account(
@@ -853,15 +914,15 @@ async def _handle_payment_selection(
     message: str, session: dict, db: Session
 ) -> tuple[str, dict]:
     text = (message or "").strip().lower()
+    session = _resolve_pending_payment(session, db)
     order_ref = session.get("last_order_ref")
     amount = float(session.get("last_order_total") or 0.0)
     phone = session.get("phone") or ""
 
     if not order_ref:
-        session.pop("order_state", None)
         return (
             "I couldn't find a recent order to pay for. "
-            "Please place an order first or share your order reference.",
+            "Please place an order first or share your order reference (e.g. ORD-20260603-2439).",
             session,
         )
 
