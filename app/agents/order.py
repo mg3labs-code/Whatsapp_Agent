@@ -21,7 +21,13 @@ from app.business.countries import (
 )
 from app.db.models import Order, Product
 from app.integrations.alerts import send_order_alert
-from app.integrations.whatsapp import send_interactive_buttons
+from app.integrations.cashfree import (
+    create_payment_link,
+    create_virtual_account,
+    get_card_payment_text,
+    get_payment_instructions_text,
+)
+from app.integrations.whatsapp import send_interactive_buttons, send_message
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -37,8 +43,24 @@ COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_CITY = "COLLECT_CITY"
 COLLECT_CONTACT = "COLLECT_CONTACT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
+SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
 ORDER_COMPLETE = "ORDER_COMPLETE"
+
+PAY_BANK_BUTTON = "pay_bank"
+PAY_CARD_BUTTON = "pay_card"
+PAYMENT_BUTTON_IDS = frozenset({PAY_BANK_BUTTON, PAY_CARD_BUTTON})
+
+PAYMENT_OPTION_BUTTONS = [
+    {"id": PAY_BANK_BUTTON, "title": "Bank Transfer"},
+    {"id": PAY_CARD_BUTTON, "title": "Debit / Credit Card"},
+]
+
+POST_PAYMENT_BUTTONS = [
+    {"id": "new_order", "title": "New Order"},
+    {"id": "order_status", "title": "Order Status"},
+    {"id": "speak", "title": "Speak to Team"},
+]
 
 SANCTIONED_COUNTRY_REFUSAL = SHIPMENT_EXCLUDED_REFUSAL
 
@@ -285,6 +307,15 @@ def _item_qty(item: dict[str, Any]) -> int:
 
 def _format_money(amount: float) -> str:
     return f"${amount:,.2f}"
+
+
+def _cart_total(cart: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for item in cart:
+        qty = _item_qty(item)
+        unit_price = float(item.get("unit_price") or 0.0)
+        total += qty * unit_price
+    return round(total, 2)
 
 
 def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
@@ -662,6 +693,10 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
         f"ORD-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
     )
     phone = session.get("phone") or ""
+    contact = session.get("order_contact") or ""
+    order_total = _cart_total(cart)
+    if order_total <= 0:
+        order_total = 1.0
 
     for idx, item in enumerate(cart, start=1):
         db.add(
@@ -699,39 +734,169 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
         }
     )
 
-    city = session.get("order_city", "")
-    country = session.get("order_country", "")
-    contact = session.get("order_contact", "")
-    product_lines = "\n".join(
-        f"• {item.get('product_name')} — {_item_qty(item)} units ({item.get('sku')})"
-        for item in cart
-    )
     _clear_order_session(session)
     session.pop("cart", None)
     session.pop("pending_product", None)
     session["lead_qualified"] = True
     session["greeted"] = True
     session["last_order_ref"] = order_ref
-    phone = session.get("phone") or ""
+    session["last_order_total"] = order_total
+    session["last_order_contact"] = contact
+    session["order_state"] = SELECT_PAYMENT
     if phone:
         await send_interactive_buttons(
             phone,
             (
                 f"✅ *Order {order_ref} confirmed!*\n"
-                "Our sales team will send your proforma invoice within 24 hours."
+                f"Total: {_format_money(order_total)}\n\n"
+                "Please choose how you'd like to pay the full amount:"
             ),
-            [
-                {"id": "new_order", "title": "New Order"},
-                {"id": "order_status", "title": "Order Status"},
-                {"id": "speak", "title": "Speak to Team"},
-            ],
+            PAYMENT_OPTION_BUTTONS,
         )
     reply = (
         f"✅ *Order Confirmed!*\n"
         f"Order Ref: {order_ref}\n"
-        "Our sales team will send your proforma invoice within 24 hours."
+        f"Total: {_format_money(order_total)}\n\n"
+        "Choose *Bank Transfer* or *Debit / Credit Card* to complete payment."
     )
     return reply, session
+
+
+def _latest_order_by_phone(db: Session, phone: str, order_ref: str | None = None) -> Order | None:
+    q = db.query(Order).filter(Order.phone == phone)
+    if order_ref:
+        q = q.filter(Order.order_ref.ilike(f"{order_ref}%"))
+    return q.order_by(Order.created_at.desc(), Order.id.desc()).first()
+
+
+def _update_orders_virtual_account(
+    db: Session, base_ref: str, virtual_account_id: str | None
+) -> None:
+    if not virtual_account_id:
+        return
+    db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%")).update(
+        {"virtual_account_id": virtual_account_id},
+        synchronize_session=False,
+    )
+    db.commit()
+
+
+async def _send_post_payment_buttons(phone: str, body: str) -> None:
+    if phone:
+        await send_interactive_buttons(phone, body, POST_PAYMENT_BUTTONS)
+
+
+async def _handle_bank_transfer(
+    session: dict, db: Session, order_ref: str, amount: float, phone: str
+) -> tuple[str, dict]:
+    contact = session.get("last_order_contact") or session.get("order_contact") or ""
+    va_details = await create_virtual_account(order_ref, amount, phone)
+    _update_orders_virtual_account(db, order_ref, va_details.get("virtual_account_id"))
+
+    order_payload = {
+        "order_ref": order_ref,
+        "total_amount": amount,
+        "contact_name": contact,
+    }
+    instructions = get_payment_instructions_text(order_payload, va_details)
+    session.pop("order_state", None)
+    session["payment_method_chosen"] = "bank_transfer"
+
+    if phone:
+        await send_message(phone, instructions)
+        await _send_post_payment_buttons(
+            phone,
+            f"Bank transfer details sent for *{order_ref}*.\n"
+            "Share your UTR/reference once you've paid.",
+        )
+
+    return (
+        f"Bank transfer details for *{order_ref}* ({_format_money(amount)}) have been sent. "
+        "Please complete the transfer and reply with your UTR/reference number.",
+        session,
+    )
+
+
+async def _handle_card_payment(
+    session: dict, order_ref: str, amount: float, phone: str
+) -> tuple[str, dict]:
+    contact = session.get("last_order_contact") or session.get("order_contact") or ""
+    link_details = await create_payment_link(order_ref, amount, phone, contact)
+    link_url = link_details.get("link_url")
+
+    session.pop("order_state", None)
+    session["payment_method_chosen"] = "card"
+
+    if not link_url:
+        return (
+            "Sorry, we couldn't generate a card payment link right now. "
+            "Please choose *Bank Transfer* or contact our team for assistance.",
+            session,
+        )
+
+    card_text = get_card_payment_text(order_ref, amount, link_url)
+    if phone:
+        await send_message(phone, card_text)
+        await _send_post_payment_buttons(
+            phone,
+            f"Secure card payment link sent for *{order_ref}*.",
+        )
+
+    return (
+        f"Secure payment link for *{order_ref}* ({_format_money(amount)}) has been sent. "
+        "Open the link to pay by debit or credit card.",
+        session,
+    )
+
+
+async def _handle_payment_selection(
+    message: str, session: dict, db: Session
+) -> tuple[str, dict]:
+    text = (message or "").strip().lower()
+    order_ref = session.get("last_order_ref")
+    amount = float(session.get("last_order_total") or 0.0)
+    phone = session.get("phone") or ""
+
+    if not order_ref:
+        session.pop("order_state", None)
+        return (
+            "I couldn't find a recent order to pay for. "
+            "Please place an order first or share your order reference.",
+            session,
+        )
+
+    if text == PAY_BANK_BUTTON or "bank transfer" in text:
+        return await _handle_bank_transfer(session, db, order_ref, amount, phone)
+    if text == PAY_CARD_BUTTON or "debit" in text or "credit card" in text or text == "card":
+        return await _handle_card_payment(session, order_ref, amount, phone)
+
+    return (
+        f"Order *{order_ref}* total: {_format_money(amount)}.\n\n"
+        "Please choose a payment method using the buttons below:\n"
+        "• *Bank Transfer* — domestic or international wire\n"
+        "• *Debit / Credit Card* — secure Cashfree checkout link",
+        session,
+    )
+
+
+async def _try_payment_actions(
+    message: str, session: dict, db: Session
+) -> tuple[str, dict] | None:
+    text = (message or "").strip().lower()
+    state = session.get("order_state")
+
+    if text in PAYMENT_BUTTON_IDS or state == SELECT_PAYMENT:
+        return await _handle_payment_selection(message, session, db)
+
+    if text == "new_order":
+        session.pop("order_state", None)
+        session.pop("last_order_ref", None)
+        session.pop("last_order_total", None)
+        session.pop("payment_method_chosen", None)
+        session["order_state"] = COLLECT_SKU
+        return "Starting a new order. Which product would you like to add?", session
+
+    return None
 
 
 def _extract_order_status_ref(text: str) -> str | None:
@@ -757,13 +922,6 @@ def _status_message(status: str, eta: str = "") -> str:
         "delivered": "Delivered ✅",
     }
     return mapping.get(status, "We are reviewing your order and will update you shortly.")
-
-
-def _latest_order_by_phone(db: Session, phone: str, order_ref: str | None = None) -> Order | None:
-    q = db.query(Order).filter(Order.phone == phone)
-    if order_ref:
-        q = q.filter(Order.order_ref.ilike(f"{order_ref}%"))
-    return q.order_by(Order.created_at.desc(), Order.id.desc()).first()
 
 
 def _execute_order_tool(name: str, args: dict, session: dict, db: Session) -> dict:
@@ -1170,6 +1328,10 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     _ensure_order_started(session)
     state = session.get("order_state") or COLLECT_SKU
     text = (message or "").strip()
+
+    payment_result = await _try_payment_actions(message, session, db)
+    if payment_result is not None:
+        return payment_result
 
     # Deterministic UX guards regardless of LLM mode.
     if _is_order_status_query(text):
