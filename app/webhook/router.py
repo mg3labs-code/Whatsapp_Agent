@@ -102,12 +102,22 @@ async def receive_cashfree_webhook(
 
     verified = verify_cashfree_webhook_signature(
         raw,
-        webhook_signature=request.headers.get("x-webhook-signature"),
-        webhook_timestamp=request.headers.get("x-webhook-timestamp"),
-        legacy_signature=request.headers.get("X-Cashfree-Signature"),
+        webhook_signature=request.headers.get("x-webhook-signature")
+        or request.headers.get("X-Webhook-Signature"),
+        webhook_timestamp=request.headers.get("x-webhook-timestamp")
+        or request.headers.get("X-Webhook-Timestamp"),
+        legacy_signature=request.headers.get("X-Cashfree-Signature")
+        or request.headers.get("x-cashfree-signature"),
     )
     if not verified:
-        logger.warning("Cashfree webhook signature mismatch — ignoring payload")
+        logger.warning(
+            "Cashfree webhook signature mismatch — ignoring payload "
+            "(env=%s, has_ts=%s, has_sig=%s, body_len=%s)",
+            os.getenv("CASHFREE_ENV", "?"),
+            bool(request.headers.get("x-webhook-timestamp")),
+            bool(request.headers.get("x-webhook-signature")),
+            len(raw),
+        )
         return Response(status_code=200)
 
     try:
