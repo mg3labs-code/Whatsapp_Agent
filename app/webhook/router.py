@@ -4,7 +4,7 @@ import logging
 import os
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from app.db.database import get_db
 from app.integrations.cashfree import (
@@ -87,6 +87,37 @@ async def payment_return() -> Response:
         "Payment submitted. You can close this page and return to WhatsApp — "
         "we will confirm your payment in the chat shortly."
     )
+
+
+@webhook_router.get("/payment/checkout")
+async def payment_checkout(session_id: str = "") -> Response:
+    """Open Cashfree hosted checkout from a payment_session_id (Orders API flow)."""
+    sid = (session_id or "").strip()
+    if not sid.startswith("session_") or len(sid) > 512:
+        return PlainTextResponse("Invalid or missing payment session.", status_code=400)
+
+    mode = "production" if os.getenv("CASHFREE_ENV", "sandbox").strip().lower() == "production" else "sandbox"
+    safe_sid = sid.replace("\\", "\\\\").replace('"', '\\"').replace("<", "").replace(">", "")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Secure payment</title>
+  <script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+</head>
+<body>
+  <p>Opening secure payment page…</p>
+  <script>
+    const cashfree = Cashfree({{ mode: "{mode}" }});
+    cashfree.checkout({{
+      paymentSessionId: "{safe_sid}",
+      redirectTarget: "_self"
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 @webhook_router.post("/webhook/cashfree")
