@@ -18,7 +18,7 @@ def test_verify_webhook_signature_2025_format(monkeypatch):
 
     body = b'{"type":"PAYMENT_LINK_EVENT","data":{"link_id":"ORD-20250603-1234"}}'
     timestamp = "1617695238078"
-    signed = f"{timestamp}.".encode() + body
+    signed = timestamp.encode() + body
     signature = base64.b64encode(
         hmac.new(secret.encode(), signed, hashlib.sha256).digest()
     ).decode()
@@ -56,6 +56,17 @@ def test_parse_payment_link_event_paid():
     assert event["order_ref"] == "ORD-20250603-1234"
     assert event["buyer_phone"] == "+919876543210"
     assert event["payment_id"] == "cf_order_abc"
+
+
+def test_verify_webhook_signature_legacy_hex(monkeypatch):
+    secret = "webhook_only_secret"
+    monkeypatch.setenv("CASHFREE_SECRET_KEY", secret)
+    monkeypatch.delenv("CASHFREE_WEBHOOK_SECRET", raising=False)
+
+    body = b'{"type":"PAYMENT_SUCCESS_WEBHOOK","data":{}}'
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    assert verify_cashfree_webhook_signature(body, legacy_signature=digest)
 
 
 def test_parse_payment_link_event_expired():

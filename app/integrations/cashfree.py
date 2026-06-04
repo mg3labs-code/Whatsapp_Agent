@@ -235,6 +235,16 @@ def get_payment_instructions_text(order: dict, va_details: dict) -> str:
     )
 
 
+def _cashfree_hmac_b64(secret: str, message: bytes) -> str:
+    return base64.b64encode(
+        hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    ).decode("utf-8")
+
+
+def _cashfree_hmac_hex(secret: str, message: bytes) -> str:
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
 def verify_cashfree_webhook_signature(
     raw_body: bytes,
     *,
@@ -242,26 +252,45 @@ def verify_cashfree_webhook_signature(
     webhook_timestamp: str | None = None,
     legacy_signature: str | None = None,
 ) -> bool:
-    """Verify Cashfree webhook — supports 2025-01-01 and legacy header formats."""
-    client_secret = os.getenv("CASHFREE_SECRET_KEY", "")
-    webhook_secret = os.getenv("CASHFREE_WEBHOOK_SECRET", "")
-
-    if webhook_timestamp and webhook_signature and client_secret:
-        signed_payload = f"{webhook_timestamp}.".encode("utf-8") + raw_body
-        expected = base64.b64encode(
-            hmac.new(client_secret.encode(), signed_payload, hashlib.sha256).digest()
-        ).decode("utf-8")
-        if hmac.compare_digest(expected, webhook_signature.strip()):
-            return True
-
-    if legacy_signature and webhook_secret:
-        digest = hmac.new(webhook_secret.encode(), raw_body, hashlib.sha256).hexdigest()
-        if hmac.compare_digest(digest, legacy_signature.strip()):
-            return True
+    """Verify Cashfree webhook (2023-08-01 / 2025-01-01 and legacy headers)."""
+    client_secret = os.getenv("CASHFREE_SECRET_KEY", "").strip()
+    webhook_secret = (os.getenv("CASHFREE_WEBHOOK_SECRET", "") or client_secret).strip()
+    sig = (webhook_signature or legacy_signature or "").strip()
+    ts = (webhook_timestamp or "").strip()
 
     if not client_secret and not webhook_secret:
         logger.warning("Cashfree secrets not set — skipping webhook signature check")
         return True
+
+    if not sig:
+        return False
+
+    secrets = [s for s in (client_secret, webhook_secret) if s]
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    unique_secrets: list[str] = []
+    for s in secrets:
+        if s not in seen:
+            seen.add(s)
+            unique_secrets.append(s)
+
+    if ts:
+        # Official: HMAC-SHA256 base64 over (timestamp + raw body) — no separator.
+        signed_std = ts.encode("utf-8") + raw_body
+        for secret in unique_secrets:
+            if hmac.compare_digest(_cashfree_hmac_b64(secret, signed_std), sig):
+                return True
+        # Some older samples used timestamp + "." + body; keep for compatibility.
+        signed_dot = f"{ts}.".encode("utf-8") + raw_body
+        for secret in unique_secrets:
+            if hmac.compare_digest(_cashfree_hmac_b64(secret, signed_dot), sig):
+                return True
+
+    for secret in unique_secrets:
+        if hmac.compare_digest(_cashfree_hmac_hex(secret, raw_body), sig):
+            return True
+        if hmac.compare_digest(_cashfree_hmac_b64(secret, raw_body), sig):
+            return True
 
     return False
 
