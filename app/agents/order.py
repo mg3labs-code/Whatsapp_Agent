@@ -23,7 +23,7 @@ from app.business.countries import (
 from app.db.models import Order, Product
 from app.integrations.alerts import send_order_alert
 from app.integrations.cashfree import (
-    create_payment_link,
+    create_card_checkout,
     create_virtual_account,
     get_card_payment_text,
     get_payment_instructions_text,
@@ -883,7 +883,7 @@ async def _handle_card_payment(
     session: dict, order_ref: str, amount: float, phone: str
 ) -> tuple[str, dict]:
     contact = session.get("last_order_contact") or session.get("order_contact") or ""
-    link_details = await create_payment_link(order_ref, amount, phone, contact)
+    link_details = await create_card_checkout(order_ref, amount, phone, contact)
     link_url = link_details.get("link_url")
 
     session.pop("order_state", None)

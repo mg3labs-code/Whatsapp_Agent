@@ -10,6 +10,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from typing import Any
 
 import httpx
@@ -118,6 +119,83 @@ def _sanitize_link_id(order_ref: str) -> str:
     return cleaned[:50] or "order"
 
 
+def _cashfree_checkout_mode() -> str:
+    """links | orders | auto — auto tries payment link then orders API."""
+    return os.getenv("CASHFREE_PAYMENT_MODE", "auto").strip().lower()
+
+
+def _checkout_page_url(payment_session_id: str) -> str | None:
+    base_url = os.getenv("BASE_URL", "").strip().rstrip("/")
+    if not base_url or not payment_session_id:
+        return None
+    return f"{base_url}/payment/checkout?session_id={quote(payment_session_id, safe='')}"
+
+
+async def create_order_checkout(
+    order_ref: str,
+    amount: float,
+    customer_phone: str,
+    customer_name: str = "",
+) -> dict[str, Any]:
+    """Create Cashfree PG order + payment session; buyer pays via /payment/checkout."""
+    headers = _cashfree_headers()
+    base = headers.pop("_base")
+    order_id = _sanitize_link_id(order_ref)
+    currency = os.getenv("CASHFREE_LINK_CURRENCY", "INR").strip().upper() or "INR"
+    base_url = os.getenv("BASE_URL", "").strip().rstrip("/")
+
+    customer: dict[str, str] = {
+        "customer_id": order_id[:45],
+        "customer_phone": customer_phone.lstrip("+"),
+    }
+    if customer_name:
+        customer["customer_name"] = customer_name
+
+    payload: dict[str, Any] = {
+        "order_id": order_id,
+        "order_amount": round(float(amount), 2),
+        "order_currency": currency,
+        "customer_details": customer,
+        "order_tags": {
+            "order_ref": order_ref,
+            "phone": customer_phone.lstrip("+"),
+        },
+    }
+    if base_url:
+        payload["order_meta"] = {
+            "notify_url": f"{base_url}/webhook/cashfree",
+            "return_url": f"{base_url}/payment/return?order_id={{order_id}}",
+        }
+
+    out: dict[str, Any] = {
+        "link_id": order_id,
+        "link_url": None,
+        "amount": round(float(amount), 2),
+        "currency": currency,
+        "payment_session_id": None,
+        "checkout_mode": "orders",
+    }
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            response = await client.post(f"{base}/pg/orders", headers=headers, json=payload)
+            if response.status_code < 400:
+                data = response.json()
+                session_id = data.get("payment_session_id")
+                out["payment_session_id"] = session_id
+                out["link_url"] = _checkout_page_url(str(session_id or ""))
+            else:
+                logger.warning(
+                    "Cashfree create order failed: HTTP %s body=%s",
+                    response.status_code,
+                    response.text[:300],
+                )
+        except Exception:
+            logger.exception("Cashfree create order error")
+
+    return out
+
+
 async def create_payment_link(
     order_ref: str,
     amount: float,
@@ -166,6 +244,7 @@ async def create_payment_link(
         "link_url": None,
         "amount": round(float(amount), 2),
         "currency": currency,
+        "checkout_mode": "payment_link",
     }
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -188,6 +267,32 @@ async def create_payment_link(
             logger.exception("Cashfree payment link creation error")
 
     return out
+
+
+async def create_card_checkout(
+    order_ref: str,
+    amount: float,
+    customer_phone: str,
+    customer_name: str = "",
+) -> dict[str, Any]:
+    """Card/UPI checkout URL — Payment Links API or Orders API (see CASHFREE_PAYMENT_MODE)."""
+    mode = _cashfree_checkout_mode()
+
+    if mode == "orders":
+        return await create_order_checkout(order_ref, amount, customer_phone, customer_name)
+
+    link_out = await create_payment_link(order_ref, amount, customer_phone, customer_name)
+    if link_out.get("link_url") or mode == "links":
+        return link_out
+
+    logger.info(
+        "Payment link unavailable for %s — falling back to Cashfree Orders API",
+        order_ref,
+    )
+    order_out = await create_order_checkout(order_ref, amount, customer_phone, customer_name)
+    if order_out.get("link_url"):
+        return order_out
+    return link_out
 
 
 def get_card_payment_text(order_ref: str, amount: float, link_url: str) -> str:
@@ -380,11 +485,15 @@ def handle_cashfree_webhook(payload: dict) -> dict[str, Any]:
 
     body = data.get("data") if isinstance(data.get("data"), dict) else data
     link_notes = body.get("link_notes") if isinstance(body.get("link_notes"), dict) else {}
+    order_tags = body.get("order_tags") if isinstance(body.get("order_tags"), dict) else {}
+    order_block = body.get("order") if isinstance(body.get("order"), dict) else {}
 
     order_ref = (
         link_notes.get("order_ref")
+        or order_tags.get("order_ref")
         or body.get("order_ref")
         or body.get("reference_id")
+        or order_block.get("order_id")
         or body.get("order_id")
         or body.get("merchant_order_id")
         or body.get("link_id")
