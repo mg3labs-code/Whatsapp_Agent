@@ -124,8 +124,16 @@ def _cashfree_checkout_mode() -> str:
     return os.getenv("CASHFREE_PAYMENT_MODE", "auto").strip().lower()
 
 
+def _checkout_base_url() -> str:
+    """Origin Cashfree JS checkout validates — must be a Website-whitelisted domain."""
+    explicit = os.getenv("CASHFREE_CHECKOUT_BASE_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    return os.getenv("BASE_URL", "").strip().rstrip("/")
+
+
 def _checkout_page_url(payment_session_id: str) -> str | None:
-    base_url = os.getenv("BASE_URL", "").strip().rstrip("/")
+    base_url = _checkout_base_url()
     if not base_url or not payment_session_id:
         return None
     return f"{base_url}/payment/checkout?session_id={quote(payment_session_id, safe='')}"
