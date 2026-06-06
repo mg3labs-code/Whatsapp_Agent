@@ -12,6 +12,7 @@ from app.integrations.cashfree import (
     process_cashfree_webhook_event,
     verify_cashfree_webhook_signature,
 )
+from app.integrations.indiapost import process_indiapost_webhook_event
 from app.orchestrator.graph import compiled_graph
 from app.session.manager import _get_redis_client, get_session, save_session
 from app.utils.security import user_ref
@@ -158,6 +159,35 @@ async def receive_cashfree_webhook(
         return Response(status_code=200)
 
     background_tasks.add_task(_process_cashfree_payload, payload)
+    return Response(status_code=200)
+
+
+async def _process_indiapost_payload(payload: dict) -> None:
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        await process_indiapost_webhook_event(payload, db)
+    except Exception:
+        logger.exception("India Post webhook processing failed")
+    finally:
+        db_gen.close()
+
+
+@webhook_router.post("/webhook/indiapost")
+async def receive_indiapost_webhook(
+    request: Request, background_tasks: BackgroundTasks
+) -> Response:
+    """India Post shipment tracking event webhooks (register URL with India Post)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("India Post webhook JSON parse failed")
+        return Response(status_code=200)
+
+    if not isinstance(payload, dict):
+        return Response(status_code=200)
+
+    background_tasks.add_task(_process_indiapost_payload, payload)
     return Response(status_code=200)
 
 
