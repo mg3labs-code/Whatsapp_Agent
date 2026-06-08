@@ -29,8 +29,23 @@ from app.db.models import Order
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Attach AWB to an order")
-    parser.add_argument("order_ref", help="Order ref, e.g. ORD-20260608-6727")
-    parser.add_argument("awb", help="India Post AWB, e.g. EB126023474IN")
+    parser.add_argument(
+        "order_ref",
+        nargs="?",
+        default="",
+        help="Order ref, e.g. ORD-20260608-6727 (or use --latest)",
+    )
+    parser.add_argument("awb", nargs="?", default="", help="India Post AWB, e.g. EB126023474IN")
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the most recently created order",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List 10 most recent orders and exit",
+    )
     parser.add_argument(
         "--shipped",
         action="store_true",
@@ -42,19 +57,41 @@ def main() -> None:
         print("Missing DATABASE_URL")
         sys.exit(1)
 
-    base_ref = args.order_ref.strip().upper().split("-L")[0]
-    awb = args.awb.strip().upper()
-
     db = SessionLocal()
     try:
-        order = (
-            db.query(Order)
-            .filter(Order.order_ref.like(f"{base_ref}%"))
-            .order_by(Order.created_at.desc())
-            .first()
-        )
+        if args.list:
+            rows = db.query(Order).order_by(Order.created_at.desc()).limit(10).all()
+            if not rows:
+                print("No orders in database")
+                sys.exit(1)
+            for o in rows:
+                print(
+                    f"{o.order_ref}\t{o.phone}\t{o.payment_status or o.status}\t{o.tracking_number or '-'}"
+                )
+            return
+
+        awb = (args.awb or "").strip().upper()
+        if not awb:
+            print("AWB required, e.g. EB126023474IN")
+            sys.exit(1)
+
+        if args.latest:
+            order = db.query(Order).order_by(Order.created_at.desc()).first()
+        else:
+            base_ref = (args.order_ref or "").strip().upper().split("-L")[0]
+            if not base_ref:
+                print("Provide order_ref or use --latest")
+                sys.exit(1)
+            order = (
+                db.query(Order)
+                .filter(Order.order_ref.like(f"{base_ref}%"))
+                .order_by(Order.created_at.desc())
+                .first()
+            )
         if not order:
-            print(f"No order found matching {base_ref}")
+            ref = args.order_ref or "(latest)"
+            print(f"No order found matching {ref}")
+            print("Run: python scripts/set_order_awb.py --list")
             sys.exit(1)
 
         order.tracking_number = awb

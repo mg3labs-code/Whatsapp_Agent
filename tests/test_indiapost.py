@@ -4,6 +4,7 @@ from app.integrations.indiapost import (
     extract_tracking_number,
     format_tracking_message,
     is_indiapost_configured,
+    parse_tracking_summary,
 )
 
 
@@ -25,10 +26,24 @@ def test_format_tracking_message_bulk_shape():
         ],
         "del_status": {"del_status": "delivered"},
     }
-    msg = format_tracking_message("EB126023474IN", row, order_ref="ORD-20260604-4720")
+    msg = format_tracking_message("EB126023474IN", row)
     assert "EB126023474IN" in msg
     assert "Delivered" in msg
-    assert "ORD-20260604-4720" in msg
+    assert "Vijayanagar S.O" in msg
+    assert msg.index("AWB:") < msg.index("Status:")
+
+
+def test_format_tracking_message_not_delivered_first():
+    row = {
+        "booking_details": {"article_number": "EB126023474IN", "delivery_location": "Vijayanagar S.O"},
+        "del_status": {"del_status": "not delivered"},
+    }
+    msg = format_tracking_message("EB126023474IN", row)
+    summary = parse_tracking_summary("EB126023474IN", row)
+    assert "Not delivered" in msg
+    assert summary["location"] == "Vijayanagar S.O"
+    assert msg.startswith("📦 *Shipment tracking*")
+    assert "AWB: EB126023474IN" in msg
 
 
 def test_is_order_tracking_message_detects_awb():
