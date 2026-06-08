@@ -984,17 +984,24 @@ def _extract_order_status_ref(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _is_order_status_query(text: str) -> bool:
+def is_order_tracking_message(text: str) -> bool:
+    """True for order status / AWB tracking queries (route to order agent)."""
     lowered = (text or "").lower().strip()
     return (
         lowered == "order_status"
+        or lowered == "order status"
         or "order status" in lowered
         or "track" in lowered
         or "where is my order" in lowered
         or "where is my shipment" in lowered
+        or "awb" in lowered
         or bool(_extract_order_status_ref(text))
         or bool(extract_tracking_number(text))
     )
+
+
+def _is_order_status_query(text: str) -> bool:
+    return is_order_tracking_message(text)
 
 
 async def _append_indiapost_tracking(
@@ -1332,6 +1339,8 @@ async def _run_order_rules(
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
+        if _is_order_status_query(text):
+            return await _run_order_rules(message, session, db)
         if not text:
             return "Which product would you like to add? (name or SKU)", session
         product, error, match_mode = _resolve_product_match(text, db)

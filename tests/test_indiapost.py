@@ -31,6 +31,15 @@ def test_format_tracking_message_bulk_shape():
     assert "ORD-20260604-4720" in msg
 
 
+def test_is_order_tracking_message_detects_awb():
+    from app.agents.order import is_order_tracking_message
+
+    assert is_order_tracking_message("EB126023474IN")
+    assert is_order_tracking_message("Order status - EB126023474IN")
+    assert is_order_tracking_message("order_status")
+    assert not is_order_tracking_message("Metformin 500mg")
+
+
 def test_is_indiapost_configured(monkeypatch):
     monkeypatch.delenv("INDIAPOST_USERNAME", raising=False)
     monkeypatch.delenv("INDIAPOST_PASSWORD", raising=False)
