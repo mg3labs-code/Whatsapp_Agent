@@ -187,16 +187,23 @@ def _delivery_status(row: dict) -> str:
     return "in_transit"
 
 
-def format_tracking_message(
-    tracking_number: str,
-    row: dict[str, Any],
-    *,
-    order_ref: str = "",
-) -> str:
-    """Build WhatsApp-friendly tracking summary from bulk or single API row."""
+def _shipment_status_label(status: str) -> str:
+    normalized = (status or "").strip().lower().replace("_", " ")
+    if normalized in {"not delivered", "not_delivered"}:
+        return "Not delivered — in transit"
+    if normalized == "delivered":
+        return "Delivered ✅"
+    if normalized in {"in transit", "intransit"}:
+        return "In transit"
+    return normalized.title() or "In transit"
+
+
+def parse_tracking_summary(tracking_number: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Extract structured shipment fields from an India Post API row."""
     booking = row.get("booking_details") if isinstance(row.get("booking_details"), dict) else {}
     events = row.get("tracking_details") if isinstance(row.get("tracking_details"), list) else []
     history = row.get("history") if isinstance(row.get("history"), list) else []
+    timeline = events or history
 
     article = str(
         booking.get("article_number")
@@ -205,40 +212,75 @@ def format_tracking_message(
         or tracking_number
     ).upper()
     status = _delivery_status(row)
-    origin = booking.get("origin_pincode") or row.get("origin") or ""
-    destination = (
-        booking.get("destination_pincode")
-        or row.get("destination")
-        or booking.get("delivery_location")
-        or ""
-    )
-    eta = str(row.get("estimatedDelivery") or row.get("estimated_delivery") or "").strip()
-
-    lines = ["📦 *Shipment tracking*"]
-    if order_ref:
-        lines.append(f"Order: {order_ref}")
-    lines.append(f"AWB: {article}")
-    lines.append(f"Status: {status.replace('_', ' ').title() or 'In transit'}")
-    if origin or destination:
-        lines.append(f"Route: {origin or '?'} → {destination or '?'}")
-    if eta:
-        lines.append(f"Est. delivery: {eta}")
-
-    timeline = events or history
+    latest_event = ""
+    latest_when = ""
+    latest_where = ""
     if timeline:
         latest = timeline[-1]
-        when = latest.get("date") or latest.get("timestamp") or ""
-        where = latest.get("office") or latest.get("location") or ""
-        event = latest.get("event") or latest.get("status") or ""
-        if event:
-            lines.append("─────────────────")
-            lines.append(f"Latest: {event}")
-            if where:
-                lines.append(f"At: {where}")
-            if when:
-                lines.append(f"When: {when}")
+        latest_event = str(latest.get("event") or latest.get("status") or "").strip()
+        latest_when = str(latest.get("date") or latest.get("timestamp") or "").strip()
+        latest_where = str(latest.get("office") or latest.get("location") or "").strip()
 
+    location = (
+        latest_where
+        or str(booking.get("delivery_location") or "").strip()
+        or str(row.get("event_office_name") or "").strip()
+        or str(row.get("destination") or "").strip()
+    )
+    origin = str(booking.get("origin_pincode") or row.get("origin") or "").strip()
+    destination = str(
+        booking.get("destination_pincode")
+        or booking.get("delivery_location")
+        or row.get("destination")
+        or ""
+    ).strip()
+    eta = str(row.get("estimatedDelivery") or row.get("estimated_delivery") or "").strip()
+
+    return {
+        "awb": article,
+        "status": status,
+        "status_label": _shipment_status_label(status),
+        "location": location,
+        "latest_event": latest_event,
+        "latest_when": latest_when,
+        "origin": origin,
+        "destination": destination,
+        "eta": eta,
+        "is_delivered": status == "delivered" or "delivered" in latest_event.lower(),
+    }
+
+
+def format_tracking_message(
+    tracking_number: str,
+    row: dict[str, Any],
+    *,
+    order_ref: str = "",
+) -> str:
+    """Build WhatsApp-friendly shipment block (AWB + status + location first)."""
+    summary = parse_tracking_summary(tracking_number, row)
+    lines = ["📦 *Shipment tracking*"]
+    lines.append(f"AWB: {summary['awb']}")
+    lines.append(f"Status: {summary['status_label']}")
+    if summary["location"]:
+        lines.append(f"📍 Location: {summary['location']}")
+    if summary["origin"] or summary["destination"]:
+        lines.append(f"Route: {summary['origin'] or '?'} → {summary['destination'] or '?'}")
+    if summary["eta"]:
+        lines.append(f"Est. delivery: {summary['eta']}")
+    if summary["latest_event"]:
+        lines.append("─────────────────")
+        lines.append(f"Latest update: {summary['latest_event']}")
+        if summary["latest_when"]:
+            lines.append(f"When: {summary['latest_when']}")
     return "\n".join(lines)
+
+
+async def _fetch_tracking_row(tracking_number: str) -> dict[str, Any] | None:
+    bulk = await track_bulk([tracking_number])
+    rows = bulk.get("data") if isinstance(bulk.get("data"), list) else []
+    if rows and isinstance(rows[0], dict):
+        return rows[0]
+    return await track_single(tracking_number)
 
 
 async def lookup_tracking_message(
@@ -247,18 +289,36 @@ async def lookup_tracking_message(
     order_ref: str = "",
 ) -> str | None:
     """Fetch India Post tracking and return WhatsApp text, or None if unavailable."""
+    _ = order_ref  # order summary is composed separately in order agent
     if not is_indiapost_configured():
         return None
-
-    bulk = await track_bulk([tracking_number])
-    rows = bulk.get("data") if isinstance(bulk.get("data"), list) else []
-    if rows and isinstance(rows[0], dict):
-        return format_tracking_message(tracking_number, rows[0], order_ref=order_ref)
-
-    single = await track_single(tracking_number)
-    if single:
-        return format_tracking_message(tracking_number, single, order_ref=order_ref)
+    row = await _fetch_tracking_row(tracking_number)
+    if row:
+        return format_tracking_message(tracking_number, row)
     return None
+
+
+async def lookup_tracking_summary(tracking_number: str) -> dict[str, Any] | None:
+    """Fetch structured India Post tracking fields, or None if unavailable."""
+    if not is_indiapost_configured():
+        return None
+    row = await _fetch_tracking_row(tracking_number)
+    if row:
+        return parse_tracking_summary(tracking_number, row)
+    return None
+
+
+async def fetch_tracking_bundle(
+    tracking_number: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """One API round-trip — returns (whatsapp_text, structured_summary)."""
+    if not is_indiapost_configured():
+        return None, None
+    row = await _fetch_tracking_row(tracking_number)
+    if not row:
+        return None, None
+    summary = parse_tracking_summary(tracking_number, row)
+    return format_tracking_message(tracking_number, row), summary
 
 
 def _map_event_to_payment_status(event_code: str, event_description: str) -> str | None:

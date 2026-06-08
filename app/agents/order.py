@@ -30,6 +30,7 @@ from app.integrations.cashfree import (
 )
 from app.integrations.indiapost import (
     extract_tracking_number,
+    fetch_tracking_bundle,
     is_indiapost_configured,
     lookup_tracking_message,
 )
@@ -1004,25 +1005,65 @@ def _is_order_status_query(text: str) -> bool:
     return is_order_tracking_message(text)
 
 
-async def _append_indiapost_tracking(
-    base_message: str,
+def _format_order_summary_for_status(
+    order,
+    base_ref: str,
+    *,
+    shipment_summary: dict | None = None,
+) -> str:
+    """Order/payment lines shown below live shipment tracking."""
+    payment_status = (order.payment_status or "").strip().lower()
+    order_status = (order.status or "processing").strip().lower()
+    lines = [f"📋 *Order {base_ref}*"]
+
+    if payment_status in {"awaiting_payment", "payment_received"}:
+        lines.append(f"Payment: {payment_status.replace('_', ' ').title()}")
+        lines.append(_status_message(payment_status))
+        return "\n".join(lines)
+
+    if shipment_summary:
+        # Shipment block above is source of truth — avoid contradicting "delivered".
+        if not shipment_summary.get("is_delivered"):
+            if payment_status == "shipped" or order_status == "shipped":
+                lines.append("Shipment: Dispatched — see tracking above.")
+            elif order_status == "processing":
+                lines.append("Shipment: Being prepared.")
+        return "\n".join(lines)
+
+    display_status = payment_status if payment_status else order_status
+    lines.append(f"Status: {display_status.replace('_', ' ').title()}")
+    lines.append(_status_message(display_status))
+    return "\n".join(lines)
+
+
+async def _build_order_status_reply(
+    order,
+    base_ref: str,
     *,
     tracking_number: str,
-    order_ref: str = "",
 ) -> str:
-    if not tracking_number or not is_indiapost_configured():
-        return base_message
-    tracking_msg = await lookup_tracking_message(
-        tracking_number,
-        order_ref=order_ref,
+    """Shipment tracking first (AWB, status, location), then order/payment summary."""
+    tracking_msg = None
+    shipment_summary = None
+    if tracking_number:
+        tracking_msg, shipment_summary = await fetch_tracking_bundle(tracking_number)
+
+    order_summary = _format_order_summary_for_status(
+        order,
+        base_ref,
+        shipment_summary=shipment_summary,
     )
+
     if tracking_msg:
-        return f"{base_message}\n\n{tracking_msg}"
-    return (
-        f"{base_message}\n\n"
-        "_Live India Post tracking is temporarily unavailable — "
-        "we'll update you when the shipment is booked._"
-    )
+        return f"{tracking_msg}\n\n{order_summary}"
+
+    if tracking_number:
+        return (
+            f"{order_summary}\n\n"
+            "_Live India Post tracking is temporarily unavailable — "
+            "we'll update you when the shipment is booked._"
+        )
+    return order_summary
 
 
 def _status_message(status: str, eta: str = "") -> str:
@@ -1271,28 +1312,11 @@ async def _run_order_rules(
             )
         ref = latest.order_ref or "ORD-UNKNOWN"
         base_ref = ref.split("-L")[0]
-        payment_status = (latest.payment_status or "").strip().lower()
-        order_status = (latest.status or "processing").strip().lower()
-        if payment_status in {
-            "awaiting_payment",
-            "payment_received",
-            "processing",
-            "shipped",
-            "delivered",
-        }:
-            display_status = payment_status
-        else:
-            display_status = order_status
-        base_message = (
-            f"📦 *Order {base_ref}*\n"
-            f"Status: {display_status.replace('_', ' ')}\n"
-            f"{_status_message(display_status)}"
-        )
         tracking_number = awb_from_text or (latest.tracking_number or "")
-        reply = await _append_indiapost_tracking(
-            base_message,
+        reply = await _build_order_status_reply(
+            latest,
+            base_ref,
             tracking_number=tracking_number,
-            order_ref=base_ref,
         )
         return reply, session
 

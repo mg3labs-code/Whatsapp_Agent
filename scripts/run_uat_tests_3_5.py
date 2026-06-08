@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from app.agents.order import _append_indiapost_tracking, _status_message
+from app.agents.order import _build_order_status_reply
 from app.db.database import SessionLocal
 from app.db.models import Order
 from app.integrations.indiapost import lookup_tracking_message
@@ -64,16 +64,10 @@ def test_3_assign_awb(order_ref: str, awb: str) -> Order:
 async def test_4_order_status(order: Order, awb: str) -> None:
     print("\n=== Test 4: Order Status + live India Post tracking ===")
     ref = (order.order_ref or "ORD-UNKNOWN").split("-L")[0]
-    display_status = (order.payment_status or order.status or "processing").strip().lower()
-    base_message = (
-        f"📦 *Order {ref}*\n"
-        f"Status: {display_status.replace('_', ' ')}\n"
-        f"{_status_message(display_status)}"
-    )
-    reply = await _append_indiapost_tracking(
-        base_message,
+    reply = await _build_order_status_reply(
+        order,
+        ref,
         tracking_number=awb.upper(),
-        order_ref=ref,
     )
     print("WhatsApp reply preview:")
     print("-" * 40)
