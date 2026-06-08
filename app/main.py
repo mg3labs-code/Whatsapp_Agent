@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.db.database import engine
+from app.db.migrate import is_railway_production, run_alembic_upgrade_head
 from app.integrations.cashfree import start_overdue_scheduler
 from app.session.manager import ping_redis, redis_configured, redis_key_stats
 from app.utils.tracing import flush_langfuse
@@ -19,8 +20,10 @@ app = FastAPI(title="WASA - WhatsApp AI Sales Agent", version="1.0.0")
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    """Verify DB connectivity. Run schema migrations manually (alembic upgrade head)."""
+    """Apply pending Alembic migrations on Railway, then verify DB connectivity."""
     try:
+        if is_railway_production():
+            run_alembic_upgrade_head()
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         logger.info("DB connected")
