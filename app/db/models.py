@@ -67,6 +67,7 @@ class Order(Base):
     utr_number = Column(String, nullable=True)
     payment_id = Column(String, nullable=True)
     payment_received_at = Column(DateTime, nullable=True)
+    tracking_number = Column(String, nullable=True, index=True)
     order_ref = Column(String, unique=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

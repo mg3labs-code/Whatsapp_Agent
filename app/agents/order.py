@@ -28,6 +28,11 @@ from app.integrations.cashfree import (
     get_card_payment_text,
     get_payment_instructions_text,
 )
+from app.integrations.indiapost import (
+    extract_tracking_number,
+    is_indiapost_configured,
+    lookup_tracking_message,
+)
 from app.integrations.whatsapp import send_interactive_buttons, send_message
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -979,12 +984,44 @@ def _extract_order_status_ref(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _is_order_status_query(text: str) -> bool:
-    lowered = (text or "").lower()
+def is_order_tracking_message(text: str) -> bool:
+    """True for order status / AWB tracking queries (route to order agent)."""
+    lowered = (text or "").lower().strip()
     return (
-        "order status" in lowered
+        lowered == "order_status"
+        or lowered == "order status"
+        or "order status" in lowered
+        or "track" in lowered
         or "where is my order" in lowered
+        or "where is my shipment" in lowered
+        or "awb" in lowered
         or bool(_extract_order_status_ref(text))
+        or bool(extract_tracking_number(text))
+    )
+
+
+def _is_order_status_query(text: str) -> bool:
+    return is_order_tracking_message(text)
+
+
+async def _append_indiapost_tracking(
+    base_message: str,
+    *,
+    tracking_number: str,
+    order_ref: str = "",
+) -> str:
+    if not tracking_number or not is_indiapost_configured():
+        return base_message
+    tracking_msg = await lookup_tracking_message(
+        tracking_number,
+        order_ref=order_ref,
+    )
+    if tracking_msg:
+        return f"{base_message}\n\n{tracking_msg}"
+    return (
+        f"{base_message}\n\n"
+        "_Live India Post tracking is temporarily unavailable — "
+        "we'll update you when the shipment is booked._"
     )
 
 
@@ -1215,11 +1252,21 @@ async def _run_order_rules(
     phone = session.get("phone") or ""
     if phone and _is_order_status_query(text):
         requested_ref = _extract_order_status_ref(text)
+        awb_from_text = extract_tracking_number(text)
         latest = _latest_order_by_phone(db, phone, requested_ref)
+        if not latest and awb_from_text:
+            tracking_only = await lookup_tracking_message(awb_from_text)
+            if tracking_only:
+                return tracking_only, session
+            return (
+                f"I couldn't find an order linked to AWB *{awb_from_text}* yet. "
+                "Please check the number or contact our team.",
+                session,
+            )
         if not latest:
             return (
                 "I couldn't find any recent order for this number yet. "
-                "Please share your order reference (e.g., ORD-12345).",
+                "Please share your order reference (e.g., ORD-12345) or AWB number.",
                 session,
             )
         ref = latest.order_ref or "ORD-UNKNOWN"
@@ -1236,12 +1283,18 @@ async def _run_order_rules(
             display_status = payment_status
         else:
             display_status = order_status
-        return (
+        base_message = (
             f"📦 *Order {base_ref}*\n"
             f"Status: {display_status.replace('_', ' ')}\n"
-            f"{_status_message(display_status)}",
-            session,
+            f"{_status_message(display_status)}"
         )
+        tracking_number = awb_from_text or (latest.tracking_number or "")
+        reply = await _append_indiapost_tracking(
+            base_message,
+            tracking_number=tracking_number,
+            order_ref=base_ref,
+        )
+        return reply, session
 
     state = session.get("order_state") or COLLECT_SKU
     session["order_state"] = state
@@ -1286,6 +1339,8 @@ async def _run_order_rules(
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
+        if _is_order_status_query(text):
+            return await _run_order_rules(message, session, db)
         if not text:
             return "Which product would you like to add? (name or SKU)", session
         product, error, match_mode = _resolve_product_match(text, db)
