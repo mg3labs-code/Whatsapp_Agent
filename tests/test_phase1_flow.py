@@ -151,10 +151,12 @@ async def test_qualification_country_picker_once(order_db):
 async def test_qualification_country_button_sets_country(order_db):
     session = {"phone": "+919876543210", "qual_state": "COLLECT_COUNTRY", "country_picker_sent": True}
     with patch("app.agents.qualification.send_country_picker", new=AsyncMock(side_effect=lambda _p, s: s)):
-        reply, session, _ = await run_qualification_agent("country_au", session, order_db)
+        with patch("app.agents.qualification._send_business_type_picker", new=AsyncMock()):
+            reply, session, _ = await run_qualification_agent("country_au", session, order_db)
     assert session["country"] == "Australia"
     assert session["qual_state"] == "COLLECT_BIZ_TYPE"
-    assert "business" in reply.lower()
+    assert session.get("biz_type_picker_sent") is True
+    assert "business type" in reply.lower()
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,11 @@ def _extract_message_text(message: dict) -> str | None:
 
         if interactive_type == "list_reply":
             list_reply = interactive.get("list_reply") or {}
-            return list_reply.get("id") or list_reply.get("title")
+            return (
+                list_reply.get("id")
+                or list_reply.get("title")
+                or list_reply.get("description")
+            )
 
     return None
 

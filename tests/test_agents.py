@@ -992,6 +992,48 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
 
 
 @pytest.mark.asyncio
+async def test_qualification_accepts_list_title_biz_type(qual_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.qualification.send_main_menu_list",
+        AsyncMock(return_value=True),
+    )
+    session = {
+        "phone": "+15550007777",
+        "country": "Australia",
+        "qual_state": COLLECT_BIZ_TYPE,
+        "biz_type_picker_sent": True,
+    }
+    reply, session, intent = await run_qualification_agent(
+        "Doctor / Prescriber / physician",
+        session,
+        qual_db,
+    )
+    assert session.get("qual_state") is None
+    assert session["lead_qualified"] is True
+    assert session["business_type"] == "doctor"
+    assert intent == "faq"
+    assert "you're all set" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_accepts_typed_clinic(qual_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.qualification.send_main_menu_list",
+        AsyncMock(return_value=True),
+    )
+    session = {
+        "phone": "+15550008888",
+        "country": "Australia",
+        "qual_state": COLLECT_BIZ_TYPE,
+        "biz_type_picker_sent": True,
+    }
+    reply, session, intent = await run_qualification_agent("clinic", session, qual_db)
+    assert session.get("qual_state") is None
+    assert session["business_type"] == "pharmacy"
+    assert intent == "faq"
+
+
+@pytest.mark.asyncio
 async def test_qualification_high_score_escalates(qual_db):
     session = {"phone": "+15550002222"}
 
