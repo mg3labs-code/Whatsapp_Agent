@@ -37,13 +37,11 @@ from app.integrations.indiapost import (
 from app.integrations.whatsapp import send_interactive_buttons, send_message
 from app.messages.onboarding import (
     BULK_LIST_PROMPT,
-    QTY_BUTTON_IDS,
-    QTY_BUTTON_MAP,
     checkout_prompt,
     looks_like_bulk_order,
     parse_bulk_order_lines,
     parse_checkout_oneline,
-    send_quantity_picker,
+    product_qty_prompt,
 )
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -293,9 +291,31 @@ def _clear_order_session(session: dict) -> None:
         session.pop(key, None)
 
 
+_ORDER_FILLER = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "hii",
+    "hiii",
+})
+
+
+def _is_filler_message(text: str) -> bool:
+    return (text or "").strip().lower() in _ORDER_FILLER
+
+
 def _ensure_order_started(session: dict) -> None:
-    if not session.get("order_state"):
-        session["order_state"] = COLLECT_SKU
+    """Begin product collection only when buyer is actively ordering."""
+    if session.get("order_state"):
+        return
+    if _get_cart(session):
+        session["order_state"] = CART_MENU
+        return
+    session["order_state"] = COLLECT_SKU
 
 
 def _set_pending_product(
@@ -350,23 +370,14 @@ def _set_bulk_queue(session: dict, queue: list[str]) -> None:
         session.pop("order_bulk_queue", None)
 
 
-async def _start_quantity_step(
-    session: dict,
-    product: Product,
-    *,
-    phone: str,
-) -> tuple[str, dict]:
+def _prompt_product_quantity(session: dict, product: Product) -> tuple[str, dict]:
+    """Ask buyer to type quantity — no button picker."""
     session["order_sku"] = _product_sku(product)
     session["order_product_name"] = product.product_name
     session["order_unit_price"] = float(product.price_per_strip or 0.0)
     session["order_state"] = COLLECT_QTY
     session.pop("order_qty_custom", None)
-    if phone:
-        await send_quantity_picker(phone, product.product_name)
-    return (
-        f"Found: *{product.product_name}*\nSelect quantity from the list, or type a number.",
-        session,
-    )
+    return product_qty_prompt(product.product_name), session
 
 
 async def _process_bulk_order(
@@ -403,7 +414,7 @@ async def _process_bulk_order(
         _set_bulk_queue(session, pending[1:])
         product, error, _ = _resolve_product_match(first_query, db)
         if product is not None and error != "restricted":
-            return await _start_quantity_step(session, product, phone=phone)
+            return _prompt_product_quantity(session, product)
 
     if added:
         session["order_state"] = CART_MENU
@@ -438,7 +449,7 @@ async def _continue_bulk_queue(session: dict, db: Session, phone: str) -> tuple[
                 session,
             )
         return await _continue_bulk_queue(session, db, phone)
-    return await _start_quantity_step(session, product, phone=phone)
+    return _prompt_product_quantity(session, product)
 
 
 def _format_money(amount: float) -> str:
@@ -1102,28 +1113,36 @@ async def _try_payment_actions(
         return await _handle_payment_selection(message, session, db)
 
     if text == "new_order":
-        session.pop("order_state", None)
         session.pop("last_order_ref", None)
         session.pop("last_order_total", None)
         session.pop("payment_method_chosen", None)
+        _clear_order_session(session)
         session["order_state"] = COLLECT_SKU
-        return "Starting a new order. Which product would you like to add?", session
+        return BULK_LIST_PROMPT, session
 
     return None
 
 
 def _extract_order_status_ref(text: str) -> str | None:
-    match = re.search(r"\b(ORD-[0-9][0-9\-]*)\b", (text or "").upper())
-    return match.group(1) if match else None
+    raw = (text or "").upper()
+    ord_match = re.search(r"\b(ORD-\d{8}-\d{4})\b", raw)
+    if ord_match:
+        return ord_match.group(1)
+    bare_match = re.search(r"\b(\d{8}-\d{4})\b", raw)
+    if bare_match:
+        return f"ORD-{bare_match.group(1)}"
+    return None
 
 
 def is_order_tracking_message(text: str) -> bool:
     """True for order status / AWB tracking queries (route to order agent)."""
     lowered = (text or "").lower().strip()
+    if lowered in {"order_status", "order status"}:
+        return True
+    if re.search(r"\border\s+st\w+\b", lowered):
+        return True
     return (
-        lowered == "order_status"
-        or lowered == "order status"
-        or "order status" in lowered
+        "order status" in lowered
         or "track" in lowered
         or "where is my order" in lowered
         or "where is my shipment" in lowered
@@ -1135,6 +1154,137 @@ def is_order_tracking_message(text: str) -> bool:
 
 def _is_order_status_query(text: str) -> bool:
     return is_order_tracking_message(text)
+
+
+def is_order_account_message(text: str) -> bool:
+    """True for order-count / pending-payment summary queries."""
+    return _is_order_account_query(text)
+
+
+def _is_order_account_query(text: str) -> bool:
+    lowered = (text or "").lower()
+    markers = (
+        "pending payment",
+        "pending payments",
+        "outstanding payment",
+        "how many",
+        "total order",
+        "my orders",
+        "all orders",
+        "orders do i have",
+        "orders i have",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+async def _handle_order_lookup(
+    message: str, session: dict, db: Session
+) -> tuple[str, dict]:
+    """Order status, tracking, or account summary — never starts a new cart."""
+    text = (message or "").strip()
+    phone = session.get("phone") or ""
+
+    if phone and _is_order_account_query(text):
+        variants = phone_lookup_variants(phone)
+        if not variants:
+            return "I couldn't find orders for this number yet.", session
+        rows = (
+            db.query(Order)
+            .filter(Order.phone.in_(variants))
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .all()
+        )
+        if not rows:
+            return "No orders found for this number yet.", session
+
+        by_ref: dict[str, list[Order]] = {}
+        for row in rows:
+            base = (row.order_ref or "ORD-UNKNOWN").rsplit("-L", 1)[0]
+            by_ref.setdefault(base, []).append(row)
+
+        pending_refs: list[str] = []
+        for ref, lines in by_ref.items():
+            pay = (lines[0].payment_status or lines[0].status or "").strip().lower()
+            if pay in {"awaiting_payment", "pending", ""}:
+                pending_refs.append(ref)
+
+        summary = [f"📊 *Your orders:* {len(by_ref)} total"]
+        if pending_refs:
+            summary.append(f"⏳ *Pending payment:* {len(pending_refs)}")
+            for ref in pending_refs[:5]:
+                total = _order_total_from_lines(db, by_ref[ref])
+                summary.append(f"• {ref} — {_format_money(total)}")
+        else:
+            summary.append("✅ No pending payments on your recent orders.")
+        summary.append("\nReply with an order reference for full status (e.g. ORD-20260614-3470).")
+        return "\n".join(summary), session
+
+    if not phone:
+        return (
+            "Please share your order reference (e.g. ORD-20260614-3470) or AWB number.",
+            session,
+        )
+
+    requested_ref = _extract_order_status_ref(text)
+    awb_from_text = extract_tracking_number(text)
+    latest = _latest_order_by_phone(db, phone, requested_ref)
+    if not latest and awb_from_text:
+        tracking_only = await lookup_tracking_message(awb_from_text)
+        if tracking_only:
+            return tracking_only, session
+        return (
+            f"I couldn't find an order linked to AWB *{awb_from_text}* yet. "
+            "Please check the number or contact our team.",
+            session,
+        )
+    if not latest:
+        hint = (
+            f" for *{requested_ref}*" if requested_ref else ""
+        )
+        return (
+            f"I couldn't find an order{hint} for this number yet. "
+            "Please share your order reference (e.g. ORD-20260614-3470) or AWB number.",
+            session,
+        )
+
+    ref = latest.order_ref or "ORD-UNKNOWN"
+    base_ref = ref.split("-L")[0]
+    tracking_number = awb_from_text or (latest.tracking_number or "")
+    reply = await _build_order_status_reply(
+        latest,
+        base_ref,
+        tracking_number=tracking_number,
+    )
+    return reply, session
+
+
+async def _handle_order_filler(session: dict, text: str) -> tuple[str, dict] | None:
+    """Greetings mid-order should not be parsed as product names or quantities."""
+    state = session.get("order_state")
+    product = session.get("order_product_name") or ""
+
+    if state == COLLECT_QTY and product:
+        return (
+            f"Still adding *{product}*.\n\n"
+            f"{product_qty_prompt(product)}",
+            session,
+        )
+
+    if state in {COLLECT_SKU, COLLECT_SKU_CONFIRM, CART_MENU}:
+        return (
+            f"{BULK_LIST_PROMPT}\n\n"
+            "Or reply *new order* to clear your cart and start fresh.",
+            session,
+        )
+
+    if state in {COLLECT_CHECKOUT, CONFIRM_ORDER, SELECT_PAYMENT}:
+        return (
+            "You have checkout in progress. "
+            "Reply with your details or *CONFIRM*, or *new order* to start over.",
+            session,
+        )
+
+    return None
 
 
 def _format_order_summary_for_status(
@@ -1424,34 +1574,8 @@ async def _run_order_rules(
 ) -> tuple[str, dict]:
     text = (message or "").strip()
     phone = session.get("phone") or ""
-    if phone and _is_order_status_query(text):
-        requested_ref = _extract_order_status_ref(text)
-        awb_from_text = extract_tracking_number(text)
-        latest = _latest_order_by_phone(db, phone, requested_ref)
-        if not latest and awb_from_text:
-            tracking_only = await lookup_tracking_message(awb_from_text)
-            if tracking_only:
-                return tracking_only, session
-            return (
-                f"I couldn't find an order linked to AWB *{awb_from_text}* yet. "
-                "Please check the number or contact our team.",
-                session,
-            )
-        if not latest:
-            return (
-                "I couldn't find any recent order for this number yet. "
-                "Please share your order reference (e.g., ORD-12345) or AWB number.",
-                session,
-            )
-        ref = latest.order_ref or "ORD-UNKNOWN"
-        base_ref = ref.split("-L")[0]
-        tracking_number = awb_from_text or (latest.tracking_number or "")
-        reply = await _build_order_status_reply(
-            latest,
-            base_ref,
-            tracking_number=tracking_number,
-        )
-        return reply, session
+    if phone and (_is_order_status_query(text) or _is_order_account_query(text)):
+        return await _handle_order_lookup(message, session, db)
 
     state = session.get("order_state") or COLLECT_SKU
     session["order_state"] = state
@@ -1494,7 +1618,7 @@ async def _run_order_rules(
             if product is None:
                 session["order_state"] = COLLECT_SKU
                 return BULK_LIST_PROMPT, session
-            return await _start_quantity_step(session, product, phone=phone)
+            return _prompt_product_quantity(session, product)
 
         _clear_pending_product(session)
         session["order_state"] = COLLECT_SKU
@@ -1504,8 +1628,12 @@ async def _run_order_rules(
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
-        if _is_order_status_query(text):
-            return await _run_order_rules(message, session, db)
+        if _is_order_status_query(text) or _is_order_account_query(text):
+            return await _handle_order_lookup(message, session, db)
+        if _is_filler_message(text):
+            filler = await _handle_order_filler(session, text)
+            if filler:
+                return filler
         if not text or any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
             return BULK_LIST_PROMPT, session
         if looks_like_bulk_order(text):
@@ -1535,19 +1663,21 @@ async def _run_order_rules(
                 "Reply *yes* to continue or share the exact product name/SKU.",
                 session,
             )
-        return await _start_quantity_step(session, product, phone=phone)
+        return _prompt_product_quantity(session, product)
 
     if state == COLLECT_QTY:
-        key = text.strip().lower()
-        if key == "qty_custom":
-            session["order_qty_custom"] = True
-            return "Type the quantity you need (e.g. 750):", session
-
-        qty: int | None = QTY_BUTTON_MAP.get(key)
-        if qty is None:
-            qty = _extract_positive_int(text)
+        if _is_filler_message(text):
+            filler = await _handle_order_filler(session, text)
+            if filler:
+                return filler
+        qty = _extract_positive_int(text)
         if qty is None or qty < 1:
-            return "Select a quantity from the list or type a positive number.", session
+            name = session.get("order_product_name") or "your product"
+            return (
+                f"Please type a positive quantity (e.g. *350*) or:\n"
+                f"*{name} - 350*",
+                session,
+            )
 
         session.pop("order_qty_custom", None)
         result = _tool_add_to_cart(
@@ -1650,17 +1780,24 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     """Run one turn of the order agent (LLM + tools, with rule fallback)."""
     session = dict(session or {})
     _migrate_legacy_single_line_session(session)
-    _ensure_order_started(session)
-    state = session.get("order_state") or COLLECT_SKU
     text = (message or "").strip()
 
     payment_result = await _try_payment_actions(message, session, db)
     if payment_result is not None:
         return payment_result
 
+    # Status / account lookups must not start a new cart.
+    if _is_order_status_query(text) or _is_order_account_query(text):
+        return await _handle_order_lookup(message, session, db)
+
+    filler_result = await _handle_order_filler(session, text) if _is_filler_message(text) else None
+    if filler_result:
+        return filler_result
+
+    _ensure_order_started(session)
+    state = session.get("order_state") or COLLECT_SKU
+
     # Deterministic UX guards regardless of LLM mode.
-    if _is_order_status_query(text):
-        return await _run_order_rules(message, session, db)
     if state in {
         COLLECT_SKU,
         COLLECT_QTY,

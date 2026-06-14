@@ -10,7 +10,7 @@ from typing import Any
 
 from langfuse import observe
 
-from app.agents.order import SELECT_PAYMENT, is_order_tracking_message
+from app.agents.order import SELECT_PAYMENT, is_order_account_message, is_order_tracking_message
 from app.messages.conversation_ui import MENU_OPTION_IDS, mark_menu_selection
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -169,6 +169,8 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
 
     key = (message or "").strip().lower()
     if is_order_tracking_message(message):
+        return "order", session
+    if is_order_account_message(message):
         return "order", session
     if key in ORDER_ACTION_IDS:
         if key == "speak":

@@ -351,19 +351,9 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     session = {"phone": "+919876543210", "country": "Kenya"}
 
     reply, session = await run_order_agent("I want to order", session, order_db)
-    assert "paste" in reply.lower() or "product list" in reply.lower()
+    assert "product" in reply.lower() and "quantity" in reply.lower()
 
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        reply, session = await run_order_agent("Metformin 500mg", session, order_db)
-    assert session["order_state"] == COLLECT_QTY
-    assert session["order_product_name"] == "Metformin 500mg"
-    assert "quantity" in reply.lower()
-
-    reply, session = await run_order_agent("0", session, order_db)
-    assert session["order_state"] == COLLECT_QTY
-    assert "quantity" in reply.lower() or "number" in reply.lower()
-
-    reply, session = await run_order_agent("qty_100", session, order_db)
+    reply, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     assert session["order_state"] == CART_MENU
     assert len(session["order_cart"]) == 1
     assert session["order_cart"][0]["quantity"] == 100
@@ -414,15 +404,11 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
     session = {"phone": "+919876543211", "country": "Kenya"}
 
     await run_order_agent("I want to order", session, db)
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        _, session = await run_order_agent("Metformin 500mg", session, db)
-    _, session = await run_order_agent("1000", session, db)
+    _, session = await run_order_agent("Metformin 500mg - 1000", session, db)
     assert session["order_state"] == CART_MENU
 
     _, session = await run_order_agent("add", session, db)
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        _, session = await run_order_agent("Amoxicillin 500mg", session, db)
-    _, session = await run_order_agent("500", session, db)
+    _, session = await run_order_agent("Amoxicillin 500mg - 500", session, db)
     assert len(session["order_cart"]) == 2
 
     _, session = await run_order_agent("qty 2 600", session, db)
@@ -449,9 +435,7 @@ async def test_order_agent_payment_does_not_commit_without_confirm(order_db, mon
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     session = {"phone": "+1", "country": "Kenya"}
     await run_order_agent("order", session, order_db)
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
     await run_order_agent("checkout", session, order_db)
     await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     await run_order_agent("T/T", session, order_db)
@@ -628,10 +612,8 @@ async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
     session = {"phone": "+15550123456", "country": "Kenya"}
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        _, session = await run_order_agent("order", session, order_db)
-        _, session = await run_order_agent("Metformin 500mg", session, order_db)
-    _, session = await run_order_agent("100", session, order_db)
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     _, session = await run_order_agent("checkout", session, order_db)
     _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
@@ -671,10 +653,8 @@ async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
     monkeypatch.setattr("app.agents.order.create_virtual_account", fake_create_va)
 
     session = {"phone": "+91999", "country": "Kenya"}
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        await run_order_agent("order", session, order_db)
-        await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
     await run_order_agent("checkout", session, order_db)
     await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
@@ -715,10 +695,8 @@ async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
     monkeypatch.setattr("app.agents.order.create_payment_link", fake_create_link)
 
     session = {"phone": "+91999", "country": "Kenya"}
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        await run_order_agent("order", session, order_db)
-        await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
     await run_order_agent("checkout", session, order_db)
     await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
@@ -735,10 +713,8 @@ async def test_payment_resolves_from_db_when_session_missing(order_db, monkeypat
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
     session = {"phone": "+91999", "country": "Kenya"}
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        await run_order_agent("order", session, order_db)
-        await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
     await run_order_agent("checkout", session, order_db)
     await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)

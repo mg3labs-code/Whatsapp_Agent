@@ -27,6 +27,7 @@ from app.agents.lead_scoring import enrich_session_from_message
 from app.agents.order import (
     PAYMENT_BUTTON_IDS,
     SELECT_PAYMENT,
+    is_order_account_message,
     is_order_tracking_message,
     run_order_agent,
 )
@@ -232,6 +233,9 @@ async def router_node(state: MessageState) -> dict:
         return {"intent": "menu_refresh", "session": session}
 
     if is_order_tracking_message(state.get("message") or ""):
+        return {"intent": "order", "session": session}
+
+    if is_order_account_message(state.get("message") or ""):
         return {"intent": "order", "session": session}
 
     if msg_key in PAYMENT_BUTTON_IDS or msg_key in {
