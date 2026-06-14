@@ -21,8 +21,8 @@ from app.business.countries import (
 from app.session.lead_persistence import upsert_lead_from_session
 from app.session.manager import normalize_phone
 from app.integrations.alerts import send_escalation_alert
-from app.integrations.whatsapp import send_interactive_buttons
-from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS
+from app.integrations.whatsapp import send_interactive_list
+from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS, send_main_menu_list
 from app.messages.onboarding import (
     COUNTRY_BUTTON_IDS,
     SESSION_AWAITING_CUSTOM_COUNTRY,
@@ -31,8 +31,11 @@ from app.messages.onboarding import (
     resolve_country_button,
     send_country_picker,
 )
+from app.messages.session_flow import BIZ_TYPE_ROWS, resolve_business_type_button
 
 logger = logging.getLogger(__name__)
+
+SESSION_BIZ_TYPE_PICKER_SENT = "biz_type_picker_sent"
 
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_BIZ_TYPE = "COLLECT_BIZ_TYPE"
@@ -71,7 +74,7 @@ _FILLER_WORDS = frozenset({
 
 _QUAL_COMPLETE_BUTTONS = [
     {"id": "order", "title": "Order Medicines"},
-    {"id": "pricing", "title": "Get Pricing"},
+    {"id": "my_orders", "title": "My Orders"},
     {"id": "speak", "title": "Speak to Team"},
 ]
 
@@ -154,6 +157,26 @@ def _extract_business_type(text: str) -> str:
     if any(k in lowered for k in ("pharmacy", "chemist", "drugstore")):
         return "pharmacy"
     return "other"
+
+
+async def _send_business_type_picker(phone: str) -> None:
+    await send_interactive_list(
+        phone,
+        header_text="New Life Medicare",
+        body_text="What type of business are you?",
+        footer_text="Or type your business type",
+        button_text="Select Type",
+        rows=BIZ_TYPE_ROWS,
+        section_title="Business Types",
+    )
+
+
+async def _ensure_business_type_picker(phone: str, session: dict) -> dict:
+    session = dict(session or {})
+    if phone and not session.get(SESSION_BIZ_TYPE_PICKER_SENT):
+        await _send_business_type_picker(phone)
+        session[SESSION_BIZ_TYPE_PICKER_SENT] = True
+    return session
 
 
 async def run_qualification_agent(
@@ -249,6 +272,13 @@ async def _handle_collect_biz_type(
     session: dict,
     db: Session,
 ) -> tuple[str, dict, str]:
+    phone = normalize_phone(session.get("phone") or "")
+    session = await _ensure_business_type_picker(phone, session)
+
+    resolved = resolve_business_type_button(text)
+    if resolved:
+        text = resolved
+
     if (
         not text.strip()
         or _is_generic_reply(text)
@@ -256,8 +286,8 @@ async def _handle_collect_biz_type(
         or len(text.strip()) < 3
     ):
         return (
-            "What type of business are you? (distributor, pharmacy/clinic, doctor, "
-            "or independent buyer)",
+            "Select your business type from the list above 👆 or type it "
+            "(distributor, pharmacy/clinic, doctor, or independent buyer).",
             session,
             CONTINUE_QUAL,
         )
@@ -334,18 +364,15 @@ async def _handle_qual_complete(
     reply = (
         "Thank you! ✅ You're all set.\n\n"
         "What would you like to do?\n"
-        "• 💊 *Order medicines* — share product names or a list\n"
-        "• 💰 *Get pricing* — ask about any product\n"
-        "• ❓ *FAQs* — shipping, documents, timelines\n\n"
-        "Or reply *human* to speak with our team."
+        "• 💊 *Place an order* — new purchase\n"
+        "• 📋 *My orders* — view past & pending orders\n"
+        "• 💰 *Get pricing* — product quotes\n"
+        "• ❓ *FAQs* — shipping, documents, timelines\n"
+        "• 👤 *Speak to team* — connect with us"
     )
 
     if phone:
-        await send_interactive_buttons(
-            phone,
-            "Choose an option below:",
-            _QUAL_COMPLETE_BUTTONS,
-        )
+        await send_main_menu_list(phone)
 
     return reply, session, next_intent
 

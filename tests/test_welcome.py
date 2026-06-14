@@ -44,12 +44,12 @@ async def test_send_greeting_menu_sets_flags(monkeypatch):
         texts.append(body)
         return True
 
-    async def capture_list(phone: str, **kwargs) -> bool:
-        lists.append(kwargs.get("body_text", ""))
+    async def capture_menu(phone: str, **kwargs) -> bool:
+        lists.append(kwargs.get("body", ""))
         return True
 
     monkeypatch.setattr("app.messages.welcome.send_message", capture_text)
-    monkeypatch.setattr("app.messages.welcome.send_interactive_list", capture_list)
+    monkeypatch.setattr("app.messages.conversation_ui.send_main_menu_list", capture_menu)
 
     session, ok = await send_greeting_menu("+91999", {})
     assert ok is True
@@ -154,12 +154,12 @@ async def test_send_reply_node_prepends_disclosure_once(monkeypatch):
     async def capture_save(phone: str, data: dict) -> None:
         saved.append(data)
 
-    async def capture_buttons(phone: str, _body: str, _buttons: list) -> bool:
+    async def capture_menu(phone: str, **kwargs) -> bool:
         sent_buttons.append(phone)
         return True
 
     monkeypatch.setattr(graph_mod, "send_message", capture_send)
-    monkeypatch.setattr(graph_mod, "send_interactive_buttons", capture_buttons)
+    monkeypatch.setattr(graph_mod, "send_main_menu_list", capture_menu)
     monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
     monkeypatch.setattr(graph_mod, "save_session", capture_save)
 
