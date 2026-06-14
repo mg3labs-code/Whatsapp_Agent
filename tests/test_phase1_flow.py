@@ -179,6 +179,106 @@ async def test_order_checkout_reuses_qualification_country(order_db, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_order_reset_from_collect_qty(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    session = {
+        "phone": "+919876543212",
+        "lead_qualified": True,
+        "order_state": COLLECT_QTY,
+        "order_product_name": "JGLUT 2000MG 30ML",
+        "order_sku": "PROD-1",
+    }
+
+    reply, session = await run_order_agent("I need new order", session, order_db)
+    assert session.get("order_state") == "COLLECT_SKU"
+    assert "product name and quantity" in reply.lower()
+    assert session.get("order_product_name") is None
+
+
+@pytest.mark.asyncio
+async def test_order_confirm_button_id(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    session = {
+        "phone": "+919876543213",
+        "lead_qualified": True,
+        "country": "Kenya",
+        "order_state": CONFIRM_ORDER,
+        "order_cart": [
+            {
+                "sku": "PROD-1",
+                "product_name": "Metformin 500mg",
+                "quantity": 100,
+                "unit_price": 0.95,
+            }
+        ],
+        "order_country": "Kenya",
+        "order_city": "Nairobi",
+        "order_contact": "Jane Doe",
+    }
+
+    with patch("app.agents.order.send_interactive_buttons", new=AsyncMock()):
+        with patch(
+            "app.agents.order._commit_order",
+            new=AsyncMock(return_value=("Order placed", session)),
+        ):
+            reply, _ = await run_order_agent("confirm", session, order_db)
+    assert "placed" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_my_orders_button_shows_grouped_history(order_db, monkeypatch):
+    from datetime import datetime
+
+    from app.db.models import Order
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    phone = "+919876543210"
+    order_db.add(
+        Order(
+            phone=phone,
+            sku="PROD-1",
+            product_name="Metformin 500mg",
+            quantity=100,
+            country="Kenya",
+            city="Nairobi",
+            contact_name="Jane",
+            order_ref="ORD-20260614-1001-L01",
+            status="pending",
+            payment_status="awaiting_payment",
+            created_at=datetime(2026, 6, 14, 10, 0, 0),
+        )
+    )
+    order_db.add(
+        Order(
+            phone=phone,
+            sku="PROD-1",
+            product_name="Metformin 500mg",
+            quantity=50,
+            country="Kenya",
+            city="Nairobi",
+            contact_name="Jane",
+            order_ref="ORD-20260613-2002-L01",
+            status="processing",
+            payment_status="payment_received",
+            created_at=datetime(2026, 6, 13, 10, 0, 0),
+        )
+    )
+    order_db.commit()
+
+    session = {"phone": phone, "lead_qualified": True}
+    reply, session = await run_order_agent("my_orders", session, order_db)
+    assert session.get("order_state") is None
+    assert "My orders" in reply
+    assert "Awaiting payment" in reply
+    assert "Paid / processing" in reply
+    assert "ORD-20260614-1001" in reply
+    assert "ORD-20260613-2002" in reply
+
+
+@pytest.mark.asyncio
 async def test_order_bulk_list_adds_multiple_products(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")

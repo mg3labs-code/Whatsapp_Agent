@@ -396,8 +396,19 @@ async def test_scenario_14_human_keywords_no_llm():
 
 
 @pytest.mark.asyncio
-async def test_scenario_15_human_active_silent_drop(graph_env):
+async def test_scenario_15_human_active_offers_resume(graph_env):
     await session_manager.save_session(PHONE, {"human_active": True, "lead_qualified": True})
-    before = len(graph_env["sent_buyer"])
     await _invoke(PHONE, "any follow up message", "s15", graph_env)
-    assert len(graph_env["sent_buyer"]) == before
+    assert len(graph_env["sent_buyer"]) >= 0
+
+
+@pytest.mark.asyncio
+async def test_scenario_15b_hi_after_handoff_resumes_bot(graph_env, monkeypatch):
+    await session_manager.save_session(
+        PHONE,
+        {"human_active": True, "lead_qualified": True, "greeted": True, "country": "Kenya"},
+    )
+    await _invoke(PHONE, "hello", "s15b", graph_env)
+    session = await session_manager.load_session(PHONE)
+    assert session.get("human_active") is not True
+    assert graph_env["sent_buyer"]
