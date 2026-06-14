@@ -35,6 +35,16 @@ from app.integrations.indiapost import (
     lookup_tracking_message,
 )
 from app.integrations.whatsapp import send_interactive_buttons, send_message
+from app.messages.onboarding import (
+    BULK_LIST_PROMPT,
+    QTY_BUTTON_IDS,
+    QTY_BUTTON_MAP,
+    checkout_prompt,
+    looks_like_bulk_order,
+    parse_bulk_order_lines,
+    parse_checkout_oneline,
+    send_quantity_picker,
+)
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -49,6 +59,7 @@ CART_MENU = "CART_MENU"
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_CITY = "COLLECT_CITY"
 COLLECT_CONTACT = "COLLECT_CONTACT"
+COLLECT_CHECKOUT = "COLLECT_CHECKOUT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
 SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
@@ -85,6 +96,8 @@ ORDER_SESSION_KEYS = (
     "order_pending_product_name",
     "order_pending_qty",
     "pending_product",
+    "order_bulk_queue",
+    "order_qty_custom",
 )
 
 ORDER_SYSTEM_PROMPT = (
@@ -97,6 +110,8 @@ ORDER_SYSTEM_PROMPT = (
     "- add_to_cart requires a positive integer quantity (parse '2k' as 2000, 'two thousand' as 2000).\n"
     "- update_cart_line / remove_from_cart: use line_number OR product_query.\n"
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
+    "- At checkout, reuse session.country as order_country when present — do not re-ask country.\n"
+    "- Collect shipping contact in one message (name, city, phone) when phase is COLLECT_CHECKOUT.\n"
     "- set_shipping / set_contact: extract from natural phrases.\n"
     f"- Payment is always {PAYMENT_METHOD}; never ask for other payment terms.\n"
     "- confirm_order ONLY when the buyer clearly confirms (yes, confirm, place order) and phase is CONFIRM_ORDER.\n"
@@ -312,6 +327,120 @@ def _item_qty(item: dict[str, Any]) -> int:
     return int(item.get("qty", item.get("quantity", 0)) or 0)
 
 
+def _prefill_order_country(session: dict) -> str | None:
+    """Copy qualification country into order checkout — never ask twice."""
+    if session.get("order_country"):
+        return str(session["order_country"])
+    known = (session.get("country") or "").strip()
+    if known:
+        session["order_country"] = known
+        return known
+    return None
+
+
+def _get_bulk_queue(session: dict) -> list[str]:
+    queue = session.get("order_bulk_queue")
+    return list(queue) if isinstance(queue, list) else []
+
+
+def _set_bulk_queue(session: dict, queue: list[str]) -> None:
+    if queue:
+        session["order_bulk_queue"] = queue
+    else:
+        session.pop("order_bulk_queue", None)
+
+
+async def _start_quantity_step(
+    session: dict,
+    product: Product,
+    *,
+    phone: str,
+) -> tuple[str, dict]:
+    session["order_sku"] = _product_sku(product)
+    session["order_product_name"] = product.product_name
+    session["order_unit_price"] = float(product.price_per_strip or 0.0)
+    session["order_state"] = COLLECT_QTY
+    session.pop("order_qty_custom", None)
+    if phone:
+        await send_quantity_picker(phone, product.product_name)
+    return (
+        f"Found: *{product.product_name}*\nSelect quantity from the list, or type a number.",
+        session,
+    )
+
+
+async def _process_bulk_order(
+    text: str,
+    session: dict,
+    db: Session,
+    phone: str,
+) -> tuple[str, dict]:
+    lines = parse_bulk_order_lines(text)
+    if not lines:
+        return BULK_LIST_PROMPT, session
+
+    added: list[str] = []
+    failed: list[str] = []
+    pending: list[str] = []
+
+    for query, qty in lines:
+        product, error, match_mode = _resolve_product_match(query, db)
+        if error == "restricted":
+            failed.append(query)
+            continue
+        if product is None:
+            failed.append(query)
+            continue
+        if qty is None or match_mode == "token":
+            pending.append(query)
+            continue
+        unit_price = float(product.price_per_strip or 0.0)
+        _add_line_to_cart(session, _product_sku(product), product.product_name, qty, unit_price)
+        added.append(f"{product.product_name} × {qty}")
+
+    if pending:
+        first_query = pending[0]
+        _set_bulk_queue(session, pending[1:])
+        product, error, _ = _resolve_product_match(first_query, db)
+        if product is not None and error != "restricted":
+            return await _start_quantity_step(session, product, phone=phone)
+
+    if added:
+        session["order_state"] = CART_MENU
+        reply_lines = ["✅ Added to cart:", *[f"• {line}" for line in added]]
+        if failed:
+            reply_lines.append("\nCouldn't match: " + ", ".join(failed))
+        reply_lines.append(f"\n{_format_cart_lines(_get_cart(session))}")
+        return "\n".join(reply_lines), session
+
+    suggestions: list[str] = []
+    for query, _ in lines[:3]:
+        suggestions.extend(_suggest_products(query, db))
+    reply = "I couldn't match those products. Please check names or SKUs."
+    if suggestions:
+        reply += "\n\nDid you mean:\n• " + "\n• ".join(dict.fromkeys(suggestions)[:5])
+    return reply, session
+
+
+async def _continue_bulk_queue(session: dict, db: Session, phone: str) -> tuple[str, dict] | None:
+    queue = _get_bulk_queue(session)
+    if not queue:
+        return None
+    next_query = queue[0]
+    product, error, _ = _resolve_product_match(next_query, db)
+    if product is None or error == "restricted":
+        queue.pop(0)
+        _set_bulk_queue(session, queue)
+        if not queue:
+            session["order_state"] = CART_MENU
+            return (
+                f"Couldn't match *{next_query}*. Skipped.\n\n{_format_cart_lines(_get_cart(session))}",
+                session,
+            )
+        return await _continue_bulk_queue(session, db, phone)
+    return await _start_quantity_step(session, product, phone=phone)
+
+
 def _format_money(amount: float) -> str:
     return f"${amount:,.2f}"
 
@@ -358,7 +487,7 @@ def _session_snapshot(session: dict) -> dict[str, Any]:
     return {
         "phase": session.get("order_state", COLLECT_SKU),
         "cart": _get_cart(session),
-        "country": session.get("order_country"),
+        "country": session.get("order_country") or session.get("country"),
         "city": session.get("order_city"),
         "contact": session.get("order_contact"),
         "payment": PAYMENT_METHOD,
@@ -641,13 +770,16 @@ def _tool_view_cart(session: dict) -> dict:
 def _tool_proceed_to_checkout(session: dict) -> dict:
     if not _get_cart(session):
         return {"error": "empty_cart"}
-    session["order_state"] = COLLECT_COUNTRY
-    return {"ok": True, "phase": COLLECT_COUNTRY, "next": "collect_country"}
+    _prefill_order_country(session)
+    session["order_state"] = COLLECT_CHECKOUT
+    return {"ok": True, "phase": COLLECT_CHECKOUT, "next": "collect_checkout"}
 
 
 def _tool_set_shipping(args: dict, session: dict) -> dict:
     country = (args.get("country") or "").strip()
     city = (args.get("city") or "").strip()
+    if not country:
+        country = (_prefill_order_country(session) or "").strip()
     if country:
         if is_shipment_excluded_country(country):
             _clear_order_session(session)
@@ -662,8 +794,8 @@ def _tool_set_shipping(args: dict, session: dict) -> dict:
     if session.get("order_country"):
         session["order_state"] = COLLECT_CITY
         return {"ok": True, "phase": COLLECT_CITY, "next": "collect_city"}
-    session["order_state"] = COLLECT_COUNTRY
-    return {"ok": True, "phase": COLLECT_COUNTRY, "next": "collect_country"}
+    session["order_state"] = COLLECT_CHECKOUT
+    return {"ok": True, "phase": COLLECT_CHECKOUT, "next": "collect_checkout"}
 
 
 def _tool_set_contact(args: dict, session: dict) -> dict:
@@ -1112,9 +1244,10 @@ def _phase_hint(session: dict) -> str:
         COLLECT_SKU_CONFIRM: "Confirm suggested product before quantity/cart actions.",
         COLLECT_QTY: "Pending quantity for a product — use add_to_cart with quantity.",
         CART_MENU: "Cart building — add, edit, remove, or proceed_to_checkout.",
-        COLLECT_COUNTRY: "Collect shipping country.",
+        COLLECT_COUNTRY: "Collect shipping country (skip if session.country is set).",
         COLLECT_CITY: "Collect city/port of entry.",
         COLLECT_CONTACT: "Collect buyer name and company.",
+        COLLECT_CHECKOUT: "Collect name, city, phone in one buyer message.",
         CONFIRM_ORDER: "Show review; confirm_order only after explicit buyer confirmation.",
     }
     return hints.get(phase, "Order flow active.")
@@ -1343,30 +1476,40 @@ async def _run_order_rules(
                 session["order_state"] = CART_MENU
                 return (
                     f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}\n\n"
-                    "Reply *done* when finished adding products.",
+                    "Reply *checkout* when finished adding products.",
                     session,
                 )
-            session["order_sku"] = pending_sku
-            session["order_product_name"] = pending_name
+            product = None
+            if pending_sku:
+                sku_match = re.fullmatch(r"PROD-(\d+)", pending_sku, re.IGNORECASE)
+                if sku_match:
+                    product = db.query(Product).filter(Product.id == int(sku_match.group(1))).first()
+            if product is None and pending_name:
+                product = (
+                    db.query(Product)
+                    .filter(Product.product_name == pending_name)
+                    .first()
+                )
             _clear_pending_product(session)
-            session["order_state"] = COLLECT_QTY
-            return (
-                f"How many units of {session['order_product_name']}?",
-                session,
-            )
+            if product is None:
+                session["order_state"] = COLLECT_SKU
+                return BULK_LIST_PROMPT, session
+            return await _start_quantity_step(session, product, phone=phone)
 
         _clear_pending_product(session)
         session["order_state"] = COLLECT_SKU
         if not text:
-            return "Please share the exact product name or SKU.", session
+            return BULK_LIST_PROMPT, session
         # Treat non-confirm text as a fresh product query.
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
         if _is_order_status_query(text):
             return await _run_order_rules(message, session, db)
-        if not text:
-            return "Which product would you like to add? (name or SKU)", session
+        if not text or any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
+            return BULK_LIST_PROMPT, session
+        if looks_like_bulk_order(text):
+            return await _process_bulk_order(text, session, db, phone)
         product, error, match_mode = _resolve_product_match(text, db)
         if error == "restricted":
             return (
@@ -1375,8 +1518,6 @@ async def _run_order_rules(
                 session,
             )
         if product is None:
-            if any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
-                return "Which product would you like to add? (name or SKU)", session
             suggestions = _suggest_products(text, db)
             reply = "I couldn't find that product. Please try the product name or SKU."
             if suggestions:
@@ -1394,25 +1535,21 @@ async def _run_order_rules(
                 "Reply *yes* to continue or share the exact product name/SKU.",
                 session,
             )
-        _clear_pending_product(session)
-        session["order_sku"] = _product_sku(product)
-        session["order_product_name"] = product.product_name
-        session["order_unit_price"] = float(product.price_per_strip or 0.0)
-        session["pending_product"] = {
-            "name": product.product_name,
-            "sku": _product_sku(product),
-        }
-        session["order_state"] = COLLECT_QTY
-        return (
-            f"Found: *{product.product_name}*\n"
-            "How many units?",
-            session,
-        )
+        return await _start_quantity_step(session, product, phone=phone)
 
     if state == COLLECT_QTY:
-        qty = _extract_positive_int(text)
+        key = text.strip().lower()
+        if key == "qty_custom":
+            session["order_qty_custom"] = True
+            return "Type the quantity you need (e.g. 750):", session
+
+        qty: int | None = QTY_BUTTON_MAP.get(key)
+        if qty is None:
+            qty = _extract_positive_int(text)
         if qty is None or qty < 1:
-            return "Please enter a positive number of units (e.g. 1000).", session
+            return "Select a quantity from the list or type a positive number.", session
+
+        session.pop("order_qty_custom", None)
         result = _tool_add_to_cart(
             {
                 "product_query": session.get("order_product_name", ""),
@@ -1423,21 +1560,55 @@ async def _run_order_rules(
         )
         if result.get("error"):
             return "Could not add to cart. Please try again.", session
+
+        continued = await _continue_bulk_queue(session, db, phone)
+        if continued:
+            return continued
+
+        session["order_state"] = CART_MENU
         return _format_cart_lines(_get_cart(session)), session
 
     if state == CART_MENU:
         action = _normalize_menu_action(text)
         if action == "add":
             session["order_state"] = COLLECT_SKU
-            return "Which product would you like to add?", session
+            return BULK_LIST_PROMPT, session
         if action == "done" or (text or "").strip().lower() == "checkout":
             result = _tool_proceed_to_checkout(session)
             if result.get("error"):
                 return "Your cart is empty.", session
-            return "Which country should we ship to?", session
+            country = _prefill_order_country(session) or ""
+            return checkout_prompt(country), session
         if not text:
             return _format_cart_lines(_get_cart(session)), session
-        return "Reply *done* to checkout, or *add* for another product.", session
+        return "Reply *checkout* to proceed, or *add* for more products.", session
+
+    if state == COLLECT_CHECKOUT:
+        parsed = parse_checkout_oneline(text, _prefill_order_country(session))
+        if not parsed:
+            country = _prefill_order_country(session) or "your country"
+            return (
+                f"Please send all details in one message:\n"
+                f"*Name, City, Phone*\n\n"
+                f"Shipping country: *{country}*"
+            ), session
+        country = parsed.get("country") or _prefill_order_country(session) or ""
+        if country and is_shipment_excluded_country(country):
+            _clear_order_session(session)
+            return SANCTIONED_COUNTRY_REFUSAL, session
+        if country:
+            session["order_country"] = country
+        session["order_city"] = parsed["city"]
+        session["order_contact"] = parsed["contact"]
+        session["order_state"] = CONFIRM_ORDER
+        return (
+            "Please review your order:\n"
+            f"{_format_cart_lines(_get_cart(session))}\n\n"
+            f"Ship to: *{session.get('order_city')}*, *{session.get('order_country')}*\n"
+            f"Contact: *{session.get('order_contact')}*\n"
+            f"Payment: *{PAYMENT_METHOD}*\n\n"
+            "Reply *CONFIRM* to place the order."
+        ), session
 
     if state == COLLECT_COUNTRY:
         if is_shipment_excluded_country(text):
@@ -1472,7 +1643,7 @@ async def _run_order_rules(
         ), session
 
     session["order_state"] = COLLECT_SKU
-    return "Which product would you like to add?", session
+    return BULK_LIST_PROMPT, session
 
 
 async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str, dict]:
@@ -1490,7 +1661,19 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     # Deterministic UX guards regardless of LLM mode.
     if _is_order_status_query(text):
         return await _run_order_rules(message, session, db)
-    if state in {COLLECT_SKU, COLLECT_QTY, COLLECT_SKU_CONFIRM}:
+    if state in {
+        COLLECT_SKU,
+        COLLECT_QTY,
+        COLLECT_SKU_CONFIRM,
+        COLLECT_CHECKOUT,
+        CONFIRM_ORDER,
+    }:
+        return await _run_order_rules(message, session, db)
+    if state == CART_MENU and (
+        not text
+        or text.lower() in {"done", "checkout", "add"}
+        or _normalize_menu_action(text) in {"done", "add"}
+    ):
         return await _run_order_rules(message, session, db)
 
     use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}

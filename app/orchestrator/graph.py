@@ -51,6 +51,7 @@ from app.messages.conversation_ui import (
     is_main_menu_request,
     should_send_navigation_footer,
 )
+from app.messages.onboarding import SESSION_SKIP_WELCOME_COMPOSE
 from app.session.lead_hydration import hydrate_session_from_db
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
@@ -393,13 +394,16 @@ async def send_reply_node(state: MessageState) -> dict:
 
     if final_reply:
         final_reply, session = apply_menu_selection_ack(final_reply, session)
-        if state.get("greeting"):
+        skip_welcome = session.get(SESSION_SKIP_WELCOME_COMPOSE) or "New Life Medicare" in (
+            final_reply or ""
+        )
+        if state.get("greeting") and not skip_welcome:
             final_reply = f"{WELCOME_MESSAGE}\n\n{final_reply}"
         try:
             await send_message(phone, final_reply)
         except Exception:
             logger.exception("send_message failed user_ref=%s", user_ref(phone))
-        if state.get("greeting"):
+        if state.get("greeting") and not skip_welcome:
             try:
                 await send_interactive_buttons(phone, "Choose an option below:", WELCOME_BUTTONS)
             except Exception:
