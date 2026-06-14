@@ -13,6 +13,9 @@ from app.agents.order import (
     COLLECT_CHECKOUT,
     COLLECT_QTY,
     CONFIRM_ORDER,
+    _extract_order_status_ref,
+    is_order_account_message,
+    is_order_tracking_message,
     run_order_agent,
 )
 from app.agents.qualification import run_qualification_agent
@@ -81,6 +84,14 @@ def test_looks_like_bulk_order_comma_list():
     assert looks_like_bulk_order("Bacloheal, cenforce, artvigil") is True
 
 
+def test_parse_trailing_qty():
+    from app.messages.onboarding import _parse_product_qty_segment
+
+    name, qty = _parse_product_qty_segment("JGLUT 2000MG 30ML 350")
+    assert qty == 350
+    assert "JGLUT" in name
+
+
 def test_parse_checkout_oneline():
     parsed = parse_checkout_oneline("Jane Doe, Sydney, +61412345678", "Australia")
     assert parsed["contact"] == "Jane Doe (+61412345678)"
@@ -92,6 +103,29 @@ def test_checkout_prompt_uses_known_country():
     prompt = checkout_prompt("Australia")
     assert "Australia" in prompt
     assert "Name, City, Phone" in prompt
+
+
+def test_extract_order_status_ref_bare_date():
+    assert _extract_order_status_ref("Order status of 20260608-2650") == "ORD-20260608-2650"
+
+
+def test_is_order_tracking_message_typo_stus():
+    assert is_order_tracking_message("20260608-2650 order stus") is True
+
+
+def test_is_order_account_message_pending_payments():
+    assert is_order_account_message("Total pending payments") is True
+
+
+@pytest.mark.asyncio
+async def test_order_status_does_not_start_cart(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    session = {"phone": "+919876543210", "lead_qualified": True}
+
+    reply, session = await run_order_agent("order_status", session, order_db)
+    assert "order" in reply.lower() or "couldn't find" in reply.lower()
+    assert session.get("order_state") is None
 
 
 @pytest.mark.asyncio
@@ -130,8 +164,7 @@ async def test_order_checkout_reuses_qualification_country(order_db, monkeypatch
     session = {"phone": "+919876543210", "country": "Kenya"}
 
     await run_order_agent("order", session, order_db)
-    _, session = await run_order_agent("Metformin 500mg", session, order_db)
-    _, session = await run_order_agent("qty_100", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     assert session["order_state"] == CART_MENU
 
     _, session = await run_order_agent("checkout", session, order_db)
@@ -152,12 +185,11 @@ async def test_order_bulk_list_adds_multiple_products(order_db, monkeypatch):
     session = {"phone": "+919876543211", "country": "Kenya", "lead_qualified": True}
 
     await run_order_agent("order", session, order_db)
-    with patch("app.agents.order.send_quantity_picker", new=AsyncMock(return_value=True)):
-        reply, session = await run_order_agent(
-            "Metformin 500mg - 100\nAmoxicillin 500mg - 200",
-            session,
-            order_db,
-        )
+    reply, session = await run_order_agent(
+        "Metformin 500mg - 100\nAmoxicillin 500mg - 200",
+        session,
+        order_db,
+    )
     assert session["order_state"] == CART_MENU
     assert len(session["order_cart"]) == 2
     assert "Added to cart" in reply

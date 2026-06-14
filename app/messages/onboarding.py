@@ -1,4 +1,4 @@
-"""Phase 1 UX — country picker, bulk order prompt, quantity picker, checkout form."""
+"""Phase 1 UX — country picker, bulk order prompt, checkout form."""
 
 from __future__ import annotations
 
@@ -27,32 +27,24 @@ COUNTRY_ID_TO_NAME: dict[str, str] = {
 
 COUNTRY_BUTTON_IDS = frozenset(COUNTRY_ID_TO_NAME.keys()) | {"country_other"}
 
-QTY_BUTTON_MAP: dict[str, int] = {
-    "qty_50": 50,
-    "qty_100": 100,
-    "qty_250": 250,
-    "qty_500": 500,
-    "qty_1000": 1000,
-}
-
-QTY_BUTTON_IDS = frozenset(QTY_BUTTON_MAP.keys()) | {"qty_custom"}
-
-QUANTITY_PICKER_ROWS: list[dict[str, str]] = [
-    {"id": "qty_50", "title": "50 units", "description": ""},
-    {"id": "qty_100", "title": "100 units", "description": ""},
-    {"id": "qty_250", "title": "250 units", "description": ""},
-    {"id": "qty_500", "title": "500 units", "description": ""},
-    {"id": "qty_1000", "title": "1000 units", "description": ""},
-    {"id": "qty_custom", "title": "Custom amount", "description": "Type your quantity"},
-]
-
 BULK_LIST_PROMPT = (
-    "📋 *Paste your product list* (one per line):\n\n"
+    "📋 *Send product name and quantity on each line:*\n\n"
     "Example:\n"
+    "JGLUT 2000MG 30ML - 350\n"
     "Metformin 500mg - 100\n"
     "Amoxicillin 500mg - 200\n\n"
-    "Or send one product name to add individually."
+    "One line or many — type the quantity beside each product."
 )
+
+
+def product_qty_prompt(product_name: str) -> str:
+    """Ask for typed quantity when a product was matched without a qty."""
+    safe = (product_name or "Product").strip()
+    return (
+        f"Found: *{safe}*\n\n"
+        f"Reply with quantity only (e.g. *350*) or full line:\n"
+        f"*{safe} - 350*"
+    )
 
 _COUNTRY_PROMPT = "🌎 *Select your country* from the list below."
 _COUNTRY_REMINDER = "Please select your country from the list above 👆"
@@ -127,7 +119,19 @@ def looks_like_bulk_order(text: str) -> bool:
     parts = [p.strip() for p in re.split(r"[,;]", stripped) if p.strip()]
     if len(parts) >= 2:
         return True
-    return bool(_BULK_LINE_RE.match(stripped))
+    _, qty = _parse_product_qty_segment(stripped)
+    return qty is not None
+
+
+def _parse_product_qty_segment(segment: str) -> tuple[str, int | None]:
+    """Parse 'Product - 100', 'Product x 100', or 'Product 100' (trailing qty)."""
+    match = _BULK_LINE_RE.match(segment)
+    if match:
+        return match.group("name").strip(), int(match.group("qty"))
+    trailing = re.match(r"^(.+?)\s+(\d+)\s*$", segment.strip())
+    if trailing and len(trailing.group(1).strip()) >= 3:
+        return trailing.group(1).strip(), int(trailing.group(2))
+    return segment.strip(), None
 
 
 def parse_bulk_order_lines(text: str) -> list[tuple[str, int | None]]:
@@ -136,11 +140,7 @@ def parse_bulk_order_lines(text: str) -> list[tuple[str, int | None]]:
     for raw_line in (text or "").split("\n"):
         segments = [s.strip() for s in re.split(r"[,;]", raw_line) if s.strip()]
         for segment in segments:
-            match = _BULK_LINE_RE.match(segment)
-            if match:
-                items.append((match.group("name").strip(), int(match.group("qty"))))
-            else:
-                items.append((segment, None))
+            items.append(_parse_product_qty_segment(segment))
     return items
 
 
@@ -162,19 +162,3 @@ async def send_country_picker(phone: str, session: dict) -> dict:
     session[SESSION_COUNTRY_PICKER_SENT] = True
     session[SESSION_SKIP_WELCOME_COMPOSE] = True
     return session
-
-
-async def send_quantity_picker(phone: str, product_name: str) -> bool:
-    """Send quantity list for a matched product."""
-    if not phone:
-        return False
-    safe_name = (product_name or "Product")[:40]
-    return await send_interactive_list(
-        phone,
-        header_text="Select quantity",
-        body_text=f"Choose quantity for *{safe_name}*",
-        footer_text="Tap an option below",
-        button_text="Quantities",
-        rows=QUANTITY_PICKER_ROWS,
-        section_title="Units",
-    )
