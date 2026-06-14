@@ -20,6 +20,7 @@ from app.business.countries import (
 )
 from app.session.lead_persistence import upsert_lead_from_session
 from app.session.manager import normalize_phone
+from app.utils.security import user_ref
 from app.integrations.alerts import send_escalation_alert
 from app.integrations.whatsapp import send_interactive_list
 from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS, send_main_menu_list
@@ -31,7 +32,10 @@ from app.messages.onboarding import (
     resolve_country_button,
     send_country_picker,
 )
-from app.messages.session_flow import BIZ_TYPE_ROWS, resolve_business_type_button
+from app.messages.session_flow import (
+    BIZ_TYPE_ROWS,
+    resolve_business_type_selection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +150,17 @@ def _extract_business_type(text: str) -> str:
     lowered = (text or "").lower()
     if any(k in lowered for k in ("independent buyer", "independent", "personal buyer")):
         return "independent_buyer"
-    if any(k in lowered for k in ("pharmacy chain", "chain pharmacy", "retail chain")):
-        return "pharmacy_chain"
-    if any(k in lowered for k in ("hospital", "clinic", "medical center")):
-        return "hospital"
     if any(k in lowered for k in ("distributor", "wholesale", "wholesaler", "resell", "bulk")):
         return "distributor"
     if any(k in lowered for k in ("doctor", "physician", "prescriber")):
         return "doctor"
-    if any(k in lowered for k in ("pharmacy", "chemist", "drugstore")):
+    if any(
+        k in lowered
+        for k in ("pharmacy", "chemist", "drugstore", "clinic", "pharmacy chain", "retail pharmacy")
+    ):
         return "pharmacy"
+    if any(k in lowered for k in ("hospital", "medical center")):
+        return "hospital"
     return "other"
 
 
@@ -169,14 +174,6 @@ async def _send_business_type_picker(phone: str) -> None:
         rows=BIZ_TYPE_ROWS,
         section_title="Business Types",
     )
-
-
-async def _ensure_business_type_picker(phone: str, session: dict) -> dict:
-    session = dict(session or {})
-    if phone and not session.get(SESSION_BIZ_TYPE_PICKER_SENT):
-        await _send_business_type_picker(phone)
-        session[SESSION_BIZ_TYPE_PICKER_SENT] = True
-    return session
 
 
 async def run_qualification_agent(
@@ -232,7 +229,7 @@ async def _handle_collect_country(
         if not country or not _is_plausible_country(country):
             return custom_country_prompt(), session, CONTINUE_QUAL
         session.pop(SESSION_AWAITING_CUSTOM_COUNTRY, None)
-        return _finalize_country(country, session)
+        return await _finalize_country(country, session, phone)
 
     if not text or _is_generic_reply(text) or _is_filler_reply(text):
         return country_prompt(reminded=bool(session.get("country_picker_sent"))), session, CONTINUE_QUAL
@@ -244,24 +241,30 @@ async def _handle_collect_country(
             session[SESSION_AWAITING_CUSTOM_COUNTRY] = True
             return follow_up, session, CONTINUE_QUAL
         if resolved:
-            return _finalize_country(resolved, session)
+            return await _finalize_country(resolved, session, phone)
 
     country = _extract_country(text)
     if not country or not _is_plausible_country(country):
         return country_prompt(reminded=True), session, CONTINUE_QUAL
 
-    return _finalize_country(country, session)
+    return await _finalize_country(country, session, phone)
 
 
-def _finalize_country(country: str, session: dict) -> tuple[str, dict, str]:
+async def _finalize_country(
+    country: str, session: dict, phone: str = ""
+) -> tuple[str, dict, str]:
     if is_shipment_excluded_country(country):
         return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_QUAL
 
     session["country"] = country
     session["qual_state"] = COLLECT_BIZ_TYPE
+    session.pop(SESSION_BIZ_TYPE_PICKER_SENT, None)
+    if phone:
+        await _send_business_type_picker(phone)
+        session[SESSION_BIZ_TYPE_PICKER_SENT] = True
     return (
-        "What type of business are you? (distributor, pharmacy/clinic, doctor, "
-        "or independent buyer)",
+        "Great! Now select your business type from the list below 👇 "
+        "or type it (e.g. *clinic*, *doctor*, *distributor*).",
         session,
         CONTINUE_QUAL,
     )
@@ -273,29 +276,32 @@ async def _handle_collect_biz_type(
     db: Session,
 ) -> tuple[str, dict, str]:
     phone = normalize_phone(session.get("phone") or "")
-    session = await _ensure_business_type_picker(phone, session)
+    if phone and not session.get(SESSION_BIZ_TYPE_PICKER_SENT):
+        await _send_business_type_picker(phone)
+        session[SESSION_BIZ_TYPE_PICKER_SENT] = True
 
-    resolved = resolve_business_type_button(text)
-    if resolved:
-        text = resolved
-
-    if (
-        not text.strip()
-        or _is_generic_reply(text)
-        or _is_filler_reply(text)
-        or len(text.strip()) < 3
-    ):
+    if not text.strip() or _is_filler_reply(text) or _is_generic_reply(text):
         return (
             "Select your business type from the list above 👆 or type it "
-            "(distributor, pharmacy/clinic, doctor, or independent buyer).",
+            "(e.g. *clinic*, *doctor*, *distributor*).",
             session,
             CONTINUE_QUAL,
         )
 
-    session["business_type"] = _extract_business_type(text)
-    session["buyer_type"] = map_business_type_to_buyer_type(session["business_type"], text)
+    parsed = resolve_business_type_selection(text)
+    if not parsed:
+        return (
+            "I didn't catch that. Tap *Select Type* above or type "
+            "*clinic*, *doctor*, *distributor*, or *independent buyer*.",
+            session,
+            CONTINUE_QUAL,
+        )
+
+    session["business_type"] = _extract_business_type(parsed)
+    session["buyer_type"] = map_business_type_to_buyer_type(session["business_type"], parsed)
+    session.pop(SESSION_BIZ_TYPE_PICKER_SENT, None)
     session["qual_state"] = QUAL_COMPLETE
-    return await _handle_qual_complete(session, db, text)
+    return await _handle_qual_complete(session, db, parsed)
 
 
 async def _apply_escalation_handoff(session: dict, reason: str) -> dict:
@@ -372,7 +378,10 @@ async def _handle_qual_complete(
     )
 
     if phone:
-        await send_main_menu_list(phone)
+        try:
+            await send_main_menu_list(phone)
+        except Exception:
+            logger.exception("send_main_menu_list failed user_ref=%s", user_ref(phone))
 
     return reply, session, next_intent
 

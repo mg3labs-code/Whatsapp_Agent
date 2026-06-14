@@ -38,6 +38,13 @@ def test_discount_and_speak_intents():
 
 def test_resolve_business_type_button():
     assert resolve_business_type_button("biz_pharmacy") == "pharmacy clinic"
+    assert resolve_business_type_button("Doctor") == "doctor physician"
+    assert resolve_business_type_button("Pharmacy / Clinic") == "pharmacy clinic"
+    assert (
+        resolve_business_type_button("Pharmacy / Clinic / Retail pharmacy or clinic")
+        == "pharmacy clinic"
+    )
+    assert resolve_business_type_button("clinic") == "pharmacy clinic"
 
 
 def test_main_menu_includes_my_orders():

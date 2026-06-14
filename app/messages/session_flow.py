@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 RESUME_BOT_ID = "resume_bot"
 
 GREETING_IDS = frozenset(
@@ -123,6 +125,21 @@ BIZ_TYPE_ID_TO_LABEL: dict[str, str] = {
     "biz_independent": "independent buyer",
 }
 
+_TYPED_BIZ_SHORTCUTS: dict[str, str] = {
+    "clinic": "pharmacy clinic",
+    "pharmacy": "pharmacy clinic",
+    "chemist": "pharmacy clinic",
+    "drugstore": "pharmacy clinic",
+    "dr": "doctor physician",
+    "gp": "doctor physician",
+    "doc": "doctor physician",
+    "distributor": "distributor wholesaler",
+    "wholesale": "distributor wholesaler",
+    "wholesaler": "distributor wholesaler",
+    "independent": "independent buyer",
+    "buyer": "independent buyer",
+}
+
 
 def is_greeting_message(message: str) -> bool:
     key = (message or "").strip().lower()
@@ -174,5 +191,40 @@ def is_order_reset_request(message: str) -> bool:
 
 
 def resolve_business_type_button(text: str) -> str | None:
-    key = (text or "").strip().lower()
-    return BIZ_TYPE_ID_TO_LABEL.get(key)
+    """Backward-compatible alias."""
+    return resolve_business_type_selection(text)
+
+
+def resolve_business_type_selection(text: str) -> str | None:
+    """Map list ids, titles, descriptions, or typed text to a business label."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    key = raw.lower()
+    if key in BIZ_TYPE_ID_TO_LABEL:
+        return BIZ_TYPE_ID_TO_LABEL[key]
+    if key in _TYPED_BIZ_SHORTCUTS:
+        return _TYPED_BIZ_SHORTCUTS[key]
+
+    normalized = re.sub(r"\s+", " ", key)
+    for row in BIZ_TYPE_ROWS:
+        row_id = row["id"]
+        title = row["title"].lower()
+        description = row["description"].lower()
+        label = BIZ_TYPE_ID_TO_LABEL[row_id]
+
+        if normalized == title or normalized == description:
+            return label
+        if title in normalized or normalized in title:
+            return label
+        if description in normalized or normalized in description:
+            return label
+        # WhatsApp sometimes shows "Title / Description" in the chat bubble.
+        combined = f"{title} / {description}"
+        if normalized == combined or combined in normalized or normalized in combined:
+            return label
+
+    if len(normalized) >= 3:
+        return normalized
+    return None
