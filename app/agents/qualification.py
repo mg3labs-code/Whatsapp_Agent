@@ -23,6 +23,14 @@ from app.session.manager import normalize_phone
 from app.integrations.alerts import send_escalation_alert
 from app.integrations.whatsapp import send_interactive_buttons
 from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS
+from app.messages.onboarding import (
+    COUNTRY_BUTTON_IDS,
+    SESSION_AWAITING_CUSTOM_COUNTRY,
+    country_prompt,
+    custom_country_prompt,
+    resolve_country_button,
+    send_country_picker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,16 +170,18 @@ async def run_qualification_agent(
     text = (message or "").strip()
     state = _normalize_qual_state(session.get("qual_state"))
     session["qual_state"] = state
+    phone = session.get("phone") or ""
 
     if state == COLLECT_COUNTRY:
-        return _handle_collect_country(text, session)
+        return await _handle_collect_country(text, session, phone)
     if state == COLLECT_BIZ_TYPE:
         return await _handle_collect_biz_type(text, session, db)
     if state == QUAL_COMPLETE:
         return await _handle_qual_complete(session, db, message)
 
     session["qual_state"] = COLLECT_COUNTRY
-    return _prompt_collect_country(), session, CONTINUE_QUAL
+    session = await send_country_picker(phone, session)
+    return country_prompt(), session, CONTINUE_QUAL
 
 
 def _is_filler_reply(text: str) -> bool:
@@ -187,14 +197,40 @@ def _is_generic_reply(text: str) -> bool:
     )
 
 
-def _handle_collect_country(text: str, session: dict) -> tuple[str, dict, str]:
+async def _handle_collect_country(
+    text: str, session: dict, phone: str
+) -> tuple[str, dict, str]:
+    session = await send_country_picker(phone, session)
+
+    if session.get(SESSION_AWAITING_CUSTOM_COUNTRY):
+        if not text or _is_generic_reply(text) or _is_filler_reply(text):
+            return custom_country_prompt(), session, CONTINUE_QUAL
+        country = _extract_country(text)
+        if not country or not _is_plausible_country(country):
+            return custom_country_prompt(), session, CONTINUE_QUAL
+        session.pop(SESSION_AWAITING_CUSTOM_COUNTRY, None)
+        return _finalize_country(country, session)
+
     if not text or _is_generic_reply(text) or _is_filler_reply(text):
-        return _prompt_collect_country(), session, CONTINUE_QUAL
+        return country_prompt(reminded=bool(session.get("country_picker_sent"))), session, CONTINUE_QUAL
+
+    key = text.strip().lower()
+    if key in COUNTRY_BUTTON_IDS:
+        resolved, follow_up = resolve_country_button(key)
+        if follow_up:
+            session[SESSION_AWAITING_CUSTOM_COUNTRY] = True
+            return follow_up, session, CONTINUE_QUAL
+        if resolved:
+            return _finalize_country(resolved, session)
 
     country = _extract_country(text)
     if not country or not _is_plausible_country(country):
-        return _prompt_collect_country(), session, CONTINUE_QUAL
+        return country_prompt(reminded=True), session, CONTINUE_QUAL
 
+    return _finalize_country(country, session)
+
+
+def _finalize_country(country: str, session: dict) -> tuple[str, dict, str]:
     if is_shipment_excluded_country(country):
         return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_QUAL
 
@@ -315,10 +351,7 @@ async def _handle_qual_complete(
 
 
 def _prompt_collect_country() -> str:
-    return (
-        "Welcome to New Life Medicare! To provide accurate pricing and ensure "
-        "compliance with export regulations, which country are you based in?"
-    )
+    return country_prompt()
 
 
 def _prompt_collect_company() -> str:
