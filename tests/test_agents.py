@@ -18,6 +18,7 @@ from app.agents.faq import (
 )
 from app.agents.order import (
     CART_MENU,
+    COLLECT_CHECKOUT,
     COLLECT_CITY,
     COLLECT_COUNTRY,
     COLLECT_QTY,
@@ -347,39 +348,24 @@ def order_db():
 async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
-    session = {"phone": "+919876543210"}
+    session = {"phone": "+919876543210", "country": "Kenya"}
 
     reply, session = await run_order_agent("I want to order", session, order_db)
-    assert "which product" in reply.lower()
+    assert "product" in reply.lower() and "quantity" in reply.lower()
 
-    reply, session = await run_order_agent("Metformin 500mg", session, order_db)
-    assert session["order_state"] == COLLECT_QTY
-    assert session["order_product_name"] == "Metformin 500mg"
-    assert "how many units" in reply.lower()
-
-    reply, session = await run_order_agent("0", session, order_db)
-    assert session["order_state"] == COLLECT_QTY
-    assert "minimum" in reply.lower() or "number" in reply.lower()
-
-    reply, session = await run_order_agent("2000", session, order_db)
+    reply, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     assert session["order_state"] == CART_MENU
     assert len(session["order_cart"]) == 1
-    assert session["order_cart"][0]["quantity"] == 2000
+    assert session["order_cart"][0]["quantity"] == 100
 
-    reply, session = await run_order_agent("done", session, order_db)
-    assert session["order_state"] == COLLECT_COUNTRY
-
-    reply, session = await run_order_agent("Kenya", session, order_db)
-    assert session["order_state"] == COLLECT_CITY
+    reply, session = await run_order_agent("checkout", session, order_db)
+    assert session["order_state"] == COLLECT_CHECKOUT
     assert session["order_country"] == "Kenya"
 
-    reply, session = await run_order_agent("Nairobi", session, order_db)
-    assert "name and company" in reply.lower()
-
-    reply, session = await run_order_agent("Priya Sharma, MedEx", session, order_db)
+    reply, session = await run_order_agent("Priya Sharma, Nairobi, +254700000000", session, order_db)
     assert session["order_state"] == CONFIRM_ORDER
     assert "t/t advance" in reply.lower()
-    assert "review" in reply.lower() or "confirm" in reply.lower()
+    assert "confirm" in reply.lower()
 
     reply, session = await run_order_agent("confirm", session, order_db)
     assert "order confirmed" in reply.lower()
@@ -393,7 +379,7 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     orders = order_db.query(Order).all()
     assert len(orders) == 1
     assert orders[0].phone == "+919876543210"
-    assert orders[0].quantity == 2000
+    assert orders[0].quantity == 100
     assert orders[0].country == "Kenya"
     assert orders[0].city == "Nairobi"
 
@@ -415,25 +401,22 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
     )
     db.commit()
 
-    session = {"phone": "+919876543211"}
+    session = {"phone": "+919876543211", "country": "Kenya"}
 
     await run_order_agent("I want to order", session, db)
-    _, session = await run_order_agent("Metformin 500mg", session, db)
-    _, session = await run_order_agent("1000", session, db)
+    _, session = await run_order_agent("Metformin 500mg - 1000", session, db)
     assert session["order_state"] == CART_MENU
 
     _, session = await run_order_agent("add", session, db)
-    _, session = await run_order_agent("Amoxicillin 500mg", session, db)
-    _, session = await run_order_agent("500", session, db)
+    _, session = await run_order_agent("Amoxicillin 500mg - 500", session, db)
     assert len(session["order_cart"]) == 2
 
     _, session = await run_order_agent("qty 2 600", session, db)
     assert session["order_cart"][1]["quantity"] == 600
 
-    _, session = await run_order_agent("done", session, db)
-    _, session = await run_order_agent("Kenya", session, db)
-    _, session = await run_order_agent("Nairobi", session, db)
-    _, session = await run_order_agent("Jane Doe, PharmaCo", session, db)
+    _, session = await run_order_agent("checkout", session, db)
+    assert session["order_state"] == COLLECT_CHECKOUT
+    _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, db)
     reply, session = await run_order_agent("LC", session, db)
     assert session["order_state"] == CONFIRM_ORDER
 
@@ -450,14 +433,11 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
 async def test_order_agent_payment_does_not_commit_without_confirm(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
-    session = {"phone": "+1"}
+    session = {"phone": "+1", "country": "Kenya"}
     await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
-    await run_order_agent("done", session, order_db)
-    await run_order_agent("Kenya", session, order_db)
-    await run_order_agent("Nairobi", session, order_db)
-    await run_order_agent("Contact Name", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
+    await run_order_agent("checkout", session, order_db)
+    await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     await run_order_agent("T/T", session, order_db)
     assert order_db.query(Order).count() == 0
 
@@ -548,7 +528,7 @@ async def test_order_agent_requires_confirmation_for_suggested_product(order_db,
 
     reply, session = await run_order_agent("yes", session, order_db)
     assert session["order_state"] == COLLECT_QTY
-    assert "how many units" in reply.lower()
+    assert "quantity" in reply.lower()
     assert "metformin" in reply.lower()
 
     reply, session = await run_order_agent("100", session, order_db)
@@ -631,14 +611,11 @@ async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
-    session = {"phone": "+15550123456"}
+    session = {"phone": "+15550123456", "country": "Kenya"}
     _, session = await run_order_agent("order", session, order_db)
-    _, session = await run_order_agent("Metformin 500mg", session, order_db)
-    _, session = await run_order_agent("100", session, order_db)
-    _, session = await run_order_agent("done", session, order_db)
-    _, session = await run_order_agent("Kenya", session, order_db)
-    _, session = await run_order_agent("Nairobi", session, order_db)
-    _, session = await run_order_agent("Contact Name", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     reply, _ = await run_order_agent("where is my order", {"phone": "+15550123456"}, order_db)
@@ -675,14 +652,11 @@ async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
     monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
     monkeypatch.setattr("app.agents.order.create_virtual_account", fake_create_va)
 
-    session = {"phone": "+91999"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
-    await run_order_agent("done", session, order_db)
-    await run_order_agent("Kenya", session, order_db)
-    await run_order_agent("Nairobi", session, order_db)
-    await run_order_agent("Jane Doe", session, order_db)
+    session = {"phone": "+91999", "country": "Kenya"}
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
     assert session["order_state"] == SELECT_PAYMENT
 
@@ -718,16 +692,13 @@ async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
 
     monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
     monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
-    monkeypatch.setattr("app.agents.order.create_payment_link", fake_create_link)
+    monkeypatch.setattr("app.agents.order.create_card_checkout", fake_create_link)
 
-    session = {"phone": "+91999"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
-    await run_order_agent("done", session, order_db)
-    await run_order_agent("Kenya", session, order_db)
-    await run_order_agent("Nairobi", session, order_db)
-    await run_order_agent("Contact Name", session, order_db)
+    session = {"phone": "+91999", "country": "Kenya"}
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     reply, session = await run_order_agent(PAY_CARD_BUTTON, session, order_db)
@@ -741,14 +712,11 @@ async def test_payment_resolves_from_db_when_session_missing(order_db, monkeypat
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
-    session = {"phone": "+91999"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg", session, order_db)
-    await run_order_agent("100", session, order_db)
-    await run_order_agent("done", session, order_db)
-    await run_order_agent("Kenya", session, order_db)
-    await run_order_agent("Nairobi", session, order_db)
-    await run_order_agent("Jane Doe", session, order_db)
+    session = {"phone": "+91999", "country": "Kenya"}
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     empty_session = {"phone": "+91999"}
@@ -904,20 +872,20 @@ async def test_qualification_rejects_filler_biz_type(qual_db):
     reply, session, intent = await run_qualification_agent("bh", session, qual_db)
     assert intent == "continue_qual"
     assert session["qual_state"] == COLLECT_BIZ_TYPE
-    assert "business" in reply.lower()
+    assert "select type" in reply.lower() or "didn't catch" in reply.lower()
 
 
 @pytest.mark.asyncio
 async def test_qualification_complete_with_pending_order_skips_menu(qual_db, monkeypatch):
-    sent: list[tuple[str, list]] = []
+    sent: list[str] = []
 
-    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
-        sent.append((phone, buttons))
+    async def capture_menu(phone: str) -> bool:
+        sent.append(phone)
         return True
 
     monkeypatch.setattr(
-        "app.agents.qualification.send_interactive_buttons",
-        capture_buttons,
+        "app.agents.qualification.send_main_menu_list",
+        capture_menu,
     )
 
     session = {"phone": "+15550005555", "pending_intent": "order"}
@@ -935,15 +903,15 @@ async def test_qualification_complete_with_pending_order_skips_menu(qual_db, mon
 
 @pytest.mark.asyncio
 async def test_qualification_complete_without_pending_sends_buttons(qual_db, monkeypatch):
-    sent: list[tuple[str, list]] = []
+    sent: list[str] = []
 
-    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
-        sent.append((phone, buttons))
+    async def capture_menu(phone: str) -> bool:
+        sent.append(phone)
         return True
 
     monkeypatch.setattr(
-        "app.agents.qualification.send_interactive_buttons",
-        capture_buttons,
+        "app.agents.qualification.send_main_menu_list",
+        capture_menu,
     )
 
     session = {"phone": "+15550006666"}
@@ -951,8 +919,8 @@ async def test_qualification_complete_without_pending_sends_buttons(qual_db, mon
     reply, session, intent = await run_qualification_agent("pharmacy", session, qual_db)
 
     assert intent == "faq"
-    assert sent
-    assert {b["id"] for b in sent[0][1]} == {"order", "pricing", "speak"}
+    assert "you're all set" in reply.lower()
+    assert sent == ["15550006666"]
 
 
 @pytest.mark.asyncio
@@ -1021,6 +989,48 @@ async def test_qualification_agent_multi_turn_flow(qual_db):
     assert len(leads) == 1
     assert leads[0].country == "Kenya"
     assert leads[0].business_type == "distributor"
+
+
+@pytest.mark.asyncio
+async def test_qualification_accepts_list_title_biz_type(qual_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.qualification.send_main_menu_list",
+        AsyncMock(return_value=True),
+    )
+    session = {
+        "phone": "+15550007777",
+        "country": "Australia",
+        "qual_state": COLLECT_BIZ_TYPE,
+        "biz_type_picker_sent": True,
+    }
+    reply, session, intent = await run_qualification_agent(
+        "Doctor / Prescriber / physician",
+        session,
+        qual_db,
+    )
+    assert session.get("qual_state") is None
+    assert session["lead_qualified"] is True
+    assert session["business_type"] == "doctor"
+    assert intent == "faq"
+    assert "you're all set" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_accepts_typed_clinic(qual_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.qualification.send_main_menu_list",
+        AsyncMock(return_value=True),
+    )
+    session = {
+        "phone": "+15550008888",
+        "country": "Australia",
+        "qual_state": COLLECT_BIZ_TYPE,
+        "biz_type_picker_sent": True,
+    }
+    reply, session, intent = await run_qualification_agent("clinic", session, qual_db)
+    assert session.get("qual_state") is None
+    assert session["business_type"] == "pharmacy"
+    assert intent == "faq"
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from app.integrations.whatsapp import send_interactive_list, send_message
-from app.messages.conversation_ui import MENU_OPTION_IDS
+from app.integrations.whatsapp import send_message
+from app.messages.conversation_ui import (
+    MAIN_MENU_BODY,
+    MAIN_MENU_LIST_ROWS,
+    MENU_OPTION_IDS,
+    send_main_menu_list,
+)
 
 AI_DISCLOSURE_MESSAGE = (
     "Hi — I'm the *AI assistant* for *New Life Medicare*\n"
@@ -22,30 +27,13 @@ GREETING_BODY_TEXT = (
 )
 
 GREETING_LIST_HEADER = "New Life Medicare"
-GREETING_LIST_BODY = "How can I help you today? Select an option below 👇"
+GREETING_LIST_BODY = MAIN_MENU_BODY
 GREETING_LIST_FOOTER = "Pharmaceutical exports worldwide 🌍"
 GREETING_LIST_BUTTON = "View Options"
-
-GREETING_LIST_ROWS: list[dict[str, str]] = [
-    {
-        "id": "order",
-        "title": "Place an Order",
-        "description": "Start a new purchase order",
-    },
-    {
-        "id": "pricing",
-        "title": "Get Pricing",
-        "description": "Product quotes and MOQ",
-    },
-    {
-        "id": "faq",
-        "title": "FAQs",
-        "description": "Shipping, docs and policies",
-    },
-]
+GREETING_LIST_ROWS = MAIN_MENU_LIST_ROWS
 
 GREETING_BUTTONS: list[dict[str, str]] = [
-    {"id": row["id"], "title": row["title"][:20]} for row in GREETING_LIST_ROWS
+    {"id": row["id"], "title": row["title"][:20]} for row in MAIN_MENU_LIST_ROWS[:3]
 ]
 
 MENU_BUTTON_IDS = MENU_OPTION_IDS
@@ -95,14 +83,7 @@ async def send_greeting_menu(
         return session, False
 
     await send_message(phone, GREETING_INTRO_TEXT)
-    ok = await send_interactive_list(
-        phone,
-        header_text=GREETING_LIST_HEADER,
-        body_text=GREETING_LIST_BODY,
-        footer_text=GREETING_LIST_FOOTER,
-        button_text=GREETING_LIST_BUTTON,
-        rows=GREETING_LIST_ROWS,
-    )
+    ok = await send_main_menu_list(phone, body=GREETING_LIST_BODY)
     if ok:
         session[SESSION_FLAG_GREETING_BUTTONS_SENT] = True
         session[SESSION_FLAG_AI_DISCLOSURE_SENT] = True

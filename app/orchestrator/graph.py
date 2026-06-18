@@ -25,8 +25,10 @@ from langgraph.graph import END, StateGraph
 from app.agents.faq import run_faq_agent
 from app.agents.lead_scoring import enrich_session_from_message
 from app.agents.order import (
+    ORDER_SESSION_KEYS,
     PAYMENT_BUTTON_IDS,
     SELECT_PAYMENT,
+    is_order_account_message,
     is_order_tracking_message,
     run_order_agent,
 )
@@ -45,12 +47,21 @@ from app.integrations.whatsapp import (
     send_message,
     send_navigation_footer,
 )
+from app.messages.session_flow import (
+    RESUME_BOT_BUTTONS,
+    clear_human_handoff,
+    is_order_reset_request,
+    is_speak_to_team_request,
+    should_resume_from_human_handoff,
+)
 from app.messages.conversation_ui import (
     SESSION_SUPPRESS_NAV_FOOTER,
     apply_menu_selection_ack,
     is_main_menu_request,
+    send_main_menu_list,
     should_send_navigation_footer,
 )
+from app.messages.onboarding import SESSION_SKIP_WELCOME_COMPOSE
 from app.session.lead_hydration import hydrate_session_from_db
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
@@ -154,15 +165,9 @@ class MessageState(TypedDict):
 
 WELCOME_MESSAGE = (
     "Hi! 👋 I'm the AI assistant for *New Life Medicare*\n"
-    "I help with medicine orders, pricing & FAQs.\n"
+    "I help with medicine orders, pricing, FAQs & your order history.\n"
     "Reply *human* anytime to reach our team."
 )
-WELCOME_BUTTONS = [
-    {"id": "order", "title": "Order Medicines"},
-    {"id": "pricing", "title": "Get Pricing"},
-    {"id": "faq", "title": "Browse FAQs"},
-]
-
 
 async def load_session_node(state: MessageState) -> dict:
     from app.session.manager import normalize_phone
@@ -213,24 +218,29 @@ async def pre_guardrails_node(state: MessageState) -> dict:
 
 async def menu_refresh_node(state: MessageState) -> dict:
     """Resend main menu when buyer taps Main Menu (no agent logic change)."""
-    session = dict(state.get("session") or {})
-    await send_interactive_buttons(
-        state["phone"],
-        "How can I help you today? Select an option below 👇",
-        WELCOME_BUTTONS,
-    )
+    session = clear_human_handoff(dict(state.get("session") or {}))
+    for key in ORDER_SESSION_KEYS:
+        session.pop(key, None)
+    await send_main_menu_list(state["phone"])
     session[SESSION_SUPPRESS_NAV_FOOTER] = True
     return {"session": session, "final_reply": None}
 
 
 async def router_node(state: MessageState) -> dict:
     session = dict(state.get("session") or {})
-    msg_key = (state.get("message") or "").strip().lower()
+    message = state.get("message") or ""
+    msg_key = message.strip().lower()
 
-    if is_main_menu_request(state.get("message") or ""):
+    if session.get("human_active") and should_resume_from_human_handoff(message):
+        session = clear_human_handoff(session)
+
+    if is_main_menu_request(message):
         return {"intent": "menu_refresh", "session": session}
 
     if is_order_tracking_message(state.get("message") or ""):
+        return {"intent": "order", "session": session}
+
+    if is_order_account_message(state.get("message") or ""):
         return {"intent": "order", "session": session}
 
     if msg_key in PAYMENT_BUTTON_IDS or msg_key in {
@@ -240,6 +250,16 @@ async def router_node(state: MessageState) -> dict:
         return {"intent": "order", "session": session}
 
     if session.get("order_state"):
+        if msg_key in {"faq", "faqs"}:
+            return {"intent": "faq", "session": session}
+        if msg_key == "pricing":
+            return {"intent": "pricing", "session": session}
+        if msg_key in {"my_orders", "my orders"}:
+            return {"intent": "order", "session": session}
+        if msg_key == "speak" or is_speak_to_team_request(message):
+            return {"intent": "escalate", "session": session}
+        if is_order_reset_request(message) or is_main_menu_request(message):
+            return {"intent": "order", "session": session}
         return {"intent": "order", "session": session}
 
     if session.get("qual_state"):
@@ -359,10 +379,25 @@ async def escalation_agent_node(state: MessageState) -> dict:
 
 
 async def human_active_node(state: MessageState) -> dict:
-    # No-op: when a human has taken over the conversation we silently drop.
-    # SECURITY: hashed user ref in logs — not raw phone
-    logger.info("human_active drop user_ref=%s", user_ref(state.get("phone")))
-    return {}
+    """Team handoff active — acknowledge and offer resume while waiting."""
+    phone = state.get("phone") or ""
+    session = dict(state.get("session") or {})
+    logger.info("human_active hold user_ref=%s", user_ref(phone))
+    reply = (
+        "Our team has been notified and will contact you shortly.\n\n"
+        "You can keep using the assistant while you wait — type *menu*, *hello*, "
+        "or tap *Continue with Bot* below."
+    )
+    if phone:
+        try:
+            await send_interactive_buttons(phone, reply, RESUME_BOT_BUTTONS)
+        except Exception:
+            logger.exception(
+                "send_interactive_buttons failed user_ref=%s",
+                user_ref(phone),
+            )
+    session[SESSION_SUPPRESS_NAV_FOOTER] = True
+    return {"session": session, "final_reply": None}
 
 
 async def post_guardrails_node(state: MessageState) -> dict:
@@ -393,18 +428,21 @@ async def send_reply_node(state: MessageState) -> dict:
 
     if final_reply:
         final_reply, session = apply_menu_selection_ack(final_reply, session)
-        if state.get("greeting"):
+        skip_welcome = session.get(SESSION_SKIP_WELCOME_COMPOSE) or "New Life Medicare" in (
+            final_reply or ""
+        )
+        if state.get("greeting") and not skip_welcome:
             final_reply = f"{WELCOME_MESSAGE}\n\n{final_reply}"
         try:
             await send_message(phone, final_reply)
         except Exception:
             logger.exception("send_message failed user_ref=%s", user_ref(phone))
-        if state.get("greeting"):
+        if state.get("greeting") and not skip_welcome:
             try:
-                await send_interactive_buttons(phone, "Choose an option below:", WELCOME_BUTTONS)
+                await send_main_menu_list(phone)
             except Exception:
                 logger.exception(
-                    "send_interactive_buttons failed user_ref=%s",
+                    "send_main_menu_list failed user_ref=%s",
                     user_ref(phone),
                 )
         try:

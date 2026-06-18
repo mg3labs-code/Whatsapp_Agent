@@ -41,6 +41,20 @@ from app.integrations.indiapost import (
     lookup_tracking_message,
 )
 from app.integrations.whatsapp import send_interactive_buttons, send_message
+from app.messages.onboarding import (
+    BULK_LIST_PROMPT,
+    checkout_prompt,
+    looks_like_bulk_order,
+    parse_bulk_order_lines,
+    parse_checkout_oneline,
+    product_qty_prompt,
+)
+from app.messages.session_flow import (
+    CART_ACTION_BUTTONS,
+    CONFIRM_ORDER_BUTTONS,
+    PRODUCT_CONFIRM_BUTTONS,
+    is_order_reset_request,
+)
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -56,6 +70,7 @@ COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_CITY = "COLLECT_CITY"
 COLLECT_CONTACT = "COLLECT_CONTACT"
 SHIPPING_CHOICE = "SHIPPING_CHOICE"
+COLLECT_CHECKOUT = "COLLECT_CHECKOUT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
 SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
@@ -103,6 +118,8 @@ ORDER_SESSION_KEYS = (
     "order_pending_product_name",
     "order_pending_qty",
     "pending_product",
+    "order_bulk_queue",
+    "order_qty_custom",
 )
 
 ORDER_SYSTEM_PROMPT = (
@@ -115,6 +132,8 @@ ORDER_SYSTEM_PROMPT = (
     "- add_to_cart requires a positive integer quantity (parse '2k' as 2000, 'two thousand' as 2000).\n"
     "- update_cart_line / remove_from_cart: use line_number OR product_query.\n"
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
+    "- At checkout, reuse session.country as order_country when present — do not re-ask country.\n"
+    "- Collect shipping contact in one message (name, city, phone) when phase is COLLECT_CHECKOUT.\n"
     "- set_shipping / set_contact: extract from natural phrases.\n"
     f"- Payment is always {PAYMENT_METHOD}; never ask for other payment terms.\n"
     "- After contact is collected, shipping options (EMS express / LP normal) are shown when available.\n"
@@ -297,9 +316,31 @@ def _clear_order_session(session: dict) -> None:
         session.pop(key, None)
 
 
+_ORDER_FILLER = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "hii",
+    "hiii",
+})
+
+
+def _is_filler_message(text: str) -> bool:
+    return (text or "").strip().lower() in _ORDER_FILLER
+
+
 def _ensure_order_started(session: dict) -> None:
-    if not session.get("order_state"):
-        session["order_state"] = COLLECT_SKU
+    """Begin product collection only when buyer is actively ordering."""
+    if session.get("order_state"):
+        return
+    if _get_cart(session):
+        session["order_state"] = CART_MENU
+        return
+    session["order_state"] = COLLECT_SKU
 
 
 def _set_pending_product(
@@ -331,6 +372,113 @@ def _item_qty(item: dict[str, Any]) -> int:
     return int(item.get("qty", item.get("quantity", 0)) or 0)
 
 
+def _prefill_order_country(session: dict) -> str | None:
+    """Copy qualification country into order checkout — never ask twice."""
+    if session.get("order_country"):
+        return str(session["order_country"])
+    known = (session.get("country") or "").strip()
+    if known:
+        session["order_country"] = known
+        return known
+    return None
+
+
+def _get_bulk_queue(session: dict) -> list[str]:
+    queue = session.get("order_bulk_queue")
+    return list(queue) if isinstance(queue, list) else []
+
+
+def _set_bulk_queue(session: dict, queue: list[str]) -> None:
+    if queue:
+        session["order_bulk_queue"] = queue
+    else:
+        session.pop("order_bulk_queue", None)
+
+
+def _prompt_product_quantity(session: dict, product: Product) -> tuple[str, dict]:
+    """Ask buyer to type quantity — no button picker."""
+    session["order_sku"] = _product_sku(product)
+    session["order_product_name"] = product.product_name
+    session["order_unit_price"] = float(product.price_per_strip or 0.0)
+    session["order_state"] = COLLECT_QTY
+    session.pop("order_qty_custom", None)
+    return product_qty_prompt(product.product_name), session
+
+
+async def _process_bulk_order(
+    text: str,
+    session: dict,
+    db: Session,
+    phone: str,
+) -> tuple[str, dict]:
+    lines = parse_bulk_order_lines(text)
+    if not lines:
+        return BULK_LIST_PROMPT, session
+
+    added: list[str] = []
+    failed: list[str] = []
+    pending: list[str] = []
+
+    for query, qty in lines:
+        product, error, match_mode = _resolve_product_match(query, db)
+        if error == "restricted":
+            failed.append(query)
+            continue
+        if product is None:
+            failed.append(query)
+            continue
+        if qty is None or match_mode == "token":
+            pending.append(query)
+            continue
+        unit_price = float(product.price_per_strip or 0.0)
+        _add_line_to_cart(session, _product_sku(product), product.product_name, qty, unit_price)
+        added.append(f"{product.product_name} × {qty}")
+
+    if pending:
+        first_query = pending[0]
+        _set_bulk_queue(session, pending[1:])
+        product, error, _ = _resolve_product_match(first_query, db)
+        if product is not None and error != "restricted":
+            return _prompt_product_quantity(session, product)
+
+    if added:
+        session["order_state"] = CART_MENU
+        reply_lines = ["✅ Added to cart:", *[f"• {line}" for line in added]]
+        if failed:
+            reply_lines.append("\nCouldn't match: " + ", ".join(failed))
+        reply_lines.append(f"\n{_format_cart_lines(_get_cart(session))}")
+        if phone:
+            await _send_cart_action_buttons(phone)
+        return "\n".join(reply_lines), session
+
+    suggestions: list[str] = []
+    for query, _ in lines[:3]:
+        suggestions.extend(_suggest_products(query, db))
+    reply = "I couldn't match those products. Please check names or SKUs."
+    if suggestions:
+        reply += "\n\nDid you mean:\n• " + "\n• ".join(dict.fromkeys(suggestions)[:5])
+    return reply, session
+
+
+async def _continue_bulk_queue(session: dict, db: Session, phone: str) -> tuple[str, dict] | None:
+    queue = _get_bulk_queue(session)
+    if not queue:
+        return None
+    next_query = queue[0]
+    product, error, _ = _resolve_product_match(next_query, db)
+    if product is None or error == "restricted":
+        queue.pop(0)
+        _set_bulk_queue(session, queue)
+        if not queue:
+            session["order_state"] = CART_MENU
+            return (
+                f"Couldn't match *{next_query}*. Skipped.\n\n{_format_cart_lines(_get_cart(session))}",
+                session,
+            )
+        return await _continue_bulk_queue(session, db, phone)
+    return _prompt_product_quantity(session, product)
+
+
 def _format_money(amount: float) -> str:
     return f"${amount:,.2f}"
 
@@ -359,7 +507,7 @@ def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
     lines.append("─────────────────")
     lines.append(f"Total: {_format_money(total)}")
     lines.append("")
-    lines.append("Add more products or type *checkout* to proceed.")
+    lines.append("Tap *Checkout* below or type *checkout* to proceed.")
     return "\n".join(lines)
 
 
@@ -447,6 +595,42 @@ def _apply_shipping_after_contact(session: dict, db: Session) -> str:
     return _format_order_review(session)
 
 
+async def _send_cart_action_buttons(phone: str) -> None:
+    if phone:
+        await send_interactive_buttons(
+            phone,
+            "Ready when you are 👇",
+            CART_ACTION_BUTTONS,
+        )
+
+
+async def _send_confirm_order_buttons(phone: str) -> None:
+    if phone:
+        await send_interactive_buttons(
+            phone,
+            "Review your order and confirm 👇",
+            CONFIRM_ORDER_BUTTONS,
+        )
+
+
+async def _send_product_confirm_buttons(phone: str, product_name: str) -> None:
+    if phone:
+        await send_interactive_buttons(
+            phone,
+            f"Is this the product you want?\n*{product_name}*",
+            PRODUCT_CONFIRM_BUTTONS,
+        )
+
+
+async def _reset_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
+    session.pop("last_order_ref", None)
+    session.pop("last_order_total", None)
+    session.pop("payment_method_chosen", None)
+    _clear_order_session(session)
+    session["order_state"] = COLLECT_SKU
+    return BULK_LIST_PROMPT, session
+
+
 def _format_order_review(session: dict) -> str:
     cart = _get_cart(session)
     subtotal = _cart_total(cart)
@@ -467,7 +651,7 @@ def _format_order_review(session: dict) -> str:
         f"Ship to: {session.get('order_city', '')}, {session.get('order_country', '')}\n"
         f"Contact: {session.get('order_contact', '')}\n"
         f"Payment: {PAYMENT_METHOD}\n\n"
-        "Reply *CONFIRM* to place the order."
+        "Tap *Confirm Order* or type *CONFIRM* to place the order."
     )
 
 
@@ -524,7 +708,7 @@ def _session_snapshot(session: dict) -> dict[str, Any]:
     return {
         "phase": session.get("order_state", COLLECT_SKU),
         "cart": _get_cart(session),
-        "country": session.get("order_country"),
+        "country": session.get("order_country") or session.get("country"),
         "city": session.get("order_city"),
         "contact": session.get("order_contact"),
         "payment": PAYMENT_METHOD,
@@ -592,6 +776,9 @@ def _product_search_tokens(text: str) -> list[str]:
         if cleaned.lower() in _SKIP_PRODUCT_TOKENS:
             continue
         tokens.append(cleaned)
+        collapsed = re.sub(r"[\s\-_]+", "", cleaned)
+        if len(collapsed) >= 3 and collapsed.lower() != cleaned.lower():
+            tokens.append(collapsed)
     return sorted(set(tokens), key=len, reverse=True)
 
 
@@ -807,13 +994,16 @@ def _tool_view_cart(session: dict) -> dict:
 def _tool_proceed_to_checkout(session: dict) -> dict:
     if not _get_cart(session):
         return {"error": "empty_cart"}
-    session["order_state"] = COLLECT_COUNTRY
-    return {"ok": True, "phase": COLLECT_COUNTRY, "next": "collect_country"}
+    _prefill_order_country(session)
+    session["order_state"] = COLLECT_CHECKOUT
+    return {"ok": True, "phase": COLLECT_CHECKOUT, "next": "collect_checkout"}
 
 
 def _tool_set_shipping(args: dict, session: dict) -> dict:
     country = (args.get("country") or "").strip()
     city = (args.get("city") or "").strip()
+    if not country:
+        country = (_prefill_order_country(session) or "").strip()
     if country:
         if is_shipment_excluded_country(country):
             _clear_order_session(session)
@@ -828,8 +1018,8 @@ def _tool_set_shipping(args: dict, session: dict) -> dict:
     if session.get("order_country"):
         session["order_state"] = COLLECT_CITY
         return {"ok": True, "phase": COLLECT_CITY, "next": "collect_city"}
-    session["order_state"] = COLLECT_COUNTRY
-    return {"ok": True, "phase": COLLECT_COUNTRY, "next": "collect_country"}
+    session["order_state"] = COLLECT_CHECKOUT
+    return {"ok": True, "phase": COLLECT_CHECKOUT, "next": "collect_checkout"}
 
 
 def _tool_set_contact(args: dict, session: dict, db: Session) -> dict:
@@ -1156,28 +1346,36 @@ async def _try_payment_actions(
         return await _handle_payment_selection(message, session, db)
 
     if text == "new_order":
-        session.pop("order_state", None)
         session.pop("last_order_ref", None)
         session.pop("last_order_total", None)
         session.pop("payment_method_chosen", None)
+        _clear_order_session(session)
         session["order_state"] = COLLECT_SKU
-        return "Starting a new order. Which product would you like to add?", session
+        return BULK_LIST_PROMPT, session
 
     return None
 
 
 def _extract_order_status_ref(text: str) -> str | None:
-    match = re.search(r"\b(ORD-[0-9][0-9\-]*)\b", (text or "").upper())
-    return match.group(1) if match else None
+    raw = (text or "").upper()
+    ord_match = re.search(r"\b(ORD-\d{8}-\d{4})\b", raw)
+    if ord_match:
+        return ord_match.group(1)
+    bare_match = re.search(r"\b(\d{8}-\d{4})\b", raw)
+    if bare_match:
+        return f"ORD-{bare_match.group(1)}"
+    return None
 
 
 def is_order_tracking_message(text: str) -> bool:
     """True for order status / AWB tracking queries (route to order agent)."""
     lowered = (text or "").lower().strip()
+    if lowered in {"order_status", "order status"}:
+        return True
+    if re.search(r"\border\s+st\w+\b", lowered):
+        return True
     return (
-        lowered == "order_status"
-        or lowered == "order status"
-        or "order status" in lowered
+        "order status" in lowered
         or "track" in lowered
         or "where is my order" in lowered
         or "where is my shipment" in lowered
@@ -1189,6 +1387,209 @@ def is_order_tracking_message(text: str) -> bool:
 
 def _is_order_status_query(text: str) -> bool:
     return is_order_tracking_message(text)
+
+
+def is_order_account_message(text: str) -> bool:
+    """True for order-count / pending-payment summary queries."""
+    return _is_order_account_query(text)
+
+
+def _is_order_account_query(text: str) -> bool:
+    lowered = (text or "").lower().strip()
+    if lowered in {"my_orders", "my orders"}:
+        return True
+    markers = (
+        "pending payment",
+        "pending payments",
+        "outstanding payment",
+        "how many",
+        "total order",
+        "my orders",
+        "all orders",
+        "orders do i have",
+        "orders i have",
+        "previous order",
+        "past order",
+        "order history",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _order_ref_bucket(lines: list) -> str:
+    """Group an order ref into a buyer-friendly status bucket."""
+    primary = lines[0]
+    pay = (primary.payment_status or "").strip().lower()
+    order_st = (primary.status or "").strip().lower()
+    if pay in {"awaiting_payment", "pending", ""}:
+        return "awaiting_payment"
+    if order_st == "delivered" or pay == "delivered":
+        return "delivered"
+    if order_st == "shipped" or pay == "shipped":
+        return "shipped"
+    if pay == "payment_received" or order_st in {"processing", "pending"}:
+        return "processing"
+    return "other"
+
+
+def _order_ref_status_label(bucket: str) -> str:
+    labels = {
+        "awaiting_payment": "Awaiting payment",
+        "processing": "Paid / processing",
+        "shipped": "Shipped",
+        "delivered": "Delivered",
+        "other": "In review",
+    }
+    return labels.get(bucket, bucket.replace("_", " ").title())
+
+
+def _format_my_orders_summary(by_ref: dict[str, list], db: Session) -> str:
+    """Full order history grouped by payment/shipment status."""
+    bucket_config = (
+        ("awaiting_payment", "⏳ *Awaiting payment*"),
+        ("processing", "🔄 *Paid / processing*"),
+        ("shipped", "🚚 *Shipped*"),
+        ("delivered", "✅ *Delivered*"),
+        ("other", "📋 *Other*"),
+    )
+    buckets: dict[str, list[str]] = {key: [] for key, _ in bucket_config}
+
+    sorted_refs = sorted(
+        by_ref.items(),
+        key=lambda item: item[1][0].created_at or datetime.min,
+        reverse=True,
+    )
+    for ref, lines in sorted_refs:
+        bucket = _order_ref_bucket(lines)
+        total = _order_total_from_lines(db, lines)
+        label = _order_ref_status_label(bucket)
+        buckets[bucket].append(f"• {ref} — {_format_money(total)} — _{label}_")
+
+    parts = [f"📊 *My orders* ({len(by_ref)} total)\n"]
+    shown = 0
+    max_lines = 12
+    for bucket_key, header in bucket_config:
+        items = buckets[bucket_key]
+        if not items:
+            continue
+        parts.append(header)
+        for line in items:
+            if shown >= max_lines:
+                parts.append("_…reply with an order reference for more details._")
+                break
+            parts.append(line)
+            shown += 1
+        parts.append("")
+        if shown >= max_lines:
+            break
+
+    if len(by_ref) == 0:
+        return "No orders found for this number yet."
+
+    parts.append(
+        "Reply with an order reference for full status & tracking "
+        "(e.g. ORD-20260614-3470)."
+    )
+    return "\n".join(parts).strip()
+
+
+async def _handle_order_lookup(
+    message: str, session: dict, db: Session
+) -> tuple[str, dict]:
+    """Order status, tracking, or account summary — never starts a new cart."""
+    text = (message or "").strip()
+    phone = session.get("phone") or ""
+
+    if phone and _is_order_account_query(text):
+        variants = phone_lookup_variants(phone)
+        if not variants:
+            return "I couldn't find orders for this number yet.", session
+        rows = (
+            db.query(Order)
+            .filter(Order.phone.in_(variants))
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .all()
+        )
+        if not rows:
+            return "No orders found for this number yet.", session
+
+        by_ref: dict[str, list[Order]] = {}
+        for row in rows:
+            base = (row.order_ref or "ORD-UNKNOWN").rsplit("-L", 1)[0]
+            by_ref.setdefault(base, []).append(row)
+
+        return _format_my_orders_summary(by_ref, db), session
+
+    if not phone:
+        return (
+            "Please share your order reference (e.g. ORD-20260614-3470) or AWB number.",
+            session,
+        )
+
+    requested_ref = _extract_order_status_ref(text)
+    awb_from_text = extract_tracking_number(text)
+    latest = _latest_order_by_phone(db, phone, requested_ref)
+    if not latest and awb_from_text:
+        tracking_only = await lookup_tracking_message(awb_from_text)
+        if tracking_only:
+            return tracking_only, session
+        return (
+            f"I couldn't find an order linked to AWB *{awb_from_text}* yet. "
+            "Please check the number or contact our team.",
+            session,
+        )
+    if not latest:
+        hint = (
+            f" for *{requested_ref}*" if requested_ref else ""
+        )
+        return (
+            f"I couldn't find an order{hint} for this number yet. "
+            "Please share your order reference (e.g. ORD-20260614-3470) or AWB number.",
+            session,
+        )
+
+    ref = latest.order_ref or "ORD-UNKNOWN"
+    base_ref = ref.split("-L")[0]
+    tracking_number = awb_from_text or (latest.tracking_number or "")
+    reply = await _build_order_status_reply(
+        latest,
+        base_ref,
+        tracking_number=tracking_number,
+    )
+    return reply, session
+
+
+async def _handle_order_filler(session: dict, text: str) -> tuple[str, dict] | None:
+    """Greetings mid-order should not be parsed as product names or quantities."""
+    state = session.get("order_state")
+    product = session.get("order_product_name") or ""
+    phone = session.get("phone") or ""
+
+    if is_order_reset_request(text):
+        return await _reset_order_flow(session, phone)
+
+    if state == COLLECT_QTY and product:
+        return (
+            f"Still adding *{product}*.\n\n"
+            f"{product_qty_prompt(product)}\n\n"
+            "Or type *cancel* or *new order* to start over.",
+            session,
+        )
+
+    if state in {COLLECT_SKU, COLLECT_SKU_CONFIRM, CART_MENU}:
+        return (
+            f"{BULK_LIST_PROMPT}\n\n"
+            "Or reply *new order* to clear your cart and start fresh.",
+            session,
+        )
+
+    if state in {COLLECT_CHECKOUT, CONFIRM_ORDER, SELECT_PAYMENT}:
+        return (
+            "You have checkout in progress. "
+            "Reply with your details or *CONFIRM*, or *new order* to start over.",
+            session,
+        )
+
+    return None
 
 
 def _format_order_summary_for_status(
@@ -1298,10 +1699,11 @@ def _phase_hint(session: dict) -> str:
         COLLECT_SKU_CONFIRM: "Confirm suggested product before quantity/cart actions.",
         COLLECT_QTY: "Pending quantity for a product — use add_to_cart with quantity.",
         CART_MENU: "Cart building — add, edit, remove, or proceed_to_checkout.",
-        COLLECT_COUNTRY: "Collect shipping country.",
+        COLLECT_COUNTRY: "Collect shipping country (skip if session.country is set).",
         COLLECT_CITY: "Collect city/port of entry.",
         COLLECT_CONTACT: "Collect buyer name and company.",
         SHIPPING_CHOICE: "Buyer must choose express (EMS) or normal (LP) shipping.",
+        COLLECT_CHECKOUT: "Collect name, city, phone in one buyer message.",
         CONFIRM_ORDER: "Show review; confirm_order only after explicit buyer confirmation.",
     }
     return hints.get(phase, "Order flow active.")
@@ -1407,6 +1809,7 @@ _ORDER_INTENT_MARKERS = ("order", "buy", "purchase", "place an order", "want to 
 _CONFIRM_MARKERS = frozenset(
     {"confirm", "confirmed", "yes", "y", "ok", "okay", "proceed", "place order"}
 )
+_REJECT_MARKERS = frozenset({"no", "n", "reject", "wrong", "nope", "not this"})
 _ADD_MARKERS = frozenset({"add", "more", "another", "+"})
 _DONE_MARKERS = frozenset({"done", "checkout", "review", "proceed", "finish", "ship"})
 _EDIT_MARKERS = frozenset({"edit", "cart", "list", "update"})
@@ -1444,6 +1847,8 @@ def _normalize_menu_action(text: str) -> str | None:
     first = lowered.split()[0]
     if first in _CONFIRM_MARKERS or lowered in _CONFIRM_MARKERS:
         return "confirm"
+    if first in _REJECT_MARKERS or lowered in _REJECT_MARKERS:
+        return "reject"
     if first in _ADD_MARKERS or lowered in _ADD_MARKERS:
         return "add"
     if first in _DONE_MARKERS or lowered in _DONE_MARKERS:
@@ -1478,34 +1883,11 @@ async def _run_order_rules(
 ) -> tuple[str, dict]:
     text = (message or "").strip()
     phone = session.get("phone") or ""
-    if phone and _is_order_status_query(text):
-        requested_ref = _extract_order_status_ref(text)
-        awb_from_text = extract_tracking_number(text)
-        latest = _latest_order_by_phone(db, phone, requested_ref)
-        if not latest and awb_from_text:
-            tracking_only = await lookup_tracking_message(awb_from_text)
-            if tracking_only:
-                return tracking_only, session
-            return (
-                f"I couldn't find an order linked to AWB *{awb_from_text}* yet. "
-                "Please check the number or contact our team.",
-                session,
-            )
-        if not latest:
-            return (
-                "I couldn't find any recent order for this number yet. "
-                "Please share your order reference (e.g., ORD-12345) or AWB number.",
-                session,
-            )
-        ref = latest.order_ref or "ORD-UNKNOWN"
-        base_ref = ref.split("-L")[0]
-        tracking_number = awb_from_text or (latest.tracking_number or "")
-        reply = await _build_order_status_reply(
-            latest,
-            base_ref,
-            tracking_number=tracking_number,
-        )
-        return reply, session
+    if is_order_reset_request(text):
+        return await _reset_order_flow(session, phone)
+
+    if phone and (_is_order_status_query(text) or _is_order_account_query(text)):
+        return await _handle_order_lookup(message, session, db)
 
     state = session.get("order_state") or COLLECT_SKU
     session["order_state"] = state
@@ -1523,37 +1905,57 @@ async def _run_order_rules(
             session["order_state"] = COLLECT_SKU
             return "Which product would you like to add? (name or SKU)", session
 
+        if _normalize_menu_action(text) == "reject":
+            _clear_pending_product(session)
+            session["order_state"] = COLLECT_SKU
+            return BULK_LIST_PROMPT, session
+
         if _normalize_menu_action(text) == "confirm":
             if pending_qty:
                 _add_line_to_cart(session, pending_sku, pending_name, int(pending_qty), 0.0)
                 _clear_pending_product(session)
                 session["order_state"] = CART_MENU
+                if phone:
+                    await _send_cart_action_buttons(phone)
                 return (
-                    f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}\n\n"
-                    "Reply *done* when finished adding products.",
+                    f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}",
                     session,
                 )
-            session["order_sku"] = pending_sku
-            session["order_product_name"] = pending_name
+            product = None
+            if pending_sku:
+                sku_match = re.fullmatch(r"PROD-(\d+)", pending_sku, re.IGNORECASE)
+                if sku_match:
+                    product = db.query(Product).filter(Product.id == int(sku_match.group(1))).first()
+            if product is None and pending_name:
+                product = (
+                    db.query(Product)
+                    .filter(Product.product_name == pending_name)
+                    .first()
+                )
             _clear_pending_product(session)
-            session["order_state"] = COLLECT_QTY
-            return (
-                f"How many units of {session['order_product_name']}?",
-                session,
-            )
+            if product is None:
+                session["order_state"] = COLLECT_SKU
+                return BULK_LIST_PROMPT, session
+            return _prompt_product_quantity(session, product)
 
         _clear_pending_product(session)
         session["order_state"] = COLLECT_SKU
         if not text:
-            return "Please share the exact product name or SKU.", session
+            return BULK_LIST_PROMPT, session
         # Treat non-confirm text as a fresh product query.
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
-        if _is_order_status_query(text):
-            return await _run_order_rules(message, session, db)
-        if not text:
-            return "Which product would you like to add? (name or SKU)", session
+        if _is_order_status_query(text) or _is_order_account_query(text):
+            return await _handle_order_lookup(message, session, db)
+        if _is_filler_message(text):
+            filler = await _handle_order_filler(session, text)
+            if filler:
+                return filler
+        if not text or any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
+            return BULK_LIST_PROMPT, session
+        if looks_like_bulk_order(text):
+            return await _process_bulk_order(text, session, db, phone)
         product, error, match_mode = _resolve_product_match(text, db)
         if error == "restricted":
             return (
@@ -1562,8 +1964,6 @@ async def _run_order_rules(
                 session,
             )
         if product is None:
-            if any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
-                return "Which product would you like to add? (name or SKU)", session
             suggestions = _suggest_products(text, db)
             reply = "I couldn't find that product. Please try the product name or SKU."
             if suggestions:
@@ -1576,30 +1976,32 @@ async def _run_order_rules(
                 product_name=product.product_name,
             )
             session["order_state"] = COLLECT_SKU_CONFIRM
+            if phone:
+                await _send_product_confirm_buttons(phone, product.product_name)
             return (
                 f"Did you mean *{product.product_name}*?\n"
-                "Reply *yes* to continue or share the exact product name/SKU.",
+                "Tap *Yes* to continue or *No* to try another product.",
                 session,
             )
-        _clear_pending_product(session)
-        session["order_sku"] = _product_sku(product)
-        session["order_product_name"] = product.product_name
-        session["order_unit_price"] = float(product.price_per_strip or 0.0)
-        session["pending_product"] = {
-            "name": product.product_name,
-            "sku": _product_sku(product),
-        }
-        session["order_state"] = COLLECT_QTY
-        return (
-            f"Found: *{product.product_name}*\n"
-            "How many units?",
-            session,
-        )
+        return _prompt_product_quantity(session, product)
 
     if state == COLLECT_QTY:
+        if is_order_reset_request(text):
+            return await _reset_order_flow(session, phone)
+        if _is_filler_message(text):
+            filler = await _handle_order_filler(session, text)
+            if filler:
+                return filler
         qty = _extract_positive_int(text)
         if qty is None or qty < 1:
-            return "Please enter a positive number of units (e.g. 1000).", session
+            name = session.get("order_product_name") or "your product"
+            return (
+                f"Please type a positive quantity (e.g. *350*) or:\n"
+                f"*{name} - 350*",
+                session,
+            )
+
+        session.pop("order_qty_custom", None)
         result = _tool_add_to_cart(
             {
                 "product_query": session.get("order_product_name", ""),
@@ -1610,21 +2012,56 @@ async def _run_order_rules(
         )
         if result.get("error"):
             return "Could not add to cart. Please try again.", session
-        return _format_cart_lines(_get_cart(session)), session
+
+        continued = await _continue_bulk_queue(session, db, phone)
+        if continued:
+            return continued
+
+        session["order_state"] = CART_MENU
+        cart_text = _format_cart_lines(_get_cart(session))
+        if phone:
+            await _send_cart_action_buttons(phone)
+        return cart_text, session
 
     if state == CART_MENU:
         action = _normalize_menu_action(text)
-        if action == "add":
+        if action == "add" or text.strip().lower() == "add":
             session["order_state"] = COLLECT_SKU
-            return "Which product would you like to add?", session
+            return BULK_LIST_PROMPT, session
         if action == "done" or (text or "").strip().lower() == "checkout":
             result = _tool_proceed_to_checkout(session)
             if result.get("error"):
                 return "Your cart is empty.", session
-            return "Which country should we ship to?", session
+            country = _prefill_order_country(session) or ""
+            return checkout_prompt(country), session
         if not text:
-            return _format_cart_lines(_get_cart(session)), session
-        return "Reply *done* to checkout, or *add* for another product.", session
+            cart_text = _format_cart_lines(_get_cart(session))
+            if phone:
+                await _send_cart_action_buttons(phone)
+            return cart_text, session
+        return "Tap *Checkout* or type *checkout*. Type product lines to add more.", session
+
+    if state == COLLECT_CHECKOUT:
+        parsed = parse_checkout_oneline(text, _prefill_order_country(session))
+        if not parsed:
+            country = _prefill_order_country(session) or "your country"
+            return (
+                f"Please send all details in one message:\n"
+                f"*Name, City, Phone*\n\n"
+                f"Shipping country: *{country}*"
+            ), session
+        country = parsed.get("country") or _prefill_order_country(session) or ""
+        if country and is_shipment_excluded_country(country):
+            _clear_order_session(session)
+            return SANCTIONED_COUNTRY_REFUSAL, session
+        if country:
+            session["order_country"] = country
+        session["order_city"] = parsed["city"]
+        session["order_contact"] = parsed["contact"]
+        reply = _apply_shipping_after_contact(session, db)
+        if session.get("order_state") == CONFIRM_ORDER and phone:
+            await _send_confirm_order_buttons(phone)
+        return reply, session
 
     if state == COLLECT_COUNTRY:
         if is_shipment_excluded_country(text):
@@ -1644,6 +2081,8 @@ async def _run_order_rules(
             return "Please share your name and company.", session
         session["order_contact"] = text
         reply = _apply_shipping_after_contact(session, db)
+        if session.get("order_state") == CONFIRM_ORDER and phone:
+            await _send_confirm_order_buttons(phone)
         return reply, session
 
     if state == SHIPPING_CHOICE:
@@ -1666,45 +2105,71 @@ async def _run_order_rules(
             return "Please tap a button below or reply *express* or *normal*", session
         session.pop("shipping_choice_buttons_sent", None)
         session["order_state"] = CONFIRM_ORDER
+        if phone:
+            await _send_confirm_order_buttons(phone)
         return _format_order_review(session), session
 
     if state == CONFIRM_ORDER:
+        if _normalize_menu_action(text) == "edit":
+            session["order_state"] = CART_MENU
+            cart_text = _format_cart_lines(_get_cart(session))
+            if phone:
+                await _send_cart_action_buttons(phone)
+            return cart_text, session
         if _normalize_menu_action(text) == "confirm":
             return await _commit_order(session, db)
         lowered = text.lower()
         if session.get("shipping_type") == "EMS" and ("express" in lowered or "ems" in lowered):
             return _format_order_review(session), session
         return (
-            "Please reply *CONFIRM* to place the order, or describe cart changes."
+            "Tap *Confirm Order* or type *CONFIRM*. Tap *Edit Cart* to change items."
         ), session
 
     session["order_state"] = COLLECT_SKU
-    return "Which product would you like to add?", session
+    return BULK_LIST_PROMPT, session
 
 
 async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str, dict]:
     """Run one turn of the order agent (LLM + tools, with rule fallback)."""
     session = dict(session or {})
     _migrate_legacy_single_line_session(session)
-    _ensure_order_started(session)
-    state = session.get("order_state") or COLLECT_SKU
     text = (message or "").strip()
+    phone = session.get("phone") or ""
 
     payment_result = await _try_payment_actions(message, session, db)
     if payment_result is not None:
         return payment_result
 
+    if is_order_reset_request(text):
+        return await _reset_order_flow(session, phone)
+
+    # Status / account lookups must not start a new cart.
+    if _is_order_status_query(text) or _is_order_account_query(text):
+        return await _handle_order_lookup(message, session, db)
+
+    filler_result = await _handle_order_filler(session, text) if _is_filler_message(text) else None
+    if filler_result:
+        return filler_result
+
+    _ensure_order_started(session)
+    state = session.get("order_state") or COLLECT_SKU
+
     # Deterministic UX guards regardless of LLM mode.
-    if _is_order_status_query(text):
-        reply, session = await _run_order_rules(message, session, db)
-        return await _finish_order_turn(reply, session)
     if state in {
         COLLECT_SKU,
         COLLECT_QTY,
         COLLECT_SKU_CONFIRM,
         SHIPPING_CHOICE,
+        COLLECT_CHECKOUT,
         CONFIRM_ORDER,
     }:
+        reply, session = await _run_order_rules(message, session, db)
+        return await _finish_order_turn(reply, session)
+    if state == CART_MENU and (
+        not text
+        or text.lower() in {"done", "checkout", "add"}
+        or _normalize_menu_action(text) in {"done", "add"}
+    ):
         reply, session = await _run_order_rules(message, session, db)
         return await _finish_order_turn(reply, session)
 

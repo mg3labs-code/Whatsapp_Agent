@@ -10,8 +10,9 @@ from typing import Any
 
 from langfuse import observe
 
-from app.agents.order import SELECT_PAYMENT, is_order_tracking_message
+from app.agents.order import SELECT_PAYMENT, is_order_account_message, is_order_tracking_message
 from app.messages.conversation_ui import MENU_OPTION_IDS, mark_menu_selection
+from app.messages.session_flow import is_discount_request, is_speak_to_team_request
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ HUMAN_KEYWORDS: tuple[str, ...] = (
     "connect me",
 )
 
-ORDER_ACTION_IDS = frozenset({"pay_bank", "pay_card", "new_order", "order_status"})
+ORDER_ACTION_IDS = frozenset({"pay_bank", "pay_card", "new_order", "order_status", "my_orders"})
 
 CLASSIFIER_SYSTEM_PROMPT = (
     "Classify this pharmaceutical B2B WhatsApp message. Return ONLY valid JSON.\n"
@@ -164,11 +165,17 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
     """
     session = dict(session or {})
 
-    if _matches_human_keyword(message):
+    if _matches_human_keyword(message) or is_speak_to_team_request(message):
+        return "escalate", session
+
+    if is_discount_request(message):
+        session["escalation_reason"] = "discount_request"
         return "escalate", session
 
     key = (message or "").strip().lower()
     if is_order_tracking_message(message):
+        return "order", session
+    if is_order_account_message(message):
         return "order", session
     if key in ORDER_ACTION_IDS:
         if key == "speak":
@@ -182,6 +189,8 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
         session = mark_menu_selection(session, message)
         if menu_intent == "escalate":
             return "escalate", session
+        if menu_intent == "my_orders":
+            return "order", session
         if not session.get("lead_qualified") and menu_intent in INTENTS_REQUIRING_QUALIFICATION:
             session["pending_intent"] = menu_intent
             return "qualify", session
