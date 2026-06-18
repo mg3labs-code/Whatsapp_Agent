@@ -20,6 +20,12 @@ from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
     is_shipment_excluded_country,
 )
+from app.business.shipping import (
+    calculate_cart_weight,
+    format_cart_with_shipping,
+    format_shipping_choice_message,
+    get_shipping_options,
+)
 from app.db.models import Order, Product
 from app.integrations.alerts import send_order_alert
 from app.integrations.cashfree import (
@@ -49,6 +55,7 @@ CART_MENU = "CART_MENU"
 COLLECT_COUNTRY = "COLLECT_COUNTRY"
 COLLECT_CITY = "COLLECT_CITY"
 COLLECT_CONTACT = "COLLECT_CONTACT"
+SHIPPING_CHOICE = "SHIPPING_CHOICE"
 CONFIRM_ORDER = "CONFIRM_ORDER"
 SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
@@ -57,6 +64,10 @@ ORDER_COMPLETE = "ORDER_COMPLETE"
 PAY_BANK_BUTTON = "pay_bank"
 PAY_CARD_BUTTON = "pay_card"
 PAYMENT_BUTTON_IDS = frozenset({PAY_BANK_BUTTON, PAY_CARD_BUTTON})
+
+SHIP_EXPRESS_BUTTON = "ship_express"
+SHIP_NORMAL_BUTTON = "ship_normal"
+SHIPPING_BUTTON_IDS = frozenset({SHIP_EXPRESS_BUTTON, SHIP_NORMAL_BUTTON})
 
 PAYMENT_OPTION_BUTTONS = [
     {"id": PAY_BANK_BUTTON, "title": "Bank Transfer"},
@@ -80,6 +91,13 @@ ORDER_SESSION_KEYS = (
     "order_country",
     "order_city",
     "order_contact",
+    "total_weight_g",
+    "box_no",
+    "shipping_options",
+    "shipping_type",
+    "shipping_cost_usd",
+    "shipping_days",
+    "shipping_choice_buttons_sent",
     "order_ref",
     "order_pending_sku",
     "order_pending_product_name",
@@ -99,6 +117,7 @@ ORDER_SYSTEM_PROMPT = (
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
     "- set_shipping / set_contact: extract from natural phrases.\n"
     f"- Payment is always {PAYMENT_METHOD}; never ask for other payment terms.\n"
+    "- After contact is collected, shipping options (EMS express / LP normal) are shown when available.\n"
     "- confirm_order ONLY when the buyer clearly confirms (yes, confirm, place order) and phase is CONFIRM_ORDER.\n"
     "- If lookup fails, show suggestions from the tool and ask for a clearer product name.\n"
     "- Use *single asterisks* for bold (WhatsApp). Be concise and professional.\n"
@@ -344,14 +363,161 @@ def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _cart_items_for_shipping(cart: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "sku": item.get("sku"),
+            "product_name": item.get("product_name"),
+            "qty": _item_qty(item),
+        }
+        for item in cart
+    ]
+
+
+def _selected_shipping_option(session: dict) -> dict[str, Any] | None:
+    options = session.get("shipping_options") or {}
+    shipping_type = session.get("shipping_type")
+    if shipping_type == "EMS":
+        return options.get("EMS")
+    if shipping_type == "LP":
+        return options.get("LP")
+    return None
+
+
+def _apply_shipping_after_contact(session: dict, db: Session) -> str:
+    """Compute weight + rates after contact collected; advance order_state."""
+    cart = _get_cart(session)
+    country = session.get("order_country") or ""
+    order_ref = session.get("order_ref") or ""
+
+    weight = calculate_cart_weight(_cart_items_for_shipping(cart), db)
+    if weight:
+        session["total_weight_g"] = weight["total_shipment_g"]
+        session["box_no"] = weight["box_no"]
+        total_g = int(weight["total_shipment_g"])
+    else:
+        session["total_weight_g"] = None
+        session["box_no"] = None
+        total_g = 0
+
+    options = get_shipping_options(country, total_g, db)
+    session["shipping_options"] = options
+
+    if not options.get("available"):
+        session["shipping_type"] = "PENDING_QUOTE"
+        session["shipping_cost_usd"] = 0
+        session["shipping_days"] = None
+        session["order_state"] = CONFIRM_ORDER
+        lead = format_shipping_choice_message(options, order_ref) or ""
+        return f"{lead}\n\n{_format_order_review(session)}".strip()
+
+    ems = options.get("EMS")
+    lp = options.get("LP")
+
+    if ems and lp is None:
+        session["shipping_type"] = "EMS"
+        session["shipping_cost_usd"] = ems["rate_usd"]
+        session["shipping_days"] = ems["days"]
+        session["order_state"] = CONFIRM_ORDER
+        lead = format_shipping_choice_message(options, order_ref) or ""
+        return f"{lead}\n\n{_format_order_review(session)}".strip()
+
+    if lp and ems is None:
+        session["shipping_type"] = "LP"
+        session["shipping_cost_usd"] = lp["rate_usd"]
+        session["shipping_days"] = lp["days"]
+        session["order_state"] = CONFIRM_ORDER
+        lead = format_shipping_choice_message(options, order_ref) or ""
+        return f"{lead}\n\n{_format_order_review(session)}".strip()
+
+    if ems and lp:
+        session.pop("shipping_type", None)
+        session.pop("shipping_cost_usd", None)
+        session.pop("shipping_days", None)
+        session.pop("shipping_choice_buttons_sent", None)
+        session["order_state"] = SHIPPING_CHOICE
+        return format_shipping_choice_message(options, order_ref) or (
+            "Please reply *express* or *normal*"
+        )
+
+    session["shipping_type"] = "PENDING_QUOTE"
+    session["shipping_cost_usd"] = 0
+    session["shipping_days"] = None
+    session["order_state"] = CONFIRM_ORDER
+    return _format_order_review(session)
+
+
 def _format_order_review(session: dict) -> str:
-    return (
-        "REVIEW:\n"
-        f"cart:\n{_format_cart_lines(_get_cart(session))}\n"
-        f"ship_to: {session.get('order_city', '')}, {session.get('order_country', '')}\n"
-        f"contact: {session.get('order_contact', '')}\n"
-        f"payment: {PAYMENT_METHOD}"
+    cart = _get_cart(session)
+    subtotal = _cart_total(cart)
+    shipping_option = _selected_shipping_option(session)
+    order_ref = session.get("order_ref") or ""
+
+    cart_review = format_cart_with_shipping(
+        cart,
+        subtotal,
+        shipping_option,
+        order_ref,
     )
+    if not cart_review:
+        cart_review = _format_cart_lines(cart)
+
+    return (
+        f"{cart_review}\n\n"
+        f"Ship to: {session.get('order_city', '')}, {session.get('order_country', '')}\n"
+        f"Contact: {session.get('order_contact', '')}\n"
+        f"Payment: {PAYMENT_METHOD}\n\n"
+        "Reply *CONFIRM* to place the order."
+    )
+
+
+def _shipping_choice_buttons(options: dict[str, Any]) -> list[dict[str, str]]:
+    """Quick-reply buttons when both EMS and LP are available (max 3, titles ≤20 chars)."""
+    ems = options.get("EMS")
+    lp = options.get("LP")
+    if not ems or not lp:
+        return []
+    ems_rate = float(ems["rate_usd"])
+    lp_rate = float(lp["rate_usd"])
+    return [
+        {
+            "id": SHIP_EXPRESS_BUTTON,
+            "title": f"Express ${ems_rate:.2f}"[:20],
+        },
+        {
+            "id": SHIP_NORMAL_BUTTON,
+            "title": f"Normal ${lp_rate:.2f}"[:20],
+        },
+    ]
+
+
+async def _finish_order_turn(reply: str, session: dict) -> tuple[str, dict]:
+    """Send shipping quick-reply buttons once when entering SHIPPING_CHOICE."""
+    if session.get("order_state") != SHIPPING_CHOICE:
+        return reply, session
+    if session.get("shipping_choice_buttons_sent"):
+        return reply, session
+
+    options = session.get("shipping_options") or {}
+    buttons = _shipping_choice_buttons(options)
+    phone = session.get("phone")
+    if not buttons or not phone or not reply:
+        return reply, session
+
+    if await send_interactive_buttons(phone, reply, buttons):
+        session["shipping_choice_buttons_sent"] = True
+        return "", session
+    return reply, session
+
+
+def _is_express_shipping_choice(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    return lowered == SHIP_EXPRESS_BUTTON or "express" in lowered or "ems" in lowered
+
+
+def _is_normal_shipping_choice(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    return lowered == SHIP_NORMAL_BUTTON or "normal" in lowered or "lp" in lowered
 
 
 def _session_snapshot(session: dict) -> dict[str, Any]:
@@ -666,15 +832,20 @@ def _tool_set_shipping(args: dict, session: dict) -> dict:
     return {"ok": True, "phase": COLLECT_COUNTRY, "next": "collect_country"}
 
 
-def _tool_set_contact(args: dict, session: dict) -> dict:
+def _tool_set_contact(args: dict, session: dict, db: Session) -> dict:
     contact = (args.get("contact") or "").strip()
     if len(contact) < 3:
         return {"error": "contact_too_short"}
     if not _get_cart(session):
         return {"error": "empty_cart"}
     session["order_contact"] = contact
-    session["order_state"] = CONFIRM_ORDER
-    return {"ok": True, "phase": CONFIRM_ORDER, "review": _format_order_review(session)}
+    shipping_message = _apply_shipping_after_contact(session, db)
+    return {
+        "ok": True,
+        "phase": session["order_state"],
+        "review": _format_order_review(session),
+        "shipping_message": shipping_message,
+    }
 
 
 async def _tool_confirm_order(session: dict, db: Session) -> dict:
@@ -701,9 +872,18 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     )
     phone = session.get("phone") or ""
     contact = session.get("order_contact") or ""
-    order_total = _cart_total(cart)
+    order_total = _cart_total(cart) + float(session.get("shipping_cost_usd") or 0)
+    order_total = round(order_total, 2)
     if order_total <= 0:
         order_total = 1.0
+
+    shipping_kwargs = {
+        "total_weight_g": session.get("total_weight_g"),
+        "box_no": session.get("box_no"),
+        "shipping_type": session.get("shipping_type"),
+        "shipping_cost_usd": session.get("shipping_cost_usd"),
+        "shipping_days": session.get("shipping_days"),
+    }
 
     for idx, item in enumerate(cart, start=1):
         db.add(
@@ -718,6 +898,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
                 order_ref=f"{order_ref}-L{idx:02d}",
                 status="pending",
                 payment_status="awaiting_payment",
+                **shipping_kwargs,
             )
         )
     db.commit()
@@ -792,7 +973,7 @@ def _orders_for_base_ref(db: Session, phone: str, base_ref: str) -> list[Order]:
 
 
 def _order_total_from_lines(db: Session, lines: list[Order]) -> float:
-    total = 0.0
+    product_total = 0.0
     for line in lines:
         sku = line.sku or ""
         match = re.fullmatch(r"PROD-(\d+)", sku, re.IGNORECASE)
@@ -801,8 +982,13 @@ def _order_total_from_lines(db: Session, lines: list[Order]) -> float:
         product = db.query(Product).filter(Product.id == int(match.group(1))).first()
         if product is None:
             continue
-        total += float(product.price_per_strip or 0) * int(line.quantity or 0)
-    return round(total, 2)
+        product_total += float(product.price_per_strip or 0) * int(line.quantity or 0)
+
+    shipping_cost = 0.0
+    if lines and lines[0].shipping_cost_usd is not None:
+        shipping_cost = float(lines[0].shipping_cost_usd)
+
+    return round(product_total + shipping_cost, 2)
 
 
 def _resolve_pending_payment(session: dict, db: Session) -> dict:
@@ -1093,7 +1279,7 @@ def _execute_order_tool(name: str, args: dict, session: dict, db: Session) -> di
     if name == "set_shipping":
         return _tool_set_shipping(args, session)
     if name == "set_contact":
-        return _tool_set_contact(args, session)
+        return _tool_set_contact(args, session, db)
     return {"error": "unknown_tool", "name": name}
 
 
@@ -1115,6 +1301,7 @@ def _phase_hint(session: dict) -> str:
         COLLECT_COUNTRY: "Collect shipping country.",
         COLLECT_CITY: "Collect city/port of entry.",
         COLLECT_CONTACT: "Collect buyer name and company.",
+        SHIPPING_CHOICE: "Buyer must choose express (EMS) or normal (LP) shipping.",
         CONFIRM_ORDER: "Show review; confirm_order only after explicit buyer confirmation.",
     }
     return hints.get(phase, "Order flow active.")
@@ -1456,17 +1643,37 @@ async def _run_order_rules(
         if len(text) < 3:
             return "Please share your name and company.", session
         session["order_contact"] = text
+        reply = _apply_shipping_after_contact(session, db)
+        return reply, session
+
+    if state == SHIPPING_CHOICE:
+        options = session.get("shipping_options") or {}
+        if _is_express_shipping_choice(text):
+            ems = options.get("EMS")
+            if not ems:
+                return "Express shipping is not available. Please reply *normal*.", session
+            session["shipping_type"] = "EMS"
+            session["shipping_cost_usd"] = ems["rate_usd"]
+            session["shipping_days"] = ems["days"]
+        elif _is_normal_shipping_choice(text):
+            lp = options.get("LP")
+            if not lp:
+                return "Normal shipping is not available. Please reply *express*.", session
+            session["shipping_type"] = "LP"
+            session["shipping_cost_usd"] = lp["rate_usd"]
+            session["shipping_days"] = lp["days"]
+        else:
+            return "Please tap a button below or reply *express* or *normal*", session
+        session.pop("shipping_choice_buttons_sent", None)
         session["order_state"] = CONFIRM_ORDER
-        return (
-            "Please review your order:\n"
-            f"{_format_cart_lines(_get_cart(session))}\n\n"
-            f"Payment method: *{PAYMENT_METHOD}*\n\n"
-            "Reply *CONFIRM* to place the order."
-        ), session
+        return _format_order_review(session), session
 
     if state == CONFIRM_ORDER:
         if _normalize_menu_action(text) == "confirm":
             return await _commit_order(session, db)
+        lowered = text.lower()
+        if session.get("shipping_type") == "EMS" and ("express" in lowered or "ems" in lowered):
+            return _format_order_review(session), session
         return (
             "Please reply *CONFIRM* to place the order, or describe cart changes."
         ), session
@@ -1489,15 +1696,25 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
 
     # Deterministic UX guards regardless of LLM mode.
     if _is_order_status_query(text):
-        return await _run_order_rules(message, session, db)
-    if state in {COLLECT_SKU, COLLECT_QTY, COLLECT_SKU_CONFIRM}:
-        return await _run_order_rules(message, session, db)
+        reply, session = await _run_order_rules(message, session, db)
+        return await _finish_order_turn(reply, session)
+    if state in {
+        COLLECT_SKU,
+        COLLECT_QTY,
+        COLLECT_SKU_CONFIRM,
+        SHIPPING_CHOICE,
+        CONFIRM_ORDER,
+    }:
+        reply, session = await _run_order_rules(message, session, db)
+        return await _finish_order_turn(reply, session)
 
     use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}
     if use_llm and os.getenv("OPENAI_API_KEY"):
         try:
-            return await _run_order_llm(message, session, db)
+            reply, session = await _run_order_llm(message, session, db)
+            return await _finish_order_turn(reply, session)
         except Exception:
             logger.exception("Order LLM agent failed; using rule fallback")
 
-    return await _run_order_rules(message, session, db)
+    reply, session = await _run_order_rules(message, session, db)
+    return await _finish_order_turn(reply, session)

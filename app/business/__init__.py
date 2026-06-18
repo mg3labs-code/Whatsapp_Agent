@@ -16,6 +16,12 @@ from app.business.hours import (
     is_limited_operations,
     is_public_holiday,
 )
+from app.business.shipping import (
+    calculate_cart_weight,
+    format_cart_with_shipping,
+    format_shipping_choice_message,
+    get_shipping_options,
+)
 
 __all__ = [
     "classify_country",
@@ -30,4 +36,8 @@ __all__ = [
     "is_business_hours",
     "is_limited_operations",
     "is_public_holiday",
+    "calculate_cart_weight",
+    "get_shipping_options",
+    "format_shipping_choice_message",
+    "format_cart_with_shipping",
 ]

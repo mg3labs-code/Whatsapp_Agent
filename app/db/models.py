@@ -1,7 +1,19 @@
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Integer, Numeric, String, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import declarative_base
 
@@ -21,10 +33,48 @@ class Product(Base):
     price_per_strip = Column(Numeric(10, 2), nullable=False)
     is_restricted = Column(Boolean, default=False)
     schedule_category = Column(String(8), nullable=True)  # X, H, or H1 when restricted
+    weight_g = Column(Numeric(8, 2), nullable=True, default=0)
+    weight_source = Column(String, nullable=True, default="unknown")
+    # weight_source values: 'exact','normalized','brand','estimated','manual'
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
         return f"<Product {self.product_name!r}>"
+
+
+class BoxSpec(Base):
+    __tablename__ = "box_specs"
+
+    box_no = Column(String, primary_key=True)
+    box_type = Column(String, nullable=False)
+    weight_g = Column(Numeric(8, 2), nullable=False)
+    height_cm = Column(String, nullable=True)
+    length_cm = Column(String, nullable=True)
+    breadth_cm = Column(String, nullable=True)
+    max_strips = Column(String, nullable=True)
+    max_tubes = Column(String, nullable=True)
+    max_vials = Column(String, nullable=True)
+    max_bottles = Column(String, nullable=True)
+
+
+class ShippingRate(Base):
+    __tablename__ = "shipping_rates"
+    __table_args__ = (
+        UniqueConstraint(
+            "country_name",
+            "shipping_type",
+            "weight_from_g",
+            name="uq_shipping_rates_country_type_weight_from",
+        ),
+        CheckConstraint("shipping_type IN ('EMS','LP')", name="ck_shipping_rates_type"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    country_name = Column(String, nullable=False)
+    shipping_type = Column(String, nullable=False)
+    weight_from_g = Column(Integer, nullable=False)
+    weight_to_g = Column(Integer, nullable=False)
+    rate_usd = Column(Numeric(8, 2), nullable=True)
 
 
 class Lead(Base):
@@ -69,6 +119,11 @@ class Order(Base):
     payment_received_at = Column(DateTime, nullable=True)
     tracking_number = Column(String, nullable=True, index=True)
     order_ref = Column(String, unique=True)
+    total_weight_g = Column(Numeric(10, 2), nullable=True)
+    box_no = Column(String, nullable=True)
+    shipping_type = Column(String, nullable=True)
+    shipping_cost_usd = Column(Numeric(10, 2), nullable=True)
+    shipping_days = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
