@@ -653,10 +653,10 @@ async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
     monkeypatch.setattr("app.agents.order.create_virtual_account", fake_create_va)
 
     session = {"phone": "+91999", "country": "Kenya"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg - 100", session, order_db)
-    await run_order_agent("checkout", session, order_db)
-    await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
     assert session["order_state"] == SELECT_PAYMENT
 
@@ -692,13 +692,13 @@ async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
 
     monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
     monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
-    monkeypatch.setattr("app.agents.order.create_payment_link", fake_create_link)
+    monkeypatch.setattr("app.agents.order.create_card_checkout", fake_create_link)
 
     session = {"phone": "+91999", "country": "Kenya"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg - 100", session, order_db)
-    await run_order_agent("checkout", session, order_db)
-    await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     reply, session = await run_order_agent(PAY_CARD_BUTTON, session, order_db)
@@ -713,10 +713,10 @@ async def test_payment_resolves_from_db_when_session_missing(order_db, monkeypat
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
     session = {"phone": "+91999", "country": "Kenya"}
-    await run_order_agent("order", session, order_db)
-    await run_order_agent("Metformin 500mg - 100", session, order_db)
-    await run_order_agent("checkout", session, order_db)
-    await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
+    _, session = await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
+    _, session = await run_order_agent("checkout", session, order_db)
+    _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
 
     empty_session = {"phone": "+91999"}
@@ -872,20 +872,20 @@ async def test_qualification_rejects_filler_biz_type(qual_db):
     reply, session, intent = await run_qualification_agent("bh", session, qual_db)
     assert intent == "continue_qual"
     assert session["qual_state"] == COLLECT_BIZ_TYPE
-    assert "business" in reply.lower()
+    assert "select type" in reply.lower() or "didn't catch" in reply.lower()
 
 
 @pytest.mark.asyncio
 async def test_qualification_complete_with_pending_order_skips_menu(qual_db, monkeypatch):
-    sent: list[tuple[str, list]] = []
+    sent: list[str] = []
 
-    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
-        sent.append((phone, buttons))
+    async def capture_menu(phone: str) -> bool:
+        sent.append(phone)
         return True
 
     monkeypatch.setattr(
-        "app.agents.qualification.send_interactive_buttons",
-        capture_buttons,
+        "app.agents.qualification.send_main_menu_list",
+        capture_menu,
     )
 
     session = {"phone": "+15550005555", "pending_intent": "order"}
@@ -903,15 +903,15 @@ async def test_qualification_complete_with_pending_order_skips_menu(qual_db, mon
 
 @pytest.mark.asyncio
 async def test_qualification_complete_without_pending_sends_buttons(qual_db, monkeypatch):
-    sent: list[tuple[str, list]] = []
+    sent: list[str] = []
 
-    async def capture_buttons(phone: str, _body: str, buttons: list) -> bool:
-        sent.append((phone, buttons))
+    async def capture_menu(phone: str) -> bool:
+        sent.append(phone)
         return True
 
     monkeypatch.setattr(
-        "app.agents.qualification.send_interactive_buttons",
-        capture_buttons,
+        "app.agents.qualification.send_main_menu_list",
+        capture_menu,
     )
 
     session = {"phone": "+15550006666"}
@@ -919,8 +919,8 @@ async def test_qualification_complete_without_pending_sends_buttons(qual_db, mon
     reply, session, intent = await run_qualification_agent("pharmacy", session, qual_db)
 
     assert intent == "faq"
-    assert sent
-    assert {b["id"] for b in sent[0][1]} == {"order", "pricing", "speak"}
+    assert "you're all set" in reply.lower()
+    assert sent == ["15550006666"]
 
 
 @pytest.mark.asyncio

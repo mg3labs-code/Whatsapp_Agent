@@ -112,6 +112,34 @@ ORDER_COMPLETE / commit
      Our sales team will contact you within 24 hours with the proforma invoice. Thank you!"
 ```
 
+### Shipping Flow (added in shipping PR)
+
+After COLLECT_CONTACT, the order agent calculates shipment weight and looks
+up shipping rates before asking for payment terms:
+
+State: SHIPPING_CHOICE
+- Calculates total_weight_g from cart items (product weight × qty + box weight)
+- Queries shipping_rates table for EMS (express) and LP (normal) rates
+- If both available: asks buyer to choose express or normal
+- If only EMS available (LP null at that weight): auto-selects EMS
+- If country not in shipping_rates: sets shipping to PENDING_QUOTE, team follows up
+
+Weight data sources (weight_source column on products):
+- exact: name matched exactly with weight sheet
+- normalized: matched after stripping dose/pack/form suffix
+- brand: matched on brand name prefix
+- estimated: not in weight sheet — calculated from form+dose+pack
+- manual: manually entered
+
+Seed command (run after alembic upgrade head):
+```
+python scripts/seed_all_shipping_data.py \
+    --weight Intelligent_Weight_Sheet.xlsx \
+    --catalog catalog.xlsx \
+    --ems EXPRESS_SHIPPING_CHARGES.xlsx \
+    --lp REGULAR__LP__SHIPPING_CHARGES.xlsx
+```
+
 ---
 
 ## AGENT 4: QUALIFICATION AGENT (app/agents/qualification.py)
