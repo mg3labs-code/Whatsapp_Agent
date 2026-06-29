@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
 from app.db.models import Order
-from app.integrations.alerts import send_order_team_alert
+from app.integrations.alerts import send_critical_error_alert, send_order_team_alert
 from app.integrations.whatsapp import send_message
 from app.session.manager import normalize_phone
 
@@ -611,78 +611,83 @@ async def process_cashfree_webhook_event(event: dict[str, Any], db: Session) -> 
     if event.get("status") == "ignored":
         return
 
-    payment_status = event.get("payment_status") or "awaiting_payment"
-    order_ref = (event.get("order_ref") or "").strip()
-    if not order_ref:
-        return
+    try:
+        payment_status = event.get("payment_status") or "awaiting_payment"
+        order_ref = (event.get("order_ref") or "").strip()
+        if not order_ref:
+            return
 
-    order = (
-        db.query(Order)
-        .filter(Order.order_ref.ilike(f"{order_ref}%"))
-        .order_by(Order.created_at.desc(), Order.id.desc())
-        .first()
-    )
-    if not order:
-        logger.warning("Cashfree webhook order not found: %s", event)
-        return
+        order = (
+            db.query(Order)
+            .filter(Order.order_ref.ilike(f"{order_ref}%"))
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .first()
+        )
+        if not order:
+            logger.warning("Cashfree webhook order not found: %s", event)
+            return
 
-    base_ref = (order.order_ref or "").rsplit("-L", 1)[0]
-    buyer_phone = event.get("buyer_phone") or order.phone
-    amount = float(event.get("amount") or 0)
-    payment_id = str(event.get("payment_id") or "")
-    utr = str(event.get("utr") or "")
-    paid_at = _parse_payment_time(str(event.get("payment_time") or ""))
+        base_ref = (order.order_ref or "").rsplit("-L", 1)[0]
+        buyer_phone = event.get("buyer_phone") or order.phone
+        amount = float(event.get("amount") or 0)
+        payment_id = str(event.get("payment_id") or "")
+        utr = str(event.get("utr") or "")
+        paid_at = _parse_payment_time(str(event.get("payment_time") or ""))
 
-    if payment_status == "payment_received":
-        q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
-        q.update(
-            {
-                "payment_status": "payment_received",
-                "status": "payment_received",
-                "utr_number": utr or Order.utr_number,
-                "payment_id": payment_id or Order.payment_id,
-                "payment_received_at": paid_at or datetime.utcnow(),
-                "virtual_account_id": event.get("virtual_account_id") or Order.virtual_account_id,
-            },
-            synchronize_session=False,
-        )
-        db.commit()
+        if payment_status == "payment_received":
+            q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
+            q.update(
+                {
+                    "payment_status": "payment_received",
+                    "status": "payment_received",
+                    "utr_number": utr or Order.utr_number,
+                    "payment_id": payment_id or Order.payment_id,
+                    "payment_received_at": paid_at or datetime.utcnow(),
+                    "virtual_account_id": event.get("virtual_account_id") or Order.virtual_account_id,
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            logger.info("Payment marked received order_ref=%s amount=%s", base_ref, amount)
 
-        buyer_msg = buyer_message_for_payment_status(
-            "payment_received",
-            order_ref=base_ref,
-            amount=amount,
-            payment_id=payment_id or utr,
-        )
-        if buyer_phone and buyer_msg:
-            await send_message(buyer_phone, buyer_msg)
-        await send_order_team_alert(
-            f"💰 Payment confirmed — {base_ref} — {amount:,.2f} "
-            f"from {event.get('remitter_name') or 'Customer'} — Ref: {payment_id or utr or 'N/A'}"
-        )
-        return
+            buyer_msg = buyer_message_for_payment_status(
+                "payment_received",
+                order_ref=base_ref,
+                amount=amount,
+                payment_id=payment_id or utr,
+            )
+            if buyer_phone and buyer_msg:
+                await send_message(buyer_phone, buyer_msg)
+            await send_order_team_alert(
+                f"💰 Payment confirmed — {base_ref} — {amount:,.2f} "
+                f"from {event.get('remitter_name') or 'Customer'} — Ref: {payment_id or utr or 'N/A'}"
+            )
+            return
 
-    if payment_status in {"payment_failed", "payment_expired"}:
-        db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%")).update(
-            {"payment_status": payment_status},
-            synchronize_session=False,
-        )
-        db.commit()
-        buyer_msg = buyer_message_for_payment_status(
-            payment_status,
-            order_ref=base_ref,
-            amount=amount,
-            payment_id=payment_id,
-        )
-        if buyer_phone and buyer_msg:
-            await send_message(buyer_phone, buyer_msg)
-        return
+        if payment_status in {"payment_failed", "payment_expired"}:
+            db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%")).update(
+                {"payment_status": payment_status},
+                synchronize_session=False,
+            )
+            db.commit()
+            buyer_msg = buyer_message_for_payment_status(
+                payment_status,
+                order_ref=base_ref,
+                amount=amount,
+                payment_id=payment_id,
+            )
+            if buyer_phone and buyer_msg:
+                await send_message(buyer_phone, buyer_msg)
+            return
 
-    if payment_status == "settlement_update":
-        settlement_status = event.get("settlement_status") or event.get("event_type")
-        await send_order_team_alert(
-            f"🏦 Settlement update — {base_ref} — {settlement_status} — amount {amount:,.2f}"
-        )
+        if payment_status == "settlement_update":
+            settlement_status = event.get("settlement_status") or event.get("event_type")
+            await send_order_team_alert(
+                f"🏦 Settlement update — {base_ref} — {settlement_status} — amount {amount:,.2f}"
+            )
+    except Exception as exc:
+        logger.exception("Cashfree payment processing failed")
+        await send_critical_error_alert("Payment processing", str(exc))
 
 
 async def poll_cashfree_payment_status(order_ref: str) -> dict[str, Any]:

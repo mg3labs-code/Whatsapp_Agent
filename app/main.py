@@ -22,6 +22,7 @@ sentry_sdk.init(
     traces_sample_rate=0.1,
 )
 
+<<<<<<< HEAD
 
 def _configure_logging() -> None:
     """Apply root logging config. Called at import and again after Alembic (fileConfig resets root to WARN)."""
@@ -35,6 +36,14 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
+=======
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
+)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(RequestIdFilter())
+>>>>>>> c91736e6519c5d0e657791339183d62d06c8a173
 
 logger = logging.getLogger(__name__)
 
