@@ -17,8 +17,9 @@ if not database_url:
     raise RuntimeError("DATABASE_URL is not set. Please set it in environment or .env")
 config.set_main_option("sqlalchemy.url", database_url)
 
-# Interpret the config file for Python logging.
-if config.config_file_name is not None:
+# Interpret the config file for Python logging (skip when invoked from app startup —
+# fileConfig resets root logger to WARN and hides INFO logs).
+if config.config_file_name is not None and os.getenv("ALEMBIC_SKIP_FILE_CONFIG") != "1":
     fileConfig(config.config_file_name)
 
 # add your model's MetaData object here
