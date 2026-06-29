@@ -1092,6 +1092,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
             )
         )
     db.commit()
+    logger.info("Order confirmed order_ref=%s total=%s", order_ref, order_total)
 
     await send_order_alert(
         {

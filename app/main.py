@@ -1,5 +1,7 @@
 import logging
+import os
 
+import sentry_sdk
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -8,10 +10,24 @@ from app.db.database import engine
 from app.db.migrate import is_railway_production, run_alembic_upgrade_head
 from app.integrations.cashfree import start_overdue_scheduler
 from app.session.manager import ping_redis, redis_configured, redis_key_stats
+from app.utils.request_context import RequestIdFilter
 from app.utils.tracing import flush_langfuse
 from app.webhook.router import webhook_router
 
 load_dotenv()
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN", ""),
+    environment=os.getenv("RAILWAY_ENVIRONMENT_NAME", "production"),
+    traces_sample_rate=0.1,
+)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
+)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(RequestIdFilter())
 
 logger = logging.getLogger(__name__)
 

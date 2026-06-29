@@ -215,6 +215,11 @@ async def process_message(payload: dict) -> None:
         text = parsed["text"]
         message_id = parsed["message_id"]
 
+        from app.utils.request_context import set_request_id
+        from app.utils.tracing import hash_user_id
+
+        set_request_id(hash_user_id(phone), message_id)
+
         client = _get_redis_client()
 
         if await _is_duplicate(message_id, client):
