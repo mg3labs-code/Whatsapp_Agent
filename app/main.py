@@ -22,12 +22,28 @@ sentry_sdk.init(
     traces_sample_rate=0.1,
 )
 
+<<<<<<< HEAD
+
+def _configure_logging() -> None:
+    """Apply root logging config. Called at import and again after Alembic (fileConfig resets root to WARN)."""
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
+        force=True,
+    )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RequestIdFilter())
+
+
+_configure_logging()
+=======
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
 )
 for handler in logging.getLogger().handlers:
     handler.addFilter(RequestIdFilter())
+>>>>>>> c91736e6519c5d0e657791339183d62d06c8a173
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +56,7 @@ async def startup_event() -> None:
     try:
         if is_railway_production():
             run_alembic_upgrade_head()
+            _configure_logging()
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         logger.info("DB connected")
