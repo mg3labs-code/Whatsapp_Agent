@@ -84,6 +84,16 @@ async def send_order_team_alert(text: str) -> bool:
     )
 
 
+async def send_critical_error_alert(context: str, error_summary: str) -> bool:
+    """Critical system failures → ORDER_ALERT_PHONE_NUMBERS, same channel as order alerts."""
+    text = (
+        f"🚨 *System Error* — {context}\n"
+        f"{error_summary}\n\n"
+        "Check Sentry/Railway logs for full details."
+    )
+    return await send_order_team_alert(text)
+
+
 async def send_escalation_alert(phone: str, session: dict, reason: str) -> bool:
     session = session or {}
     message = (

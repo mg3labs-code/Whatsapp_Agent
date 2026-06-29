@@ -18,3 +18,5 @@ python-docx
 pypdf
 pdfplumber
 openpyxl
+sentry-sdk[fastapi]==2.18.0
+jinja2
