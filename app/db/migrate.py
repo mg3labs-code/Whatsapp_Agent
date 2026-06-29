@@ -9,6 +9,8 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 
+from app.db.database import engine
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,5 +27,11 @@ def run_alembic_upgrade_head() -> None:
 
     cfg = Config(str(_PROJECT_ROOT / "alembic.ini"))
     logger.info("Running Alembic upgrade head (Railway production)")
-    command.upgrade(cfg, "head")
+    # Release app pool connections so Alembic can acquire migration locks.
+    engine.dispose()
+    os.environ["ALEMBIC_SKIP_FILE_CONFIG"] = "1"
+    try:
+        command.upgrade(cfg, "head")
+    finally:
+        os.environ.pop("ALEMBIC_SKIP_FILE_CONFIG", None)
     logger.info("Alembic migrations complete")
