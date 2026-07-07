@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from decimal import Decimal
 
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.db.models import Lead
 from app.integrations.alerts import send_critical_error_alert
-from app.session.lead_hydration import lookup_lead_by_phone
 from app.session.manager import normalize_phone
 from app.utils.tracing import hash_user_id
 
@@ -38,23 +39,20 @@ def upsert_lead_from_session(session: dict, db: Session) -> Lead:
         "manual_review_only": bool(session.get("manual_review_only")),
     }
 
-    try:
-        existing = lookup_lead_by_phone(db, phone)
-        if existing:
-            existing.phone = phone
-            for key, value in fields.items():
-                setattr(existing, key, value)
-            db.commit()
-            db.refresh(existing)
-            logger.info(
-                "Lead saved phone_hash=%s lifecycle_stage=%s",
-                hash_user_id(phone),
-                fields["lifecycle_stage"],
-            )
-            return existing
+    insert_stmt = insert(Lead).values(phone=phone, **fields)
+    upsert_stmt = (
+        insert_stmt.on_conflict_do_update(
+            index_elements=["phone"],
+            set_={
+                **{key: getattr(insert_stmt.excluded, key) for key in fields},
+                "updated_at": datetime.utcnow(),
+            },
+        )
+        .returning(Lead)
+    )
 
-        lead = Lead(phone=phone, **fields)
-        db.add(lead)
+    try:
+        lead = db.execute(upsert_stmt).scalar_one()
         db.commit()
         db.refresh(lead)
         logger.info(

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -29,6 +31,25 @@ logger = logging.getLogger(__name__)
 webhook_router = APIRouter()
 
 
+def _verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Verify Meta X-Hub-Signature-256 (HMAC-SHA256 over raw request body)."""
+    app_secret = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+    if not app_secret or not signature_header:
+        return False
+
+    header = signature_header.strip()
+    if not header.startswith("sha256="):
+        return False
+
+    expected_sig = header[len("sha256=") :]
+    computed_sig = hmac.new(
+        app_secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(computed_sig, expected_sig)
+
+
 @webhook_router.get("/webhook")
 async def verify_webhook(request: Request) -> Response:
     """Meta webhook verification handshake.
@@ -56,7 +77,27 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     """
     # SECURITY: always 200 to Meta — never expose parse/validation errors in HTTP status
     try:
-        payload = await request.json()
+        raw = await request.body()
+    except Exception:
+        logger.warning("Webhook body read failed")
+        return Response(status_code=200)
+
+    signature_header = (
+        request.headers.get("x-hub-signature-256")
+        or request.headers.get("X-Hub-Signature-256")
+        or ""
+    )
+    if not _verify_meta_signature(raw, signature_header):
+        logger.warning(
+            "Meta webhook signature mismatch — ignoring payload "
+            "(has_sig=%s, body_len=%s)",
+            bool(signature_header),
+            len(raw),
+        )
+        return Response(status_code=200)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
     except Exception:
         logger.warning("Webhook JSON parse failed")
         return Response(status_code=200)
