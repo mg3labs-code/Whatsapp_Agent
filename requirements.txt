@@ -8,6 +8,7 @@ redis
 psycopg2-binary
 sqlalchemy
 alembic
+apscheduler==3.10.4
 pinecone
 langfuse
 httpx

@@ -245,7 +245,7 @@ async def router_node(state: MessageState) -> dict:
 
     if msg_key in PAYMENT_BUTTON_IDS or msg_key in {
         "bank transfer",
-        "debit / credit card",
+        "wire transfer",
     } or session.get("order_state") == SELECT_PAYMENT:
         return {"intent": "order", "session": session}
 

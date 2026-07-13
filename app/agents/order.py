@@ -28,12 +28,7 @@ from app.business.shipping import (
 )
 from app.db.models import Order, Product
 from app.integrations.alerts import send_order_alert
-from app.integrations.cashfree import (
-    create_card_checkout,
-    create_virtual_account,
-    get_card_payment_text,
-    get_payment_instructions_text,
-)
+from app.integrations.cashfree import get_static_payment_details_text
 from app.integrations.indiapost import (
     extract_tracking_number,
     fetch_tracking_bundle,
@@ -77,17 +72,11 @@ PAYMENT_METHOD = "T/T Advance"
 ORDER_COMPLETE = "ORDER_COMPLETE"
 
 PAY_BANK_BUTTON = "pay_bank"
-PAY_CARD_BUTTON = "pay_card"
-PAYMENT_BUTTON_IDS = frozenset({PAY_BANK_BUTTON, PAY_CARD_BUTTON})
+PAYMENT_BUTTON_IDS = frozenset({PAY_BANK_BUTTON})
 
 SHIP_EXPRESS_BUTTON = "ship_express"
 SHIP_NORMAL_BUTTON = "ship_normal"
 SHIPPING_BUTTON_IDS = frozenset({SHIP_EXPRESS_BUTTON, SHIP_NORMAL_BUTTON})
-
-PAYMENT_OPTION_BUTTONS = [
-    {"id": PAY_BANK_BUTTON, "title": "Bank Transfer"},
-    {"id": PAY_CARD_BUTTON, "title": "Debit / Credit Card"},
-]
 
 POST_PAYMENT_BUTTONS = [
     {"id": "new_order", "title": "New Order"},
@@ -1121,24 +1110,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     session["last_order_ref"] = order_ref
     session["last_order_total"] = order_total
     session["last_order_contact"] = contact
-    session["order_state"] = SELECT_PAYMENT
-    if phone:
-        await send_interactive_buttons(
-            phone,
-            (
-                f"✅ *Order {order_ref} confirmed!*\n"
-                f"Total: {_format_money(order_total)}\n\n"
-                "Please choose how you'd like to pay the full amount:"
-            ),
-            PAYMENT_OPTION_BUTTONS,
-        )
-    reply = (
-        f"✅ *Order Confirmed!*\n"
-        f"Order Ref: {order_ref}\n"
-        f"Total: {_format_money(order_total)}\n\n"
-        "Choose *Bank Transfer* or *Debit / Credit Card* to complete payment."
-    )
-    return reply, session
+    return await _handle_bank_transfer(session, db, order_ref, order_total, phone)
 
 
 def _latest_order_by_phone(db: Session, phone: str, order_ref: str | None = None) -> Order | None:
@@ -1214,82 +1186,40 @@ def _resolve_pending_payment(session: dict, db: Session) -> dict:
     return session
 
 
-def _update_orders_virtual_account(
-    db: Session, base_ref: str, virtual_account_id: str | None
-) -> None:
-    if not virtual_account_id:
-        return
-    db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%")).update(
-        {"virtual_account_id": virtual_account_id},
-        synchronize_session=False,
-    )
-    db.commit()
-
-
 async def _send_post_payment_buttons(phone: str, body: str) -> None:
     if phone:
         await send_interactive_buttons(phone, body, POST_PAYMENT_BUTTONS)
 
 
+def _order_payment_currency() -> str:
+    """Cart totals and shipping in this agent are priced in USD."""
+    return "USD"
+
+
 async def _handle_bank_transfer(
     session: dict, db: Session, order_ref: str, amount: float, phone: str
 ) -> tuple[str, dict]:
-    contact = session.get("last_order_contact") or session.get("order_contact") or ""
-    va_details = await create_virtual_account(order_ref, amount, phone)
-    _update_orders_virtual_account(db, order_ref, va_details.get("virtual_account_id"))
-
-    order_payload = {
-        "order_ref": order_ref,
-        "total_amount": amount,
-        "contact_name": contact,
-    }
-    instructions = get_payment_instructions_text(order_payload, va_details)
+    instructions = get_static_payment_details_text(
+        order_ref,
+        amount,
+        _order_payment_currency(),
+    )
     session.pop("order_state", None)
-    session["payment_method_chosen"] = "bank_transfer"
+    session["payment_method_chosen"] = "wire_transfer"
 
     if phone:
         await send_message(phone, instructions)
         await _send_post_payment_buttons(
             phone,
-            f"Bank transfer details sent for *{order_ref}*.\n"
-            "Share your UTR/reference once you've paid.",
+            f"Wire transfer details sent for *{order_ref}*.\n"
+            "Share your payment reference once you've transferred.",
         )
 
     return (
-        f"Bank transfer details for *{order_ref}* ({_format_money(amount)}) have been sent. "
-        "Please complete the transfer and reply with your UTR/reference number.",
-        session,
-    )
-
-
-async def _handle_card_payment(
-    session: dict, order_ref: str, amount: float, phone: str
-) -> tuple[str, dict]:
-    contact = session.get("last_order_contact") or session.get("order_contact") or ""
-    link_details = await create_card_checkout(order_ref, amount, phone, contact)
-    link_url = link_details.get("link_url")
-
-    session.pop("order_state", None)
-    session["payment_method_chosen"] = "card"
-
-    if not link_url:
-        return (
-            "Sorry, we couldn't generate a card payment link right now. "
-            "Please choose *Bank Transfer* or contact our team for assistance.",
-            session,
-        )
-
-    card_text = get_card_payment_text(order_ref, amount, link_url)
-    if phone:
-        await send_message(phone, card_text)
-        await _send_post_payment_buttons(
-            phone,
-            f"Secure card payment link sent for *{order_ref}*.",
-        )
-
-    return (
-        f"Secure payment link for *{order_ref}* ({_format_money(amount)}) has been sent. "
-        "Open the link to pay by debit or credit card.",
+        f"✅ *Order {order_ref} confirmed!*\n"
+        f"Total: {_format_money(amount)}\n\n"
+        "Wire transfer details have been sent. "
+        "Please complete the transfer and reply with your payment reference.",
         session,
     )
 
@@ -1310,16 +1240,12 @@ async def _handle_payment_selection(
             session,
         )
 
-    if text == PAY_BANK_BUTTON or "bank transfer" in text:
+    if text == PAY_BANK_BUTTON or "bank transfer" in text or "wire transfer" in text:
         return await _handle_bank_transfer(session, db, order_ref, amount, phone)
-    if text == PAY_CARD_BUTTON or "debit" in text or "credit card" in text or text == "card":
-        return await _handle_card_payment(session, order_ref, amount, phone)
 
     return (
         f"Order *{order_ref}* total: {_format_money(amount)}.\n\n"
-        "Please choose a payment method using the buttons below:\n"
-        "• *Bank Transfer* — domestic or international wire\n"
-        "• *Debit / Credit Card* — secure Cashfree checkout link",
+        "Reply *wire transfer* to receive payment details again.",
         session,
     )
 
@@ -1330,9 +1256,12 @@ def _is_payment_button_message(text: str, session: dict) -> bool:
         return True
     if session.get("order_state") == SELECT_PAYMENT:
         return True
-    if lowered in {"bank transfer", "debit / credit card"}:
-        return True
-    if "bank transfer" in lowered or "debit" in lowered or "credit card" in lowered:
+    if (
+        lowered == "bank transfer"
+        or "bank transfer" in lowered
+        or lowered == "wire transfer"
+        or "wire transfer" in lowered
+    ):
         return True
     return False
 

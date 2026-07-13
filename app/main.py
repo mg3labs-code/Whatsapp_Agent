@@ -8,7 +8,13 @@ from sqlalchemy import text
 
 from app.db.database import engine
 from app.db.migrate import is_railway_production, run_alembic_upgrade_head
-from app.integrations.cashfree import start_overdue_scheduler
+from app.integrations.cashfree import (
+    is_export_wire_configured,
+    load_export_wire_details,
+    missing_export_wire_fields,
+    start_overdue_scheduler,
+    validate_export_wire_details,
+)
 from app.session.manager import ping_redis, redis_configured, redis_key_stats
 from app.utils.request_context import RequestIdFilter
 from app.utils.tracing import flush_langfuse
@@ -60,6 +66,15 @@ async def startup_event() -> None:
         else:
             logger.error("REDIS_URL not set on app service — sessions will not persist")
         start_overdue_scheduler()
+        if is_export_wire_configured():
+            logger.info("Export wire payment details configured")
+        else:
+            details = load_export_wire_details()
+            logger.warning(
+                "Export wire payment details incomplete or invalid missing=%s validation=%s",
+                missing_export_wire_fields(details),
+                validate_export_wire_details(details),
+            )
     except Exception as exc:
         # SECURITY: do not expose connection strings or env details in error messages
         logger.exception("Database startup check failed")

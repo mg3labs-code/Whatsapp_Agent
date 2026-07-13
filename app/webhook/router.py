@@ -6,14 +6,9 @@ import logging
 import os
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 
 from app.db.database import get_db
-from app.integrations.cashfree import (
-    handle_cashfree_webhook,
-    process_cashfree_webhook_event,
-    verify_cashfree_webhook_signature,
-)
 from app.integrations.indiapost import process_indiapost_webhook_event
 from app.orchestrator.graph import compiled_graph
 from app.session.manager import _get_redis_client, get_session, save_session
@@ -106,100 +101,10 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
     return Response(status_code=200)
 
 
-async def _process_cashfree_payload(payload: dict) -> None:
-    event = handle_cashfree_webhook(payload)
-    if event.get("status") == "ignored":
-        logger.info("Cashfree webhook ignored event=%s", event.get("event_type"))
-        return
-
-    db_gen = get_db()
-    db = next(db_gen)
-    try:
-        await process_cashfree_webhook_event(event, db)
-    except Exception:
-        logger.exception("Cashfree webhook processing failed")
-    finally:
-        db_gen.close()
-
-
-@webhook_router.get("/payment/return")
-async def payment_return() -> Response:
-    """Buyer lands here after card checkout — status comes via webhook, not redirect."""
-    return PlainTextResponse(
-        "Payment submitted. You can close this page and return to WhatsApp — "
-        "we will confirm your payment in the chat shortly."
-    )
-
-
-@webhook_router.get("/payment/checkout")
-async def payment_checkout(session_id: str = "") -> Response:
-    """Open Cashfree hosted checkout from a payment_session_id (Orders API flow)."""
-    sid = (session_id or "").strip()
-    if not sid.startswith("session_") or len(sid) > 512:
-        return PlainTextResponse("Invalid or missing payment session.", status_code=400)
-
-    mode = "production" if os.getenv("CASHFREE_ENV", "sandbox").strip().lower() == "production" else "sandbox"
-    safe_sid = sid.replace("\\", "\\\\").replace('"', '\\"').replace("<", "").replace(">", "")
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Secure payment</title>
-  <script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
-</head>
-<body>
-  <p>Opening secure payment page…</p>
-  <script>
-    const cashfree = Cashfree({{ mode: "{mode}" }});
-    cashfree.checkout({{
-      paymentSessionId: "{safe_sid}",
-      redirectTarget: "_self"
-    }});
-  </script>
-</body>
-</html>"""
-    return HTMLResponse(html)
-
-
 @webhook_router.post("/webhook/cashfree")
-async def receive_cashfree_webhook(
-    request: Request, background_tasks: BackgroundTasks
-) -> Response:
-    """Cashfree payment / payment-link / settlement webhooks."""
-    try:
-        raw = await request.body()
-    except Exception:
-        logger.warning("Cashfree webhook body read failed")
-        return Response(status_code=200)
-
-    verified = verify_cashfree_webhook_signature(
-        raw,
-        webhook_signature=request.headers.get("x-webhook-signature")
-        or request.headers.get("X-Webhook-Signature"),
-        webhook_timestamp=request.headers.get("x-webhook-timestamp")
-        or request.headers.get("X-Webhook-Timestamp"),
-        legacy_signature=request.headers.get("X-Cashfree-Signature")
-        or request.headers.get("x-cashfree-signature"),
-    )
-    if not verified:
-        logger.warning(
-            "Cashfree webhook signature mismatch — ignoring payload "
-            "(env=%s, has_ts=%s, has_sig=%s, body_len=%s)",
-            os.getenv("CASHFREE_ENV", "?"),
-            bool(request.headers.get("x-webhook-timestamp")),
-            bool(request.headers.get("x-webhook-signature")),
-            len(raw),
-        )
-        return Response(status_code=200)
-
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:
-        logger.warning("Cashfree webhook JSON parse failed")
-        return Response(status_code=200)
-
-    background_tasks.add_task(_process_cashfree_payload, payload)
+async def receive_cashfree_webhook() -> Response:
+    """Acknowledge legacy Cashfree webhook retries — integration removed."""
+    logger.info("Cashfree webhook received but integration has been removed")
     return Response(status_code=200)
 
 

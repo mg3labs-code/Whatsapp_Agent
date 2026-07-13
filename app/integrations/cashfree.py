@@ -1,11 +1,8 @@
-"""Cashfree helpers: payment links, VA creation, webhooks, overdue tracking."""
+"""Payment helpers: export wire instructions and overdue tracking."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import logging
 import os
 import re
@@ -18,9 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
 from app.db.models import Order
-from app.integrations.alerts import send_critical_error_alert, send_order_team_alert
+from app.integrations.alerts import send_order_team_alert
 from app.integrations.whatsapp import send_message
-from app.session.manager import normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -53,64 +49,6 @@ def _base_order_ref(order_ref: str) -> str:
     if "-L" in (order_ref or ""):
         return order_ref.rsplit("-L", 1)[0]
     return order_ref
-
-
-async def create_virtual_account(
-    order_ref: str, amount: float, customer_phone: str
-) -> dict[str, Any]:
-    """Create VA (domestic) and include international remittance details if available."""
-    headers = _cashfree_headers()
-    base = headers.pop("_base")
-    payload = {
-        "reference_id": order_ref,
-        "customer_details": {"customer_phone": customer_phone},
-        "amount": float(amount),
-        "remarks": f"Payment for {order_ref}",
-    }
-    out: dict[str, Any] = {
-        "virtual_account_id": None,
-        "account_number": None,
-        "ifsc": None,
-        "iban": None,
-        "swift_code": None,
-        "amount": float(amount),
-    }
-
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        # Domestic VA (Autocollect).
-        try:
-            domestic_url = f"{base}/pg/links/autocollect"
-            domestic = await client.post(domestic_url, headers=headers, json=payload)
-            if domestic.status_code < 400:
-                data = domestic.json()
-                out["virtual_account_id"] = (
-                    data.get("virtual_account_id")
-                    or data.get("va_id")
-                    or data.get("id")
-                )
-                out["account_number"] = (
-                    data.get("account_number")
-                    or data.get("bank_details", {}).get("account_number")
-                )
-                out["ifsc"] = data.get("ifsc") or data.get("bank_details", {}).get("ifsc")
-            else:
-                logger.warning("Cashfree domestic VA creation failed: HTTP %s", domestic.status_code)
-        except Exception:
-            logger.exception("Cashfree domestic VA creation error")
-
-        # International collection details (best effort).
-        try:
-            intl_url = f"{base}/pg/international/collections/accounts"
-            intl = await client.get(intl_url, headers=headers)
-            if intl.status_code < 400:
-                rows = intl.json()
-                row = rows[0] if isinstance(rows, list) and rows else {}
-                out["iban"] = row.get("iban") or row.get("account_iban")
-                out["swift_code"] = row.get("swift_code") or row.get("swift")
-        except Exception:
-            logger.exception("Cashfree international details fetch error")
-
-    return out
 
 
 def _sanitize_link_id(order_ref: str) -> str:
@@ -277,451 +215,117 @@ async def create_payment_link(
     return out
 
 
-async def create_card_checkout(
-    order_ref: str,
-    amount: float,
-    customer_phone: str,
-    customer_name: str = "",
-) -> dict[str, Any]:
-    """Card/UPI checkout URL — Payment Links API or Orders API (see CASHFREE_PAYMENT_MODE)."""
-    mode = _cashfree_checkout_mode()
+EXPORT_WIRE_ENV = {
+    "account_name": "STATIC_WIRE_ACCOUNT_NAME",
+    "account_number": "STATIC_WIRE_ACCOUNT_NUMBER",
+    "bank_name": "STATIC_WIRE_BANK_NAME",
+    "branch": "STATIC_WIRE_BRANCH",
+    "swift_code": "STATIC_WIRE_SWIFT_CODE",
+    "ifsc": "STATIC_WIRE_IFSC",
+}
 
-    if mode == "orders":
-        return await create_order_checkout(order_ref, amount, customer_phone, customer_name)
+REQUIRED_EXPORT_WIRE_FIELDS = (
+    "account_name",
+    "account_number",
+    "bank_name",
+    "branch",
+    "swift_code",
+)
 
-    link_out = await create_payment_link(order_ref, amount, customer_phone, customer_name)
-    if link_out.get("link_url") or mode == "links":
-        return link_out
-
-    logger.info(
-        "Payment link unavailable for %s — falling back to Cashfree Orders API",
-        order_ref,
-    )
-    order_out = await create_order_checkout(order_ref, amount, customer_phone, customer_name)
-    if order_out.get("link_url"):
-        return order_out
-    return link_out
+_SWIFT_PATTERN = re.compile(r"^[A-Z0-9]{8}([A-Z0-9]{3})?$")
+_IFSC_PATTERN = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
 
-def get_card_payment_text(order_ref: str, amount: float, link_url: str) -> str:
-    """WhatsApp copy for debit/credit card payment via Cashfree link."""
-    currency = os.getenv("CASHFREE_LINK_CURRENCY", "INR").strip().upper() or "INR"
-    amount_label = f"₹{amount:,.2f}" if currency == "INR" else f"${amount:,.2f} {currency}"
-    return (
-        "💳 *Pay by Debit / Credit Card*\n"
-        f"Order: {order_ref}\n"
-        f"Amount: {amount_label}\n"
-        "─────────────────\n"
-        "Tap the secure link below to complete payment:\n"
-        f"{link_url}\n\n"
-        "You can pay with Visa, Mastercard, UPI, or netbanking.\n"
-        "_Link expires in 48 hours._\n"
-        "We will confirm your payment automatically in this chat."
-    )
-
-
-def get_payment_instructions_text(order: dict, va_details: dict) -> str:
-    """Build WhatsApp payment instructions text for buyer."""
-    order_ref = order.get("order_ref", "N/A")
-    total = float(va_details.get("amount") or order.get("total_amount") or 0)
-    account_number = va_details.get("account_number") or "Will be shared shortly"
-    ifsc = va_details.get("ifsc") or "Will be shared shortly"
-    iban = va_details.get("iban") or "Will be shared shortly"
-    swift = va_details.get("swift_code") or "Will be shared shortly"
-
-    return (
-        "💳 *Payment Instructions*\n"
-        f"Order: {order_ref}\n"
-        f"Amount: ${total:,.2f} USD\n"
-        "─────────────────\n"
-        "Bank Transfer (India):\n"
-        f"Account: {account_number}\n"
-        f"IFSC: {ifsc}\n"
-        f"Reference: {order_ref}\n"
-        "─────────────────\n"
-        "International Wire:\n"
-        f"Account: {iban}\n"
-        f"SWIFT: {swift}\n"
-        f"Reference: {order_ref}\n\n"
-        "Funds reflect in 1–3 business days.\n"
-        "Reply with your UTR/reference once transferred."
-    )
-
-
-def _cashfree_hmac_b64(secret: str, message: bytes) -> str:
-    return base64.b64encode(
-        hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
-    ).decode("utf-8")
-
-
-def _cashfree_hmac_hex(secret: str, message: bytes) -> str:
-    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
-
-
-def verify_cashfree_webhook_signature(
-    raw_body: bytes,
-    *,
-    webhook_signature: str | None = None,
-    webhook_timestamp: str | None = None,
-    legacy_signature: str | None = None,
-) -> bool:
-    """Verify Cashfree webhook (2023-08-01 / 2025-01-01 and legacy headers)."""
-    client_secret = os.getenv("CASHFREE_SECRET_KEY", "").strip()
-    webhook_secret = (os.getenv("CASHFREE_WEBHOOK_SECRET", "") or client_secret).strip()
-    sig = (webhook_signature or legacy_signature or "").strip()
-    ts = (webhook_timestamp or "").strip()
-
-    if not client_secret and not webhook_secret:
-        logger.warning("Cashfree secrets not set — skipping webhook signature check")
-        return True
-
-    if not sig:
-        return False
-
-    secrets = [s for s in (client_secret, webhook_secret) if s]
-    # Deduplicate while preserving order.
-    seen: set[str] = set()
-    unique_secrets: list[str] = []
-    for s in secrets:
-        if s not in seen:
-            seen.add(s)
-            unique_secrets.append(s)
-
-    if ts:
-        # Official: HMAC-SHA256 base64 over (timestamp + raw body) — no separator.
-        signed_std = ts.encode("utf-8") + raw_body
-        for secret in unique_secrets:
-            if hmac.compare_digest(_cashfree_hmac_b64(secret, signed_std), sig):
-                return True
-        # Some older samples used timestamp + "." + body; keep for compatibility.
-        signed_dot = f"{ts}.".encode("utf-8") + raw_body
-        for secret in unique_secrets:
-            if hmac.compare_digest(_cashfree_hmac_b64(secret, signed_dot), sig):
-                return True
-
-    for secret in unique_secrets:
-        if hmac.compare_digest(_cashfree_hmac_hex(secret, raw_body), sig):
-            return True
-        if hmac.compare_digest(_cashfree_hmac_b64(secret, raw_body), sig):
-            return True
-
-    return False
-
-
-def _notes_order_ref(link_notes: dict | None, link_id: str = "") -> str:
-    notes = link_notes or {}
-    order_ref = notes.get("order_ref") or ""
-    if order_ref:
-        return _base_order_ref(str(order_ref))
-    if link_id and link_id.upper().startswith("ORD"):
-        return _base_order_ref(link_id)
-    return ""
-
-
-def _notes_phone(link_notes: dict | None, customer: dict | None) -> str:
-    notes = link_notes or {}
-    phone = notes.get("phone") or (customer or {}).get("customer_phone") or ""
-    if phone:
-        return normalize_phone(str(phone))
-    return ""
-
-
-def _parse_payment_link_event(payload: dict) -> dict[str, Any]:
-    """Parse PAYMENT_LINK_EVENT (Cashfree 2025-01-01 schema)."""
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    link_notes = data.get("link_notes") if isinstance(data.get("link_notes"), dict) else {}
-    customer = data.get("customer_details") if isinstance(data.get("customer_details"), dict) else {}
-    order = data.get("order") if isinstance(data.get("order"), dict) else {}
-    payment = data.get("payment") if isinstance(data.get("payment"), dict) else {}
-
-    link_id = str(data.get("link_id") or "")
-    order_ref = _notes_order_ref(link_notes, link_id)
-    buyer_phone = _notes_phone(link_notes, customer)
-    link_status = str(data.get("link_status") or "").upper()
-    txn_status = str(order.get("transaction_status") or payment.get("payment_status") or "").upper()
-
-    amount = float(
-        order.get("order_amount")
-        or data.get("link_amount_paid")
-        or data.get("link_amount")
-        or payment.get("payment_amount")
-        or 0
-    )
-    payment_id = (
-        str(order.get("order_id") or "")
-        or str(payment.get("cf_payment_id") or "")
-        or str(order.get("transaction_id") or "")
-    )
-
-    if link_status == "PAID" or txn_status in {"SUCCESS", "PAID"}:
-        payment_status = "payment_received"
-    elif link_status in {"EXPIRED"}:
-        payment_status = "payment_expired"
-    elif link_status in {"CANCELLED"} or txn_status in {"FAILED", "CANCELLED"}:
-        payment_status = "payment_failed"
-    else:
-        payment_status = "awaiting_payment"
-
+def load_export_wire_details() -> dict[str, str]:
+    """Read export wire details from env (evaluated on each call)."""
     return {
-        "event_type": "PAYMENT_LINK_EVENT",
-        "order_ref": order_ref,
-        "buyer_phone": buyer_phone,
-        "payment_status": payment_status,
-        "link_status": link_status,
-        "amount": amount,
-        "payment_id": payment_id,
-        "utr": payment.get("bank_reference") or payment.get("utr") or "",
-        "virtual_account_id": None,
-        "remitter_name": customer.get("customer_name") or "Customer",
-        "payment_time": payload.get("event_time") or "",
-        "status": "process",
+        field: (os.getenv(env_key, "") or "").strip()
+        for field, env_key in EXPORT_WIRE_ENV.items()
     }
 
 
-def handle_cashfree_webhook(payload: dict) -> dict[str, Any]:
-    """Normalize Cashfree webhook payloads into one internal shape."""
-    data = payload or {}
-    event_type = str(
-        data.get("type") or data.get("event") or data.get("event_type") or ""
-    ).strip()
+def missing_export_wire_fields(details: dict[str, str] | None = None) -> list[str]:
+    """Return required field names that are empty."""
+    data = details if details is not None else load_export_wire_details()
+    return [field for field in REQUIRED_EXPORT_WIRE_FIELDS if not data.get(field)]
 
-    if event_type == "PAYMENT_LINK_EVENT":
-        event = _parse_payment_link_event(data)
-        if not event.get("order_ref"):
-            event["status"] = "ignored"
-        return event
 
-    body = data.get("data") if isinstance(data.get("data"), dict) else data
-    link_notes = body.get("link_notes") if isinstance(body.get("link_notes"), dict) else {}
-    order_tags = body.get("order_tags") if isinstance(body.get("order_tags"), dict) else {}
-    order_block = body.get("order") if isinstance(body.get("order"), dict) else {}
+def validate_export_wire_details(details: dict[str, str] | None = None) -> list[str]:
+    """Return human-readable validation errors for configured wire details."""
+    data = details if details is not None else load_export_wire_details()
+    errors: list[str] = []
 
-    order_ref = (
-        link_notes.get("order_ref")
-        or order_tags.get("order_ref")
-        or body.get("order_ref")
-        or body.get("reference_id")
-        or order_block.get("order_id")
-        or body.get("order_id")
-        or body.get("merchant_order_id")
-        or body.get("link_id")
-        or body.get("vAccountId")
-        or ""
-    )
-    if not order_ref:
-        va_ref = body.get("virtual_account_reference") or body.get("remarks") or ""
-        match = re.search(r"ORD-\d{8}-\d{4}", str(va_ref))
-        if match:
-            order_ref = match.group(0)
+    swift = (data.get("swift_code") or "").upper()
+    if swift and not _SWIFT_PATTERN.match(swift):
+        errors.append("swift_code must be 8 or 11 alphanumeric characters")
 
-    customer = body.get("customer_details") if isinstance(body.get("customer_details"), dict) else {}
-    buyer_phone = _notes_phone(link_notes, customer) or str(body.get("phone") or "")
+    ifsc = (data.get("ifsc") or "").upper()
+    if ifsc and not _IFSC_PATTERN.match(ifsc):
+        errors.append("ifsc must be an 11-character IFSC (e.g. HDFC0001234)")
 
-    normalized = {
-        "event_type": event_type,
-        "order_ref": _base_order_ref(str(order_ref)) if order_ref else "",
-        "buyer_phone": normalize_phone(buyer_phone) if buyer_phone else "",
-        "virtual_account_id": body.get("virtual_account_id") or body.get("va_id"),
-        "payment_id": body.get("payment_id") or body.get("cf_payment_id") or body.get("utr"),
-        "utr": body.get("utr") or body.get("bank_reference") or body.get("reference_number"),
-        "amount": float(body.get("amount") or body.get("payment_amount") or 0),
-        "currency": body.get("currency") or "INR",
-        "remitter_name": body.get("remitter_name") or body.get("payer_name") or body.get("payerName") or "Unknown",
-        "payment_time": body.get("payment_time") or body.get("paid_at") or "",
-        "payment_status": "payment_received",
-        "status": "process",
-    }
+    account_number = data.get("account_number") or ""
+    if account_number and not re.fullmatch(r"\d{6,18}", account_number):
+        errors.append("account_number must be 6–18 digits")
 
-    bank_success = {
-        "virtual_account.credited",
-        "INTERNATIONAL_PAYMENT_COLLECTED",
-        "VIRTUAL_ACCOUNT_CREDITED",
-    }
-    card_success = {"PAYMENT_SUCCESS_WEBHOOK", "LINK_PAYMENT_RECEIVED", "PAYMENT_SUCCESS"}
-    settlement_events = {
-        "SETTLEMENT_SUCCESS",
-        "SETTLEMENT_INITIATED",
-        "SETTLEMENT_FAILED",
-        "SETTLEMENT_REVERSED",
-    }
+    return errors
 
-    if event_type in settlement_events:
-        normalized["payment_status"] = "settlement_update"
-        normalized["settlement_status"] = event_type
-    elif event_type in bank_success or event_type in card_success:
-        normalized["payment_status"] = "payment_received"
-    elif event_type in {"PAYMENT_FAILED_WEBHOOK"}:
-        normalized["payment_status"] = "payment_failed"
+
+def is_export_wire_configured() -> bool:
+    """True when all required export wire env vars are set and pass validation."""
+    details = load_export_wire_details()
+    return not missing_export_wire_fields(details) and not validate_export_wire_details(details)
+
+
+def get_static_payment_details_text(
+    order_ref: str, amount: float, currency: str
+) -> str:
+    """Build export wire instructions for the buyer from environment variables."""
+    currency_code = (currency or "").strip().upper()
+    if currency_code == "USD":
+        symbol = "$"
+    elif currency_code == "INR":
+        symbol = "₹"
     else:
-        normalized["status"] = "ignored"
+        raise ValueError(f"Unsupported currency: {currency_code!r}")
 
-    if not normalized["order_ref"]:
-        normalized["status"] = "ignored"
-    return normalized
-
-
-def buyer_message_for_payment_status(
-    payment_status: str,
-    *,
-    order_ref: str,
-    amount: float,
-    payment_id: str = "",
-) -> str | None:
-    currency = os.getenv("CASHFREE_LINK_CURRENCY", "INR").strip().upper() or "INR"
-    amount_label = f"₹{amount:,.2f}" if currency == "INR" else f"${amount:,.2f} {currency}"
-
-    if payment_status == "payment_received":
+    details = load_export_wire_details()
+    missing = missing_export_wire_fields(details)
+    validation_errors = validate_export_wire_details(details)
+    if missing or validation_errors:
+        logger.warning(
+            "Export wire details unavailable order_ref=%s missing=%s validation=%s",
+            order_ref,
+            missing,
+            validation_errors,
+        )
         return (
-            "✅ *Payment received!*\n\n"
-            f"Order  : {order_ref}\n"
-            f"Amount : {amount_label}\n"
-            f"Ref    : `{payment_id or 'N/A'}`\n\n"
-            "Your order is confirmed and being processed.\n"
-            "Settlement to our business account may take 1–2 business days."
+            "*Payment details (International wire)*\n"
+            f"Amount: {symbol}{amount:,.2f} {currency_code}\n"
+            f"Reference: {order_ref}\n\n"
+            "Our team will share international wire transfer details with you directly.\n"
+            "Our team will confirm receipt manually within 24 hours."
         )
-    if payment_status == "payment_failed":
-        return (
-            "❌ *Payment unsuccessful*\n\n"
-            f"Order: {order_ref}\n\n"
-            "You can try again using the same link, or reply *new order* to start fresh."
-        )
-    if payment_status == "payment_expired":
-        return (
-            "⏰ *Payment link expired*\n\n"
-            f"Order: {order_ref}\n\n"
-            "Reply in this chat and we can generate a new payment link."
-        )
-    if payment_status == "settlement_update":
-        return None
-    return None
 
-
-def _parse_payment_time(raw: str) -> datetime | None:
-    value = (raw or "").strip()
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-async def process_cashfree_webhook_event(event: dict[str, Any], db: Session) -> None:
-    """Apply webhook event to DB and notify buyer + ops team."""
-    if event.get("status") == "ignored":
-        return
-
-    try:
-        payment_status = event.get("payment_status") or "awaiting_payment"
-        order_ref = (event.get("order_ref") or "").strip()
-        if not order_ref:
-            return
-
-        order = (
-            db.query(Order)
-            .filter(Order.order_ref.ilike(f"{order_ref}%"))
-            .order_by(Order.created_at.desc(), Order.id.desc())
-            .first()
-        )
-        if not order:
-            logger.warning("Cashfree webhook order not found: %s", event)
-            return
-
-        base_ref = (order.order_ref or "").rsplit("-L", 1)[0]
-        buyer_phone = event.get("buyer_phone") or order.phone
-        amount = float(event.get("amount") or 0)
-        payment_id = str(event.get("payment_id") or "")
-        utr = str(event.get("utr") or "")
-        paid_at = _parse_payment_time(str(event.get("payment_time") or ""))
-
-        if payment_status == "payment_received":
-            q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
-            q.update(
-                {
-                    "payment_status": "payment_received",
-                    "status": "payment_received",
-                    "utr_number": utr or Order.utr_number,
-                    "payment_id": payment_id or Order.payment_id,
-                    "payment_received_at": paid_at or datetime.utcnow(),
-                    "virtual_account_id": event.get("virtual_account_id") or Order.virtual_account_id,
-                },
-                synchronize_session=False,
-            )
-            db.commit()
-            logger.info("Payment marked received order_ref=%s amount=%s", base_ref, amount)
-
-            buyer_msg = buyer_message_for_payment_status(
-                "payment_received",
-                order_ref=base_ref,
-                amount=amount,
-                payment_id=payment_id or utr,
-            )
-            if buyer_phone and buyer_msg:
-                await send_message(buyer_phone, buyer_msg)
-            await send_order_team_alert(
-                f"💰 Payment confirmed — {base_ref} — {amount:,.2f} "
-                f"from {event.get('remitter_name') or 'Customer'} — Ref: {payment_id or utr or 'N/A'}"
-            )
-            return
-
-        if payment_status in {"payment_failed", "payment_expired"}:
-            db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%")).update(
-                {"payment_status": payment_status},
-                synchronize_session=False,
-            )
-            db.commit()
-            buyer_msg = buyer_message_for_payment_status(
-                payment_status,
-                order_ref=base_ref,
-                amount=amount,
-                payment_id=payment_id,
-            )
-            if buyer_phone and buyer_msg:
-                await send_message(buyer_phone, buyer_msg)
-            return
-
-        if payment_status == "settlement_update":
-            settlement_status = event.get("settlement_status") or event.get("event_type")
-            await send_order_team_alert(
-                f"🏦 Settlement update — {base_ref} — {settlement_status} — amount {amount:,.2f}"
-            )
-    except Exception as exc:
-        logger.exception("Cashfree payment processing failed")
-        await send_critical_error_alert("Payment processing", str(exc))
-
-
-async def poll_cashfree_payment_status(order_ref: str) -> dict[str, Any]:
-    """Poll Cashfree for order payment status (fallback when webhook missed)."""
-    headers = _cashfree_headers()
-    base = headers.pop("_base")
-    url = f"{base}/pg/orders/{order_ref}/payments"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            response = await client.get(url, headers=headers)
-            if response.status_code >= 400:
-                return {"status": "unknown", "order_ref": order_ref}
-            rows = response.json()
-            if not isinstance(rows, list) or not rows:
-                return {"status": "pending", "order_ref": order_ref}
-            paid = next(
-                (r for r in rows if str(r.get("payment_status", "")).upper() in {"SUCCESS", "PAID"}),
-                None,
-            )
-            if not paid:
-                return {"status": "pending", "order_ref": order_ref}
-            return {
-                "status": "received",
-                "order_ref": order_ref,
-                "payment_id": paid.get("cf_payment_id") or paid.get("payment_id"),
-                "utr": paid.get("bank_reference") or paid.get("utr"),
-                "amount": float(paid.get("payment_amount") or 0),
-                "currency": paid.get("payment_currency") or "INR",
-                "payment_time": paid.get("payment_time") or "",
-                "remitter_name": paid.get("payment_message") or "Unknown",
-            }
-        except Exception:
-            logger.exception("Cashfree poll failed for order_ref=%s", order_ref)
-            return {"status": "unknown", "order_ref": order_ref}
+    lines = [
+        "*Payment details (International wire)*",
+        f"Amount: {symbol}{amount:,.2f} {currency_code}",
+        f"Beneficiary: {details['account_name']}",
+        f"Account: {details['account_number']}",
+        f"Bank: {details['bank_name']}",
+        f"Branch: {details['branch']}",
+        f"SWIFT: {details['swift_code'].upper()}",
+    ]
+    if details.get("ifsc"):
+        lines.append(f"IFSC: {details['ifsc'].upper()}")
+    lines.extend(
+        [
+            f"Reference: {order_ref}",
+            "",
+            "Please mention the reference exactly as above.",
+            "Our team will confirm receipt manually within 24 hours.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _group_base_order_refs(rows: list[Order]) -> list[str]:
@@ -742,7 +346,7 @@ def _latest_order_for_ref(db: Session, base_ref: str) -> Order | None:
 
 
 async def check_overdue_payments() -> None:
-    """Check awaiting-payment orders >48h, poll Cashfree, remind buyer if overdue."""
+    """Remind buyers and alert ops for awaiting-payment orders older than the cutoff."""
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(hours=OVERDUE_HOURS)
@@ -758,32 +362,7 @@ async def check_overdue_payments() -> None:
             latest = _latest_order_for_ref(db, base_ref)
             if not latest:
                 continue
-            polled = await poll_cashfree_payment_status(base_ref)
-            if polled.get("status") == "received":
-                paid_at = datetime.utcnow()
-                q = db.query(Order).filter(Order.order_ref.ilike(f"{base_ref}%"))
-                q.update(
-                    {
-                        "payment_status": "payment_received",
-                        "status": "payment_received",
-                        "utr_number": polled.get("utr"),
-                        "payment_id": polled.get("payment_id"),
-                        "payment_received_at": paid_at,
-                    },
-                    synchronize_session=False,
-                )
-                db.commit()
-                await send_message(
-                    latest.phone,
-                    f"✅ Payment of ${float(polled.get('amount') or 0):,.2f} received! Order is being processed.",
-                )
-                await send_order_team_alert(
-                    f"💰 Payment confirmed — {base_ref} — ${float(polled.get('amount') or 0):,.2f} "
-                    f"from {polled.get('remitter_name') or 'Unknown'} — UTR: {polled.get('utr') or 'N/A'}"
-                )
-                continue
 
-            # genuinely overdue: reminder + owner alert
             await send_message(
                 latest.phone,
                 f"Friendly reminder: payment for *{base_ref}* is still pending. "
