@@ -26,7 +26,6 @@ from app.agents.order import (
     COLLECT_SKU_CONFIRM,
     CONFIRM_ORDER,
     PAY_BANK_BUTTON,
-    PAY_CARD_BUTTON,
     SANCTIONED_COUNTRY_REFUSAL,
     SELECT_PAYMENT,
     _resolve_pending_payment,
@@ -344,10 +343,28 @@ def order_db():
         db.close()
 
 
+def _set_export_wire_env(monkeypatch, **overrides):
+    defaults = {
+        "STATIC_WIRE_ACCOUNT_NAME": "New Life Medicare Exports",
+        "STATIC_WIRE_ACCOUNT_NUMBER": "123456789012",
+        "STATIC_WIRE_BANK_NAME": "Example Bank Ltd",
+        "STATIC_WIRE_BRANCH": "Mumbai Export Branch",
+        "STATIC_WIRE_SWIFT_CODE": "EXAMPLGB",
+        "STATIC_WIRE_IFSC": "HDFC0001234",
+    }
+    defaults.update(overrides)
+    for key, value in defaults.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+
 @pytest.mark.asyncio
 async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    _set_export_wire_env(monkeypatch)
     session = {"phone": "+919876543210", "country": "Kenya"}
 
     reply, session = await run_order_agent("I want to order", session, order_db)
@@ -368,9 +385,10 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert "confirm" in reply.lower()
 
     reply, session = await run_order_agent("confirm", session, order_db)
-    assert "order confirmed" in reply.lower()
+    assert "confirmed" in reply.lower()
     assert "ORD-" in reply
-    assert session["order_state"] == SELECT_PAYMENT
+    assert "order_state" not in session
+    assert session.get("payment_method_chosen") == "wire_transfer"
     assert session.get("last_order_total", 0) > 0
     assert session.get("lead_qualified") is True
     assert session.get("greeted") is True
@@ -624,9 +642,10 @@ async def test_order_status_query_returns_latest_status(order_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
+async def test_order_payment_wire_transfer_fallback_resends_details(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    _set_export_wire_env(monkeypatch)
 
     sent_messages: list[str] = []
 
@@ -638,19 +657,8 @@ async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
         sent_messages.append(body)
         return True
 
-    async def fake_create_va(order_ref, amount, customer_phone):
-        return {
-            "virtual_account_id": "va_test_1",
-            "account_number": "1234567890",
-            "ifsc": "CF0000001",
-            "iban": "GB00TEST",
-            "swift_code": "CFSWIFT",
-            "amount": amount,
-        }
-
     monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
     monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
-    monkeypatch.setattr("app.agents.order.create_virtual_account", fake_create_va)
 
     session = {"phone": "+91999", "country": "Kenya"}
     _, session = await run_order_agent("order", session, order_db)
@@ -658,20 +666,28 @@ async def test_order_payment_bank_transfer_after_confirm(order_db, monkeypatch):
     _, session = await run_order_agent("checkout", session, order_db)
     _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
-    assert session["order_state"] == SELECT_PAYMENT
+    sent_messages.clear()
 
     reply, session = await run_order_agent(PAY_BANK_BUTTON, session, order_db)
-    assert "bank transfer" in reply.lower()
-    assert session.get("payment_method_chosen") == "bank_transfer"
+    assert "wire transfer" in reply.lower()
+    assert session.get("payment_method_chosen") == "wire_transfer"
     assert "order_state" not in session
-    assert any("Payment Instructions" in msg for msg in sent_messages)
-    assert order_db.query(Order).first().virtual_account_id == "va_test_1"
+    assert any(
+        "123456789012" in msg and "EXAMPLGB" in msg and "New Life Medicare Exports" in msg
+        for msg in sent_messages
+    )
 
 
 @pytest.mark.asyncio
-async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
+async def test_order_payment_export_wire_details_after_confirm(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    _set_export_wire_env(
+        monkeypatch,
+        STATIC_WIRE_ACCOUNT_NUMBER="9876543210",
+        STATIC_WIRE_SWIFT_CODE="EXPORTGB",
+        STATIC_WIRE_IFSC="SBIN0004321",
+    )
 
     sent_messages: list[str] = []
 
@@ -683,28 +699,22 @@ async def test_order_payment_card_link_after_confirm(order_db, monkeypatch):
         sent_messages.append(body)
         return True
 
-    async def fake_create_link(order_ref, amount, customer_phone, customer_name=""):
-        return {
-            "link_url": "https://payments-test.cashfree.com/links/test123",
-            "link_id": order_ref,
-            "amount": amount,
-        }
-
     monkeypatch.setattr("app.agents.order.send_message", fake_send_message)
     monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_send_buttons)
-    monkeypatch.setattr("app.agents.order.create_card_checkout", fake_create_link)
 
     session = {"phone": "+91999", "country": "Kenya"}
     _, session = await run_order_agent("order", session, order_db)
     _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     _, session = await run_order_agent("checkout", session, order_db)
     _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
-    _, session = await run_order_agent("confirm", session, order_db)
+    reply, session = await run_order_agent("confirm", session, order_db)
 
-    reply, session = await run_order_agent(PAY_CARD_BUTTON, session, order_db)
-    assert "payment link" in reply.lower()
-    assert session.get("payment_method_chosen") == "card"
-    assert any("payments-test.cashfree.com" in msg for msg in sent_messages)
+    assert "wire transfer" in reply.lower()
+    assert session.get("payment_method_chosen") == "wire_transfer"
+    assert any(
+        "9876543210" in msg and "EXPORTGB" in msg and "SBIN0004321" in msg
+        for msg in sent_messages
+    )
 
 
 @pytest.mark.asyncio
