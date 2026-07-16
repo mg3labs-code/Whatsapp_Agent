@@ -43,6 +43,13 @@ def test_pre_guardrails_blocks_sanctioned_session_country():
     assert result.refusal_message == REFUSAL_SANCTIONED_COUNTRY
 
 
+def test_pre_guardrails_blocks_disqualified_flag():
+    result = check_pre_guardrails("pricing", {"disqualified": True, "country": "United Kingdom"})
+    assert result.blocked is True
+    assert result.reason == "disqualified_lead"
+    assert result.refusal_message == REFUSAL_SANCTIONED_COUNTRY
+
+
 def test_pre_guardrails_blocks_sanctioned_country_case_insensitive():
     result = check_pre_guardrails("quote please", {"country": "PAKISTAN"})
     assert result.blocked is True
@@ -203,9 +210,10 @@ async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
     monkeypatch.setattr(graph_mod, "send_message", capture_send)
     monkeypatch.setattr("app.messages.welcome.send_message", capture_send)
     monkeypatch.setattr(
-        "app.messages.welcome.send_interactive_list",
+        "app.messages.conversation_ui.send_main_menu_list",
         AsyncMock(return_value=True),
     )
+    monkeypatch.setattr(graph_mod, "send_main_menu_list", AsyncMock(return_value=True))
     monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
     monkeypatch.setattr(graph_mod, "classify_intent", fail_classify)
     monkeypatch.setattr(graph_mod, "log_guardrail", AsyncMock())

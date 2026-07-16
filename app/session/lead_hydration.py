@@ -13,6 +13,16 @@ from app.utils.security import user_ref
 
 logger = logging.getLogger(__name__)
 
+# In-progress qualification UI flags — safe to drop once lead is terminal.
+QUAL_UI_KEYS: tuple[str, ...] = (
+    "qual_state",
+    "biz_type_picker_sent",
+    "country_picker_sent",
+    "awaiting_custom_country",
+)
+
+LIFECYCLE_DISQUALIFIED = "disqualified"
+
 
 def phone_lookup_variants(phone: str) -> list[str]:
     """Canonical and legacy (+prefix) forms for leads.phone lookup."""
@@ -21,6 +31,58 @@ def phone_lookup_variants(phone: str) -> list[str]:
         return []
     variants = [normalized, f"+{normalized}"]
     return list(dict.fromkeys(variants))
+
+
+def is_session_disqualified(session: dict | None) -> bool:
+    session = session or {}
+    return bool(session.get("disqualified")) or (
+        session.get("lifecycle_stage") == LIFECYCLE_DISQUALIFIED
+    )
+
+
+def clear_stale_qualification_flags(session: dict) -> dict:
+    """Drop mid-qualification prompts once the buyer is permanently terminal.
+
+    Applies when ``lead_qualified`` or ``disqualified`` so stale ``qual_state``
+    cannot reopen country/business-type collection.
+    """
+    session = dict(session or {})
+    if not session.get("lead_qualified") and not is_session_disqualified(session):
+        return session
+    for key in QUAL_UI_KEYS:
+        session.pop(key, None)
+    if session.get("lead_qualified"):
+        session.pop("pending_intent", None)
+    return session
+
+
+def mark_session_qualified(session: dict) -> dict:
+    """Mark buyer qualified and clear mid-qual UI state.
+
+    Keeps ``pending_intent`` so qualification completion can hand off to
+    pricing/order in the same turn.
+    """
+    session = dict(session or {})
+    session["lead_qualified"] = True
+    session.pop("disqualified", None)
+    for key in QUAL_UI_KEYS:
+        session.pop(key, None)
+    return session
+
+
+def mark_session_disqualified(session: dict, country: str | None = None) -> dict:
+    """Permanently lock this phone out of the automated channel."""
+    session = dict(session or {})
+    session["disqualified"] = True
+    session["lead_qualified"] = False
+    session["lifecycle_stage"] = LIFECYCLE_DISQUALIFIED
+    session["manual_review_only"] = True
+    if country:
+        session["country"] = country
+    for key in QUAL_UI_KEYS:
+        session.pop(key, None)
+    session.pop("pending_intent", None)
+    return session
 
 
 def lookup_lead_by_phone(db: Session, phone: str) -> Lead | None:
@@ -40,8 +102,11 @@ def lookup_lead_by_phone(db: Session, phone: str) -> Lead | None:
 def hydrate_session_from_lead(session: dict, lead: Lead) -> dict:
     """Merge persisted lead fields into the live Redis session."""
     session = dict(session or {})
-    session["lead_qualified"] = True
-    session.pop("qual_state", None)
+    stage = (lead.lifecycle_stage or "").strip().lower()
+    if stage == LIFECYCLE_DISQUALIFIED:
+        session = mark_session_disqualified(session, lead.country)
+    else:
+        session = mark_session_qualified(session)
 
     if lead.company:
         session["company"] = lead.company
@@ -77,10 +142,10 @@ def hydrate_session_from_lead(session: dict, lead: Lead) -> dict:
 
 
 def hydrate_session_from_db(phone: str, session: dict, db: Session) -> dict:
-    """If buyer is already in leads table, mark session qualified without re-qual."""
+    """If buyer is already in leads table, restore qualified or disqualified state."""
     session = dict(session or {})
-    if session.get("lead_qualified"):
-        return session
+    if session.get("lead_qualified") or is_session_disqualified(session):
+        return clear_stale_qualification_flags(session)
 
     lead = lookup_lead_by_phone(db, phone)
     if not lead:
@@ -88,8 +153,9 @@ def hydrate_session_from_db(phone: str, session: dict, db: Session) -> dict:
 
     hydrated = hydrate_session_from_lead(session, lead)
     logger.info(
-        "Session hydrated from leads table user_ref=%s lead_id=%s",
+        "Session hydrated from leads table user_ref=%s lead_id=%s lifecycle=%s",
         user_ref(phone),
         lead.id,
+        lead.lifecycle_stage,
     )
     return hydrated

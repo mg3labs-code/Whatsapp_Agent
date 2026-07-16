@@ -275,7 +275,10 @@ async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db
     phone = "+919876543210"
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
-    await session_manager.save_session(phone, {"lead_qualified": True})
+    await session_manager.save_session(
+        phone,
+        {"lead_qualified": True, "country": "Kenya", "business_type": "pharmacy"},
+    )
 
     sent: list[tuple[str, str]] = []
 
@@ -296,17 +299,27 @@ async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db
 
     monkeypatch.setattr(graph_mod, "_get_db_generator", db_factory)
 
+    # Match current cart + one-shot checkout (name, city, phone).
+    monkeypatch.setenv("STATIC_WIRE_ACCOUNT_NAME", "New Life Medicare Exports")
+    monkeypatch.setenv("STATIC_WIRE_ACCOUNT_NUMBER", "123456789012")
+    monkeypatch.setenv("STATIC_WIRE_BANK_NAME", "Example Bank Ltd")
+    monkeypatch.setenv("STATIC_WIRE_BRANCH", "Mumbai Export Branch")
+    monkeypatch.setenv("STATIC_WIRE_SWIFT_CODE", "EXAMPLGB")
+    monkeypatch.setenv("STATIC_WIRE_IFSC", "HDFC0001234")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(graph_mod, "send_interactive_buttons", AsyncMock(return_value=True))
+    monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
+    monkeypatch.setattr(graph_mod, "send_main_menu_list", AsyncMock(return_value=True))
+
     turns = [
         ("m1", "I want to order"),
-        ("m2", "Metformin 500mg"),
-        ("m3", "0"),
-        ("m4", "2000"),
-        ("m5", "done"),
-        ("m6", "Kenya"),
-        ("m7", "Nairobi"),
-        ("m8", "Priya Sharma, MedEx"),
-        ("m9", "T/T advance"),
-        ("m10", "confirm"),
+        ("m2", "Metformin 500mg - 2000"),
+        ("m3", "checkout"),
+        ("m4", "Priya Sharma, Nairobi, +254700000000"),
+        ("m5", "confirm"),
     ]
 
     for mid, text in turns:
@@ -323,11 +336,16 @@ async def test_scenario_b_multi_turn_order_via_graph(monkeypatch, graph_order_db
             }
         )
 
-    assert len(sent) == 10
-    final_reply = sent[-1][1].lower()
-    assert "order confirmed" in final_reply
+    assert len(sent) >= 5
+    final_reply = "\n".join(text for _, text in sent).lower()
+    assert "confirmed" in final_reply
     assert "ord-" in final_reply
 
     session = await session_manager.get_session(phone)
     assert "order_state" not in session
+    assert session.get("lead_qualified") is True
+    assert session.get("qual_state") is None
     assert graph_order_db.query(Order).count() == 1
+    from app.db.models import Lead
+
+    assert graph_order_db.query(Lead).count() == 1

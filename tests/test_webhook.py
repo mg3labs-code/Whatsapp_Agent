@@ -210,6 +210,12 @@ def _patch_redis_and_orchestrator(monkeypatch) -> AsyncMock:
         "message_trace_context",
         lambda **_kwargs: nullcontext(),
     )
+    # Unit tests focus on routing/dedup, not HMAC — accept unsigned test payloads.
+    monkeypatch.setattr(
+        webhook_router_module,
+        "_verify_meta_signature",
+        lambda _raw, _sig: True,
+    )
 
     mock_invoke = AsyncMock(return_value={})
     monkeypatch.setattr(orchestrator_graph.compiled_graph, "ainvoke", mock_invoke)
@@ -286,3 +292,20 @@ def test_dedup_drops_duplicate(monkeypatch):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert mock_invoke.call_count == 1
+
+
+def test_post_webhook_rejects_unsigned_payload(monkeypatch):
+    """SECURITY: missing/invalid Meta signature → 200 but no orchestrator work."""
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(webhook_router_module, "_get_redis_client", lambda: fake_redis)
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "test-app-secret")
+
+    mock_invoke = AsyncMock(return_value={})
+    monkeypatch.setattr(orchestrator_graph.compiled_graph, "ainvoke", mock_invoke)
+
+    client = TestClient(_build_test_app())
+    response = client.post("/webhook", json=META_TEXT_MESSAGE_PAYLOAD)
+
+    assert response.status_code == 200
+    assert mock_invoke.call_count == 0

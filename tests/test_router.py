@@ -51,6 +51,21 @@ async def test_menu_button_pricing_qualified_without_llm():
 
 
 @pytest.mark.asyncio
+async def test_qualified_never_routes_to_qualify_from_llm(monkeypatch):
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("qualify", 0.9)),
+    )
+    intent, session = await router_mod.classify_intent(
+        "hello again",
+        {"lead_qualified": True},
+    )
+    assert intent == "faq"
+    assert session.get("lead_qualified") is True
+
+
+@pytest.mark.asyncio
 async def test_unqualified_order_routes_to_qualify(monkeypatch):
     monkeypatch.setattr(
         router_mod,
@@ -213,6 +228,70 @@ async def test_graph_router_node_continues_qual_state(monkeypatch):
     )
     assert out["intent"] == "qualify"
     graph_mod.classify_intent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_graph_router_skips_stale_qual_when_already_qualified(monkeypatch):
+    """Bug fix: qualified buyers with leftover qual_state must reach pricing/order/FAQ."""
+    mock_classify = AsyncMock(
+        return_value=("pricing", {"lead_qualified": True, "pending_menu_ack": "pricing"})
+    )
+    monkeypatch.setattr(graph_mod, "classify_intent", mock_classify)
+
+    out = await graph_mod.router_node(
+        {
+            "phone": "1",
+            "message": "pricing",
+            "message_id": "m1",
+            "session": {
+                "lead_qualified": True,
+                "qual_state": "COLLECT_BIZ_TYPE",
+                "biz_type_picker_sent": True,
+                "pending_intent": "pricing",
+            },
+            "intent": None,
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": None,
+        }
+    )
+    assert out["intent"] == "pricing"
+    assert out["session"].get("qual_state") is None
+    assert out["session"].get("pending_intent") is None
+    mock_classify.assert_awaited_once()
+    # Stale flags cleared before classify_intent sees the session.
+    called_session = mock_classify.await_args.args[1]
+    assert called_session.get("lead_qualified") is True
+    assert called_session.get("qual_state") is None
+
+
+@pytest.mark.asyncio
+async def test_menu_refresh_clears_stale_qual_for_qualified_user(monkeypatch):
+    monkeypatch.setattr(graph_mod, "send_main_menu_list", AsyncMock(return_value=True))
+
+    out = await graph_mod.menu_refresh_node(
+        {
+            "phone": "919999000111",
+            "message": "main_menu",
+            "message_id": "m1",
+            "session": {
+                "lead_qualified": True,
+                "qual_state": "COLLECT_BIZ_TYPE",
+                "order_state": "CART_MENU",
+                "order_cart": [{"sku": "PROD-1"}],
+            },
+            "intent": None,
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": None,
+        }
+    )
+    session = out["session"]
+    assert session.get("lead_qualified") is True
+    assert session.get("qual_state") is None
+    assert session.get("order_state") is None
+    assert session.get("order_cart") is None
+    graph_mod.send_main_menu_list.assert_awaited_once_with("919999000111")
 
 
 @pytest.mark.asyncio

@@ -139,6 +139,13 @@ def check_pre_guardrails(message: str, session: dict) -> GuardrailResult:
     """Run before any agent/LLM call."""
     session = session or {}
 
+    if session.get("disqualified") or session.get("lifecycle_stage") == "disqualified":
+        return GuardrailResult(
+            blocked=True,
+            reason="disqualified_lead",
+            refusal_message=REFUSAL_SANCTIONED_COUNTRY,
+        )
+
     country = session.get("country")
     if country and is_shipment_excluded_country(country):
         return GuardrailResult(

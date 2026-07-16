@@ -391,6 +391,7 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert session.get("payment_method_chosen") == "wire_transfer"
     assert session.get("last_order_total", 0) > 0
     assert session.get("lead_qualified") is True
+    assert session.get("qual_state") is None
     assert session.get("greeted") is True
     assert session.get("last_order_ref", "").startswith("ORD-")
 
@@ -401,11 +402,19 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert orders[0].country == "Kenya"
     assert orders[0].city == "Nairobi"
 
+    # Lifetime memory: order path also writes the leads table.
+    leads = order_db.query(Lead).all()
+    assert len(leads) == 1
+    assert leads[0].phone == "919876543210"
+    assert leads[0].country == "Kenya"
+    assert leads[0].lifecycle_stage == "qualified"
+
 
 @pytest.mark.asyncio
 async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    _set_export_wire_env(monkeypatch)
     db = order_db
     db.add(
         Product(
@@ -439,12 +448,14 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
     assert session["order_state"] == CONFIRM_ORDER
 
     reply, session = await run_order_agent("yes", session, db)
-    assert "order confirmed" in reply.lower()
+    assert "confirmed" in reply.lower()
+    assert "ord-" in reply.lower()
     assert session.get("last_order_ref", "").startswith("ORD-")
     orders = db.query(Order).all()
     assert len(orders) == 2
     bases = {o.order_ref.rsplit("-L", 1)[0] for o in orders}
     assert len(bases) == 1
+    assert db.query(Lead).count() == 1
 
 
 @pytest.mark.asyncio
