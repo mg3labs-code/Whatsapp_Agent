@@ -42,6 +42,11 @@ from app.guardrails.check import (
     log_guardrail,
 )
 from app.db.models import Conversation
+from app.session.lead_hydration import (
+    clear_stale_qualification_flags,
+    hydrate_session_from_db,
+    is_session_disqualified,
+)
 from app.integrations.whatsapp import (
     send_interactive_buttons,
     send_message,
@@ -62,7 +67,6 @@ from app.messages.conversation_ui import (
     should_send_navigation_footer,
 )
 from app.messages.onboarding import SESSION_SKIP_WELCOME_COMPOSE
-from app.session.lead_hydration import hydrate_session_from_db
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
 
@@ -174,13 +178,16 @@ async def load_session_node(state: MessageState) -> dict:
 
     phone = normalize_phone(state["phone"])
     session = await get_session(phone)
-    if not session.get("lead_qualified"):
+    # Restore from Postgres only when Redis has no terminal lead state yet.
+    if not session.get("lead_qualified") and not session.get("disqualified"):
         gen = _get_db_generator()
         db = next(gen)
         try:
             session = hydrate_session_from_db(phone, session, db)
         finally:
             gen.close()
+    # Terminal buyers never re-enter mid-qualification UI (stale Redis flags).
+    session = clear_stale_qualification_flags(session)
     session = enrich_session_from_message(session, state.get("message") or "")
     session["phone"] = phone
     return {"session": session, "phone": phone}
@@ -221,6 +228,8 @@ async def menu_refresh_node(state: MessageState) -> dict:
     session = clear_human_handoff(dict(state.get("session") or {}))
     for key in ORDER_SESSION_KEYS:
         session.pop(key, None)
+    # Escape hatch: qualified users leave any stale mid-qual loop via Main Menu.
+    session = clear_stale_qualification_flags(session)
     await send_main_menu_list(state["phone"])
     session[SESSION_SUPPRESS_NAV_FOOTER] = True
     return {"session": session, "final_reply": None}
@@ -233,6 +242,13 @@ async def router_node(state: MessageState) -> dict:
 
     if session.get("human_active") and should_resume_from_human_handoff(message):
         session = clear_human_handoff(session)
+
+    # Permanent qualify-once: never re-trap already-qualified buyers in mid-qual UI.
+    session = clear_stale_qualification_flags(session)
+
+    # Excluded-country lock: never reopen agents (pre_guardrails also blocks).
+    if is_session_disqualified(session):
+        return {"intent": "escalate", "session": session}
 
     if is_main_menu_request(message):
         return {"intent": "menu_refresh", "session": session}
@@ -262,7 +278,8 @@ async def router_node(state: MessageState) -> dict:
             return {"intent": "order", "session": session}
         return {"intent": "order", "session": session}
 
-    if session.get("qual_state"):
+    # Only unfinished NEW buyers continue qualification.
+    if session.get("qual_state") and not session.get("lead_qualified"):
         return {"intent": "qualify", "session": session}
 
     intent, session = await classify_intent(

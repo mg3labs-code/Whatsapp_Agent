@@ -49,7 +49,7 @@ async def test_send_greeting_menu_sets_flags(monkeypatch):
         return True
 
     monkeypatch.setattr("app.messages.welcome.send_message", capture_text)
-    monkeypatch.setattr("app.messages.conversation_ui.send_main_menu_list", capture_menu)
+    monkeypatch.setattr("app.messages.welcome.send_main_menu_list", capture_menu)
 
     session, ok = await send_greeting_menu("+91999", {})
     assert ok is True
@@ -180,7 +180,7 @@ async def test_send_reply_node_prepends_disclosure_once(monkeypatch):
     assert sent[0].startswith("Hi! 👋 I'm the AI assistant for *New Life Medicare*")
     assert "country" in sent[0].lower()
     assert saved[0].get("phone") == "91999"
-    assert sent_buttons == ["+91999"]
+    assert sent_buttons == ["91999"]
 
 
 @pytest.mark.asyncio

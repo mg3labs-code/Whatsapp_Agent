@@ -79,6 +79,7 @@ class ShippingRate(Base):
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (UniqueConstraint("phone", name="uq_leads_phone"),)
 
     id = Column(Integer, primary_key=True)
     phone = Column(String, nullable=False)

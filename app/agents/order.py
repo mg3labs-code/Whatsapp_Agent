@@ -15,7 +15,8 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.agents.pricing import get_product_by_name
-from app.session.lead_hydration import phone_lookup_variants
+from app.session.lead_hydration import mark_session_qualified, phone_lookup_variants
+from app.session.lead_persistence import upsert_lead_from_session
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
     is_shipment_excluded_country,
@@ -1102,14 +1103,30 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
         }
     )
 
+    # Capture identity for permanent lead memory before order session keys are cleared.
+    if not session.get("country") and session.get("order_country"):
+        session["country"] = session["order_country"]
+    if not session.get("lifecycle_stage"):
+        session["lifecycle_stage"] = "qualified"
+
     _clear_order_session(session)
     session.pop("cart", None)
     session.pop("pending_product", None)
-    session["lead_qualified"] = True
+    session = mark_session_qualified(session)
     session["greeted"] = True
     session["last_order_ref"] = order_ref
     session["last_order_total"] = order_total
     session["last_order_contact"] = contact
+
+    # Lifetime qualify-once: buyers who qualify via order are remembered in Postgres.
+    try:
+        upsert_lead_from_session(session, db)
+    except Exception:
+        logger.exception(
+            "Lead upsert after order failed order_ref=%s (order still committed)",
+            order_ref,
+        )
+
     return await _handle_bank_transfer(session, db, order_ref, order_total, phone)
 
 

@@ -19,7 +19,7 @@ from app.agents.order import (
     run_order_agent,
 )
 from app.agents.qualification import run_qualification_agent
-from app.db.models import Base, Product
+from app.db.models import Base, Lead, Product
 from app.messages.onboarding import (
     checkout_prompt,
     looks_like_bulk_order,
@@ -157,6 +157,71 @@ async def test_qualification_country_button_sets_country(order_db):
     assert session["qual_state"] == "COLLECT_BIZ_TYPE"
     assert session.get("biz_type_picker_sent") is True
     assert "business type" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_freezes_first_allowed_country_on_list_retap(order_db):
+    """Old WhatsApp country list re-tap must not overwrite the first allowed country."""
+    session = {
+        "phone": "+919876543210",
+        "qual_state": "COLLECT_COUNTRY",
+        "country_picker_sent": True,
+    }
+    with patch("app.agents.qualification.send_country_picker", new=AsyncMock(side_effect=lambda _p, s: s)):
+        with patch("app.agents.qualification._send_business_type_picker", new=AsyncMock()):
+            _, session, _ = await run_qualification_agent("country_uk", session, order_db)
+            assert session["country"] == "United Kingdom"
+            assert session["qual_state"] == "COLLECT_BIZ_TYPE"
+
+            reply, session, intent = await run_qualification_agent(
+                "country_us", session, order_db
+            )
+
+    assert intent == "continue_qual"
+    assert session["country"] == "United Kingdom"
+    assert session["qual_state"] == "COLLECT_BIZ_TYPE"
+    assert "already set" in reply.lower()
+    assert "united kingdom" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_excluded_country_hard_locks_phone(order_db):
+    """Restricted country permanently locks the phone; later UK tap cannot continue."""
+    session = {
+        "phone": "+919876543299",
+        "qual_state": "COLLECT_COUNTRY",
+        "country_picker_sent": True,
+        "awaiting_custom_country": True,
+    }
+    with patch("app.agents.qualification.send_country_picker", new=AsyncMock(side_effect=lambda _p, s: s)):
+        with patch(
+            "app.agents.qualification.send_escalation_alert",
+            new=AsyncMock(),
+        ):
+            reply, session, intent = await run_qualification_agent(
+                "Iran", session, order_db
+            )
+
+    assert intent == "escalate"
+    assert session.get("disqualified") is True
+    assert session.get("lead_qualified") is False
+    assert session["country"] == "Iran"
+    assert session.get("qual_state") is None
+    assert "unable" in reply.lower() or "compliance" in reply.lower()
+
+    leads = order_db.query(Lead).filter(Lead.phone == "919876543299").all()
+    assert len(leads) == 1
+    assert leads[0].lifecycle_stage == "disqualified"
+    assert leads[0].country == "Iran"
+
+    # Re-tap of an allowed country on the old list must stay locked.
+    reply2, session2, intent2 = await run_qualification_agent(
+        "country_uk", session, order_db
+    )
+    assert intent2 == "escalate"
+    assert session2.get("disqualified") is True
+    assert session2.get("country") == "Iran"
+    assert "united kingdom" not in (session2.get("country") or "").lower()
 
 
 @pytest.mark.asyncio

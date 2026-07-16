@@ -20,6 +20,11 @@ from app.business.countries import (
 )
 from app.session.lead_persistence import upsert_lead_from_session
 from app.session.manager import normalize_phone
+from app.session.lead_hydration import (
+    is_session_disqualified,
+    mark_session_disqualified,
+    mark_session_qualified,
+)
 from app.utils.security import user_ref
 from app.integrations.alerts import send_escalation_alert
 from app.integrations.whatsapp import send_interactive_list
@@ -164,6 +169,24 @@ def _extract_business_type(text: str) -> str:
     return "other"
 
 
+def _is_country_list_selection(text: str) -> bool:
+    """True when message is a re-tap of the WhatsApp country list (or resolved id)."""
+    key = (text or "").strip().lower()
+    if key in COUNTRY_BUTTON_IDS:
+        return True
+    resolved, follow_up = resolve_country_button(key)
+    return bool(resolved or follow_up)
+
+
+def _frozen_country_prompt(session: dict) -> str:
+    country = session.get("country") or "your country"
+    return (
+        f"Your country is already set to *{country}*.\n\n"
+        "Please select your business type from the list 👆 "
+        "or type it (e.g. *clinic*, *doctor*, *distributor*)."
+    )
+
+
 async def _send_business_type_picker(phone: str) -> None:
     await send_interactive_list(
         phone,
@@ -188,12 +211,16 @@ async def run_qualification_agent(
     session = dict(session or {})
     session = enrich_session_from_message(session, message)
     text = (message or "").strip()
-    state = _normalize_qual_state(session.get("qual_state"))
-    session["qual_state"] = state
     phone = session.get("phone") or ""
 
+    if is_session_disqualified(session):
+        return SHIPMENT_EXCLUDED_REFUSAL, session, "escalate"
+
+    state = _normalize_qual_state(session.get("qual_state"))
+    session["qual_state"] = state
+
     if state == COLLECT_COUNTRY:
-        return await _handle_collect_country(text, session, phone)
+        return await _handle_collect_country(text, session, phone, db)
     if state == COLLECT_BIZ_TYPE:
         return await _handle_collect_biz_type(text, session, db)
     if state == QUAL_COMPLETE:
@@ -218,8 +245,17 @@ def _is_generic_reply(text: str) -> bool:
 
 
 async def _handle_collect_country(
-    text: str, session: dict, phone: str
+    text: str, session: dict, phone: str, db: Session
 ) -> tuple[str, dict, str]:
+    # First allowed country already frozen — ignore old list re-taps.
+    existing = (session.get("country") or "").strip()
+    if existing and not is_shipment_excluded_country(existing):
+        session["qual_state"] = COLLECT_BIZ_TYPE
+        if phone and not session.get(SESSION_BIZ_TYPE_PICKER_SENT):
+            await _send_business_type_picker(phone)
+            session[SESSION_BIZ_TYPE_PICKER_SENT] = True
+        return _frozen_country_prompt(session), session, CONTINUE_QUAL
+
     session = await send_country_picker(phone, session)
 
     if session.get(SESSION_AWAITING_CUSTOM_COUNTRY):
@@ -229,7 +265,7 @@ async def _handle_collect_country(
         if not country or not _is_plausible_country(country):
             return custom_country_prompt(), session, CONTINUE_QUAL
         session.pop(SESSION_AWAITING_CUSTOM_COUNTRY, None)
-        return await _finalize_country(country, session, phone)
+        return await _finalize_country(country, session, phone, db)
 
     if not text or _is_generic_reply(text) or _is_filler_reply(text):
         return country_prompt(reminded=bool(session.get("country_picker_sent"))), session, CONTINUE_QUAL
@@ -241,20 +277,39 @@ async def _handle_collect_country(
             session[SESSION_AWAITING_CUSTOM_COUNTRY] = True
             return follow_up, session, CONTINUE_QUAL
         if resolved:
-            return await _finalize_country(resolved, session, phone)
+            return await _finalize_country(resolved, session, phone, db)
 
     country = _extract_country(text)
     if not country or not _is_plausible_country(country):
         return country_prompt(reminded=True), session, CONTINUE_QUAL
 
-    return await _finalize_country(country, session, phone)
+    return await _finalize_country(country, session, phone, db)
 
 
 async def _finalize_country(
-    country: str, session: dict, phone: str = ""
+    country: str, session: dict, phone: str, db: Session
 ) -> tuple[str, dict, str]:
+    # Freeze: first successful allowed country wins for this qualification.
+    existing = (session.get("country") or "").strip()
+    if existing and not is_shipment_excluded_country(existing):
+        session["qual_state"] = COLLECT_BIZ_TYPE
+        if phone and not session.get(SESSION_BIZ_TYPE_PICKER_SENT):
+            await _send_business_type_picker(phone)
+            session[SESSION_BIZ_TYPE_PICKER_SENT] = True
+        return _frozen_country_prompt(session), session, CONTINUE_QUAL
+
     if is_shipment_excluded_country(country):
-        return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_QUAL
+        session = mark_session_disqualified(session, country)
+        session["phone"] = normalize_phone(session.get("phone") or phone)
+        try:
+            upsert_lead_from_session(session, db)
+        except Exception:
+            logger.exception(
+                "Lead upsert after excluded country failed user_ref=%s",
+                user_ref(session.get("phone") or phone),
+            )
+        session = await _apply_escalation_handoff(session, "excluded_country")
+        return SHIPMENT_EXCLUDED_REFUSAL, session, "escalate"
 
     session["country"] = country
     session["qual_state"] = COLLECT_BIZ_TYPE
@@ -280,6 +335,10 @@ async def _handle_collect_biz_type(
         await _send_business_type_picker(phone)
         session[SESSION_BIZ_TYPE_PICKER_SENT] = True
 
+    # Ignore re-taps of the first country list while collecting business type.
+    if _is_country_list_selection(text):
+        return _frozen_country_prompt(session), session, CONTINUE_QUAL
+
     if not text.strip() or _is_filler_reply(text) or _is_generic_reply(text):
         return (
             "Select your business type from the list above 👆 or type it "
@@ -289,19 +348,27 @@ async def _handle_collect_biz_type(
         )
 
     parsed = resolve_business_type_selection(text)
-    if not parsed:
-        return (
-            "I didn't catch that. Tap *Select Type* above or type "
-            "*clinic*, *doctor*, *distributor*, or *independent buyer*.",
-            session,
-            CONTINUE_QUAL,
-        )
+    if parsed:
+        session["business_type"] = _extract_business_type(parsed)
+        session["buyer_type"] = map_business_type_to_buyer_type(session["business_type"], parsed)
+        session.pop(SESSION_BIZ_TYPE_PICKER_SENT, None)
+        session["qual_state"] = QUAL_COMPLETE
+        return await _handle_qual_complete(session, db, parsed)
 
-    session["business_type"] = _extract_business_type(parsed)
-    session["buyer_type"] = map_business_type_to_buyer_type(session["business_type"], parsed)
-    session.pop(SESSION_BIZ_TYPE_PICKER_SENT, None)
-    session["qual_state"] = QUAL_COMPLETE
-    return await _handle_qual_complete(session, db, parsed)
+    # Typed known-market / excluded names after freeze — keep first country.
+    # Only after biz-type parse fails, so short junk like "bh" is not treated as Bhutan.
+    typed_country = _extract_country(text)
+    if session.get("country") and typed_country and len(typed_country.strip()) >= 4:
+        tier = classify_country(typed_country)
+        if tier in {"priority", "secondary", "excluded"}:
+            return _frozen_country_prompt(session), session, CONTINUE_QUAL
+
+    return (
+        "I didn't catch that. Tap *Select Type* above or type "
+        "*clinic*, *doctor*, *distributor*, or *independent buyer*.",
+        session,
+        CONTINUE_QUAL,
+    )
 
 
 async def _apply_escalation_handoff(session: dict, reason: str) -> dict:
@@ -322,10 +389,9 @@ async def _handle_qual_complete(
     result = score_lead(session, message)
     session["lead_score"] = result.score
     session["lead_category"] = result.category
-    session["lead_qualified"] = True
     session["manual_review_only"] = result.manual_review_only
     session["lifecycle_stage"] = "qualified"
-    session.pop("qual_state", None)
+    session = mark_session_qualified(session)
     session["qual_completed_at"] = datetime.now(timezone.utc).isoformat()
 
     if not session.get("buyer_type"):
@@ -338,6 +404,14 @@ async def _handle_qual_complete(
     upsert_lead_from_session(session, db)
 
     if result.disqualified:
+        session = mark_session_disqualified(session, session.get("country"))
+        try:
+            upsert_lead_from_session(session, db)
+        except Exception:
+            logger.exception(
+                "Lead upsert after score disqualify failed user_ref=%s",
+                user_ref(phone),
+            )
         reply = (
             "Thank you for your interest. We're unable to process this request through "
             "our automated channel due to export compliance requirements. "

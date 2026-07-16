@@ -7,7 +7,8 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.db.models import Lead
@@ -18,14 +19,9 @@ from app.utils.tracing import hash_user_id
 logger = logging.getLogger(__name__)
 
 
-def upsert_lead_from_session(session: dict, db: Session) -> Lead:
-    """Insert or update lead row using canonical phone (digits only, no '+')."""
-    phone = normalize_phone(session.get("phone") or "")
-    if not phone:
-        raise ValueError("phone required to upsert lead")
-
+def _lead_fields_from_session(session: dict) -> dict:
     order_val = session.get("order_value_usd")
-    fields = {
+    return {
         "company": session.get("company"),
         "country": session.get("country"),
         "business_type": session.get("business_type"),
@@ -39,17 +35,25 @@ def upsert_lead_from_session(session: dict, db: Session) -> Lead:
         "manual_review_only": bool(session.get("manual_review_only")),
     }
 
-    insert_stmt = insert(Lead).values(phone=phone, **fields)
-    upsert_stmt = (
-        insert_stmt.on_conflict_do_update(
-            index_elements=["phone"],
-            set_={
-                **{key: getattr(insert_stmt.excluded, key) for key in fields},
-                "updated_at": datetime.utcnow(),
-            },
-        )
-        .returning(Lead)
-    )
+
+def upsert_lead_from_session(session: dict, db: Session) -> Lead:
+    """Insert or update lead row using canonical phone (digits only, no '+')."""
+    phone = normalize_phone(session.get("phone") or "")
+    if not phone:
+        raise ValueError("phone required to upsert lead")
+
+    fields = _lead_fields_from_session(session)
+    dialect = db.bind.dialect.name if db.bind is not None else "postgresql"
+    insert_fn = sqlite_insert if dialect == "sqlite" else pg_insert
+
+    insert_stmt = insert_fn(Lead).values(phone=phone, **fields)
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=["phone"],
+        set_={
+            **{key: getattr(insert_stmt.excluded, key) for key in fields},
+            "updated_at": datetime.utcnow(),
+        },
+    ).returning(Lead)
 
     try:
         lead = db.execute(upsert_stmt).scalar_one()
