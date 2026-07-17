@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -387,7 +386,7 @@ def start_overdue_scheduler() -> None:
 
     scheduler = AsyncIOScheduler(timezone=timezone.utc)
     scheduler.add_job(
-        lambda: asyncio.create_task(check_overdue_payments()),
+        check_overdue_payments,
         "interval",
         hours=6,
         id="cashfree_overdue_payments",
