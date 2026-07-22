@@ -10,14 +10,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any
 
 import pinecone
 from langfuse import observe
 
+from app.business.countries import (
+    SHIPMENT_EXCLUDED_REFUSAL,
+    canonicalize_country,
+    is_shipment_excluded_country,
+)
+from app.business.shipping import get_shipping_options
+from app.db.database import SessionLocal
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
+
+_DESTINATION_COUNTRY_RE = re.compile(
+    r"\b(?:ship|deliver|send)\s+to\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,3})\b",
+    re.IGNORECASE,
+)
 
 INDEX_NAME = os.getenv("PINECONE_INDEX", "wasa-faq")
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -52,6 +65,19 @@ ERROR_REPLY = (
     "I'm having trouble searching our knowledge base right now. "
     "Let me connect you with our team."
 )
+
+
+def _extract_destination_country(message: str) -> str | None:
+    """Return canonical destination country when message asks ship/deliver/send to one."""
+    match = _DESTINATION_COUNTRY_RE.search(message or "")
+    if not match:
+        return None
+    words = match.group(1).strip().split()
+    for length in range(len(words), 0, -1):
+        canonical = canonicalize_country(" ".join(words[:length]))
+        if canonical:
+            return canonical
+    return None
 
 
 def _normalize_matches(query_response: Any) -> list[dict[str, Any]]:
@@ -89,6 +115,26 @@ async def run_faq_agent(
     chunks above the score threshold, returns a safe escalation-style message
     (no LLM call when there is no qualifying context).
     """
+    destination = _extract_destination_country(message)
+    if destination:
+        if is_shipment_excluded_country(destination):
+            return SHIPMENT_EXCLUDED_REFUSAL
+        db = SessionLocal()
+        try:
+            options = get_shipping_options(destination, total_g=0, db=db)
+        finally:
+            db.close()
+        if options.get("available"):
+            return (
+                f"Yes, we ship to {destination}. Express (EMS): approximately 7-14 days. "
+                "Standard LP: approximately 15-30 days. Reply 'place an order' when ready."
+            )
+        return (
+            f"We do not have standard shipping rates configured for {destination} yet. "
+            "Our team can confirm if shipping is possible — type 'speak to team' and "
+            "someone will follow up."
+        )
+
     openai_key = os.getenv("OPENAI_API_KEY")
     pinecone_key = os.getenv("PINECONE_API_KEY")
     if not openai_key or not pinecone_key:

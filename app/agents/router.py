@@ -194,6 +194,7 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
         # FAQ / already-qualified order+pricing skip qualification forever.
         if not session.get("lead_qualified") and menu_intent in INTENTS_REQUIRING_QUALIFICATION:
             session["pending_intent"] = menu_intent
+            session["pending_query"] = message
             return "qualify", session
         return menu_intent, session
 
@@ -208,10 +209,12 @@ async def classify_intent(message: str, session: dict) -> tuple[str, dict]:
             return "faq", session
         if intent in INTENTS_REQUIRING_QUALIFICATION:
             session["pending_intent"] = intent
+            session["pending_query"] = message
             return "qualify", session
         if intent == "qualify":
             return "qualify", session
         session["pending_intent"] = intent
+        session["pending_query"] = message
         return "qualify", session
 
     # Already qualified — never route back to qualify from free-text intents.
