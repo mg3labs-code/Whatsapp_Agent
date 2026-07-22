@@ -242,7 +242,7 @@ async def test_run_faq_agent_missing_keys(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("PINECONE_API_KEY", raising=False)
 
-    out = await run_faq_agent("Do you ship to Nigeria?")
+    out = await run_faq_agent("What are your payment terms?")
 
     assert out == ERROR_REPLY
 
@@ -483,52 +483,9 @@ def test_resolve_product_from_natural_language_sentence(order_db):
 
 @pytest.mark.asyncio
 async def test_order_agent_llm_add_product_natural_language(order_db, monkeypatch):
-    """Natural language product match still asks quantity first."""
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
-
-    call_count = {"n": 0}
-
-    async def fake_create(*_args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] > 1:
-            response = MagicMock()
-            response.choices = [
-                MagicMock(
-                    message=MagicMock(
-                        content="Added *Metformin 500mg* — *2000* units to your cart.",
-                        tool_calls=None,
-                    )
-                )
-            ]
-            return response
-
-        tool_fn = MagicMock()
-        tool_fn.name = "add_to_cart"
-        tool_fn.arguments = json.dumps(
-            {"product_query": "metformin 500mg", "quantity": 2000}
-        )
-        tool_call = MagicMock()
-        tool_call.id = "call_1"
-        tool_call.function = tool_fn
-
-        response = MagicMock()
-        response.choices = [
-            MagicMock(
-                message=MagicMock(
-                    content=None,
-                    tool_calls=[tool_call],
-                )
-            )
-        ]
-        return response
-
-    mock_client = MagicMock()
-    mock_client.chat.completions.create = fake_create
-    monkeypatch.setattr(
-        "app.agents.order.get_async_openai_client",
-        lambda **_: mock_client,
-    )
+    """Phase A: natural-language product+qty is parsed by rules without LLM."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
 
     session = {"phone": "+1", "order_state": COLLECT_SKU}
     reply, session = await run_order_agent(
@@ -536,9 +493,9 @@ async def test_order_agent_llm_add_product_natural_language(order_db, monkeypatc
         session,
         order_db,
     )
-    assert session["order_state"] == COLLECT_SKU_CONFIRM
-    assert session.get("pending_product")
-    assert "did you mean" in reply.lower()
+    assert session["order_state"] == CART_MENU
+    assert session["order_cart"][0]["quantity"] == 2000
+    assert "metformin" in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -622,16 +579,14 @@ async def test_order_agent_llm_add_with_suggested_product_waits_for_confirmation
         order_db,
     )
     assert session["order_state"] == COLLECT_SKU_CONFIRM
-    assert session.get("order_pending_qty") is None
+    assert session.get("order_pending_qty") == 100
 
     # Confirm on next turn via deterministic fallback path.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     reply, session = await run_order_agent("yes", session, order_db)
-    assert session["order_state"] == COLLECT_QTY
-    reply, session = await run_order_agent("100", session, order_db)
     assert session["order_state"] == CART_MENU
-    assert any("Metformin" in line["product_name"] for line in session["order_cart"])
+    assert session["order_cart"][0]["quantity"] == 100
     assert "your cart" in reply.lower()
 
 

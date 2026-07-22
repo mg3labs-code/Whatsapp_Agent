@@ -278,6 +278,9 @@ async def router_node(state: MessageState) -> dict:
             return {"intent": "order", "session": session}
         return {"intent": "order", "session": session}
 
+    if session.get("awaiting_faq_ship_country"):
+        return {"intent": "faq", "session": session}
+
     # Only unfinished NEW buyers continue qualification.
     if session.get("qual_state") and not session.get("lead_qualified"):
         return {"intent": "qualify", "session": session}
@@ -364,6 +367,9 @@ async def qualify_agent_node(state: MessageState) -> dict:
         result: dict = {"agent_response": reply, "session": updated_session}
         if next_intent != "continue_qual":
             result["intent"] = next_intent
+            handoff_query = updated_session.pop("_handoff_query", None)
+            if handoff_query and next_intent in {"pricing", "faq", "order"}:
+                result["message"] = handoff_query
         return result
     finally:
         gen.close()

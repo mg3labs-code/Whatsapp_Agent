@@ -45,6 +45,7 @@ from app.messages.onboarding import (
     parse_checkout_oneline,
     product_qty_prompt,
 )
+from app.messages.onboarding import _parse_product_qty_segment
 from app.messages.session_flow import (
     CART_ACTION_BUTTONS,
     CONFIRM_ORDER_BUTTONS,
@@ -318,9 +319,106 @@ _ORDER_FILLER = frozenset({
     "hiii",
 })
 
+_OFF_TOPIC_QUESTION_MARKERS = (
+    "ship",
+    "do you",
+    "?",
+    "deliver",
+    "how long",
+    "when will",
+)
+
+_OFF_TOPIC_QUESTION_REPLY = (
+    "That sounds like a question rather than a product — try asking it after typing "
+    "'FAQs' from the main menu, or tell me which product you'd like to order."
+)
+
+_PRODUCT_NOT_FOUND_REPLY = "I couldn't find that product. Please try the product name or SKU."
+
 
 def _is_filler_message(text: str) -> bool:
     return (text or "").strip().lower() in _ORDER_FILLER
+
+
+def _looks_like_off_topic_question(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _OFF_TOPIC_QUESTION_MARKERS)
+
+
+def _split_product_query_and_qty(text: str) -> tuple[str, int | None]:
+    """Extract catalog search text and optional quantity from free-form buyer text."""
+    segment = (text or "").strip()
+    if not segment:
+        return "", None
+
+    product_query, qty = _parse_product_qty_segment(segment)
+    if qty is None:
+        units_match = re.search(
+            r"\b(\d[\d,]*)\s*(?:units?|pcs?|pieces?|strips?|tablets?|tabs?)\s+(?:of\s+)?(.+)\s*$",
+            segment,
+            re.IGNORECASE,
+        )
+        if units_match:
+            try:
+                qty = int(units_match.group(1).replace(",", ""))
+                product_query = units_match.group(2).strip()
+            except ValueError:
+                pass
+
+    product_query = re.sub(
+        r"^(?:i\s+)?(?:need|want|order|buy|get|please)\s+",
+        "",
+        product_query,
+        flags=re.IGNORECASE,
+    ).strip(" .")
+    if not product_query:
+        product_query = segment
+    return product_query, qty
+
+
+async def _apply_product_match_result(
+    session: dict,
+    product: Product,
+    match_mode: str,
+    qty: int | None,
+    phone: str,
+) -> tuple[str, dict]:
+    """Add direct match to cart, confirm fuzzy match, or ask for missing quantity."""
+    if match_mode == "token":
+        _set_pending_product(
+            session,
+            sku=_product_sku(product),
+            product_name=product.product_name,
+            qty=qty,
+        )
+        session["order_state"] = COLLECT_SKU_CONFIRM
+        if phone:
+            await _send_product_confirm_buttons(phone, product.product_name)
+        return (
+            f"Did you mean *{product.product_name}*?\n"
+            "Tap *Yes* to continue or *No* to try another product.",
+            session,
+        )
+
+    if qty is not None and qty >= 1:
+        unit_price = float(product.price_per_strip or 0.0)
+        _add_line_to_cart(
+            session,
+            _product_sku(product),
+            product.product_name,
+            qty,
+            unit_price,
+        )
+        session["order_state"] = CART_MENU
+        if phone:
+            await _send_cart_action_buttons(phone)
+        return (
+            f"Added *{product.product_name}* × {qty} to cart.\n\n"
+            f"{_format_cart_lines(_get_cart(session))}",
+            session,
+        )
+
+    return _prompt_product_quantity(session, product)
 
 
 def _ensure_order_started(session: dict) -> None:
@@ -407,7 +505,7 @@ async def _process_bulk_order(
 
     added: list[str] = []
     failed: list[str] = []
-    pending: list[str] = []
+    pending: list[tuple[str, int | None]] = []
 
     for query, qty in lines:
         product, error, match_mode = _resolve_product_match(query, db)
@@ -418,18 +516,20 @@ async def _process_bulk_order(
             failed.append(query)
             continue
         if qty is None or match_mode == "token":
-            pending.append(query)
+            pending.append((query, qty))
             continue
         unit_price = float(product.price_per_strip or 0.0)
         _add_line_to_cart(session, _product_sku(product), product.product_name, qty, unit_price)
         added.append(f"{product.product_name} × {qty}")
 
     if pending:
-        first_query = pending[0]
-        _set_bulk_queue(session, pending[1:])
-        product, error, _ = _resolve_product_match(first_query, db)
+        first_query, first_qty = pending[0]
+        _set_bulk_queue(session, [query for query, _ in pending[1:]])
+        product, error, match_mode = _resolve_product_match(first_query, db)
         if product is not None and error != "restricted":
-            return _prompt_product_quantity(session, product)
+            return await _apply_product_match_result(
+                session, product, match_mode, first_qty, phone
+            )
 
     if added:
         session["order_state"] = CART_MENU
@@ -1763,11 +1863,15 @@ _EDIT_MARKERS = frozenset({"edit", "cart", "list", "update"})
 
 
 def _extract_positive_int(text: str) -> int | None:
-    match = re.search(r"\d[\d,]*", (text or "").replace(",", ""))
-    if not match:
+    _, parsed_qty = _parse_product_qty_segment(text or "")
+    if parsed_qty is not None and parsed_qty >= 1:
+        return parsed_qty
+
+    matches = re.findall(r"\d[\d,]*", (text or "").replace(",", ""))
+    if not matches:
         return None
     try:
-        return int(match.group().replace(",", ""))
+        return int(matches[-1].replace(",", ""))
     except ValueError:
         return None
 
@@ -1903,7 +2007,10 @@ async def _run_order_rules(
             return BULK_LIST_PROMPT, session
         if looks_like_bulk_order(text):
             return await _process_bulk_order(text, session, db, phone)
-        product, error, match_mode = _resolve_product_match(text, db)
+        product_query, parsed_qty = _split_product_query_and_qty(text)
+        product, error, match_mode = _resolve_product_match(product_query, db)
+        if product is None and product_query != text:
+            product, error, match_mode = _resolve_product_match(text, db)
         if error == "restricted":
             return (
                 "I'm unable to assist with that product through this channel. "
@@ -1911,26 +2018,16 @@ async def _run_order_rules(
                 session,
             )
         if product is None:
-            suggestions = _suggest_products(text, db)
-            reply = "I couldn't find that product. Please try the product name or SKU."
+            if _looks_like_off_topic_question(text):
+                return _OFF_TOPIC_QUESTION_REPLY, session
+            suggestions = _suggest_products(product_query, db)
+            reply = _PRODUCT_NOT_FOUND_REPLY
             if suggestions:
                 reply += "\n\nDid you mean:\n• " + "\n• ".join(suggestions)
             return reply, session
-        if match_mode == "token":
-            _set_pending_product(
-                session,
-                sku=_product_sku(product),
-                product_name=product.product_name,
-            )
-            session["order_state"] = COLLECT_SKU_CONFIRM
-            if phone:
-                await _send_product_confirm_buttons(phone, product.product_name)
-            return (
-                f"Did you mean *{product.product_name}*?\n"
-                "Tap *Yes* to continue or *No* to try another product.",
-                session,
-            )
-        return _prompt_product_quantity(session, product)
+        return await _apply_product_match_result(
+            session, product, match_mode, parsed_qty, phone
+        )
 
     if state == COLLECT_QTY:
         if is_order_reset_request(text):
@@ -2100,6 +2197,7 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
 
     _ensure_order_started(session)
     state = session.get("order_state") or COLLECT_SKU
+    use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}
 
     # Deterministic UX guards regardless of LLM mode.
     if state in {
@@ -2111,6 +2209,16 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
         CONFIRM_ORDER,
     }:
         reply, session = await _run_order_rules(message, session, db)
+        if (
+            state == COLLECT_SKU
+            and use_llm
+            and os.getenv("OPENAI_API_KEY")
+            and reply.startswith(_PRODUCT_NOT_FOUND_REPLY)
+        ):
+            try:
+                reply, session = await _run_order_llm(message, session, db)
+            except Exception:
+                logger.exception("Order LLM fallback failed after product lookup miss")
         return await _finish_order_turn(reply, session)
     if state == CART_MENU and (
         not text
@@ -2120,7 +2228,6 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
         reply, session = await _run_order_rules(message, session, db)
         return await _finish_order_turn(reply, session)
 
-    use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}
     if use_llm and os.getenv("OPENAI_API_KEY"):
         try:
             reply, session = await _run_order_llm(message, session, db)

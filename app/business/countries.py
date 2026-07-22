@@ -298,6 +298,16 @@ def classify_country(country: str | None) -> CountryTier:
     return "other"
 
 
+def canonicalize_country(country: str) -> str | None:
+    """Return uppercase canonical country name when *country* is a known market, else None."""
+    resolved = resolve_country_label(country)
+    if not resolved:
+        return None
+    if classify_country(resolved) in ("missing", "other"):
+        return None
+    return resolved.upper()
+
+
 def is_shipment_excluded_country(country: str | None) -> bool:
     return classify_country(country) == "excluded"
 

@@ -256,6 +256,7 @@ async def _handle_collect_country(
             session[SESSION_BIZ_TYPE_PICKER_SENT] = True
         return _frozen_country_prompt(session), session, CONTINUE_QUAL
 
+    picker_already_sent = bool(session.get("country_picker_sent"))
     session = await send_country_picker(phone, session)
 
     if session.get(SESSION_AWAITING_CUSTOM_COUNTRY):
@@ -268,7 +269,7 @@ async def _handle_collect_country(
         return await _finalize_country(country, session, phone, db)
 
     if not text or _is_generic_reply(text) or _is_filler_reply(text):
-        return country_prompt(reminded=bool(session.get("country_picker_sent"))), session, CONTINUE_QUAL
+        return country_prompt(reminded=picker_already_sent), session, CONTINUE_QUAL
 
     key = text.strip().lower()
     if key in COUNTRY_BUTTON_IDS:
@@ -436,8 +437,11 @@ async def _handle_qual_complete(
         session = await _apply_escalation_handoff(session, "hot_lead")
         return reply, session, "escalate"
 
+    pending_query = session.pop("pending_query", None)
     pending = session.pop("pending_intent", None)
     if pending in _PENDING_INTENT_HANDOFF:
+        if pending_query:
+            session["_handoff_query"] = pending_query
         return _PENDING_INTENT_HANDOFF[pending], session, pending
 
     next_intent = pending or "faq"
@@ -456,6 +460,9 @@ async def _handle_qual_complete(
             await send_main_menu_list(phone)
         except Exception:
             logger.exception("send_main_menu_list failed user_ref=%s", user_ref(phone))
+
+    if pending_query and next_intent in {"pricing", "faq", "order"}:
+        session["_handoff_query"] = pending_query
 
     return reply, session, next_intent
 
