@@ -21,6 +21,24 @@ META_API_VERSION = "v18.0"
 META_GRAPH_BASE = "https://graph.facebook.com"
 REQUEST_TIMEOUT_SECONDS = 10.0
 RATE_LIMIT_RETRY_DELAY_SECONDS = 2
+MAX_WHATSAPP_TEXT_LEN = 4000
+
+
+def _split_whatsapp_text(text: str, max_len: int = MAX_WHATSAPP_TEXT_LEN) -> list[str]:
+    """Split long text at newlines before max_len; hard-split if no newline fits."""
+    chunks: list[str] = []
+    rest = text
+    while len(rest) > max_len:
+        newline_at = rest.rfind("\n", 0, max_len)
+        if newline_at > 0:
+            chunks.append(rest[:newline_at])
+            rest = rest[newline_at + 1 :]
+        else:
+            chunks.append(rest[:max_len])
+            rest = rest[max_len:]
+    if rest:
+        chunks.append(rest)
+    return chunks
 
 
 async def send_message(phone: str, text: str) -> bool:
@@ -33,6 +51,20 @@ async def send_message(phone: str, text: str) -> bool:
     Returns:
         True on 2xx response, False otherwise. Never raises.
     """
+    if len(text) > MAX_WHATSAPP_TEXT_LEN:
+        chunks = _split_whatsapp_text(text)
+        normalized_phone = phone.lstrip("+")
+        logger.warning(
+            "WhatsApp message split into %s chunks (len=%s) user_ref=%s",
+            len(chunks),
+            len(text),
+            user_ref(normalized_phone),
+        )
+        for chunk in chunks:
+            if not await send_message(phone, chunk):
+                return False
+        return True
+
     token = os.getenv("WHATSAPP_TOKEN")
     phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 

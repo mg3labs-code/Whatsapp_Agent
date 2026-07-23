@@ -100,6 +100,7 @@ CART_ACTION_BUTTONS = [
 CONFIRM_ORDER_BUTTONS = [
     {"id": "confirm", "title": "Confirm Order"},
     {"id": "edit", "title": "Edit Cart"},
+    {"id": "edit_details", "title": "Edit Details"},
 ]
 
 PRODUCT_CONFIRM_BUTTONS = [

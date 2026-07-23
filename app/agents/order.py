@@ -585,15 +585,24 @@ def _cart_total(cart: list[dict[str, Any]]) -> float:
 def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
     if not cart:
         return "🛒 *Your cart:*\n_Empty cart._"
-    lines = ["🛒 *Your cart:*"]
+    item_count = len(cart)
+    lines = [f"🛒 *Your cart ({item_count} items):*"]
     total = 0.0
+    max_lines = 12
     for idx, item in enumerate(cart, start=1):
         name = item.get("product_name") or item.get("sku")
         qty = _item_qty(item)
         unit_price = float(item.get("unit_price") or 0.0)
         line_total = qty * unit_price
         total += line_total
-        lines.append(f"{idx}. {name} × {qty} = {_format_money(line_total)}")
+        if idx <= max_lines:
+            lines.append(f"{idx}. {name} × {qty} = {_format_money(line_total)}")
+    if item_count > max_lines:
+        remaining = item_count - max_lines
+        lines.append(
+            f"_…and {remaining} more items (total includes all). "
+            f"Type *checkout* to review the full order before confirming._"
+        )
     lines.append("─────────────────")
     lines.append(f"Total: {_format_money(total)}")
     lines.append("")
@@ -713,11 +722,14 @@ async def _send_product_confirm_buttons(phone: str, product_name: str) -> None:
 
 
 async def _reset_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
+    had_active_order = bool(_get_cart(session) or session.get("order_state"))
     session.pop("last_order_ref", None)
     session.pop("last_order_total", None)
     session.pop("payment_method_chosen", None)
     _clear_order_session(session)
     session["order_state"] = COLLECT_SKU
+    if had_active_order:
+        return f"❌ Order cancelled.\n\n{BULK_LIST_PROMPT}", session
     return BULK_LIST_PROMPT, session
 
 
@@ -1881,6 +1893,21 @@ def _parse_remove_command(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _parse_replace_command(text: str) -> tuple[int, str] | None:
+    """Parse 'replace #1 with metformin' / 'swap line 1 to metformin'."""
+    match = re.search(
+        r"\b(?:replace|swap)\s+(?:line\s+)?#?(\d+)\s+(?:with|to|for)\s+(.+)",
+        (text or "").strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    product_query = match.group(2).strip()
+    if not product_query:
+        return None
+    return int(match.group(1)), product_query
+
+
 def _parse_qty_command(text: str) -> tuple[int, int] | None:
     match = re.search(
         r"\b(?:qty|quantity|units?)\s*#?(\d+)\s+(\d[\d,]*)\b",
@@ -1909,10 +1936,43 @@ def _normalize_menu_action(text: str) -> str | None:
     return None
 
 
-def _try_cart_edit_commands(text: str, session: dict) -> tuple[str, dict] | None:
+def _try_cart_edit_commands(
+    text: str, session: dict, db: Session
+) -> tuple[str, dict] | None:
     cart = _get_cart(session)
     if not cart:
         return None
+    replace = _parse_replace_command(text)
+    if replace is not None:
+        line_no, product_query = replace
+        idx = _find_cart_line(cart, line_no, None)
+        if idx is None:
+            return f"Line {line_no} not found.", session
+        product, error, _ = _resolve_product_match(product_query, db)
+        if error == "restricted":
+            return (
+                "I'm unable to assist with that product through this channel. "
+                "Please contact our medical compliance team directly.",
+                session,
+            )
+        if product is None:
+            return (
+                f"Couldn't find *{product_query}* in the catalog. "
+                "Please check the name and try again.",
+                session,
+            )
+        qty = _item_qty(cart[idx])
+        cart[idx]["sku"] = _product_sku(product)
+        cart[idx]["product_name"] = product.product_name
+        cart[idx]["unit_price"] = float(product.price_per_strip or 0.0)
+        cart[idx]["quantity"] = qty
+        cart[idx]["qty"] = qty
+        _set_cart(session, cart)
+        return (
+            f"Replaced line {line_no} with *{product.product_name}* "
+            f"(qty {qty} kept).\n\n{_format_cart_lines(_get_cart(session))}",
+            session,
+        )
     line_no = _parse_remove_command(text)
     if line_no is not None:
         result = _tool_remove_from_cart({"line_number": line_no}, session)
@@ -1943,7 +2003,7 @@ async def _run_order_rules(
     state = session.get("order_state") or COLLECT_SKU
     session["order_state"] = state
 
-    edit_result = _try_cart_edit_commands(text, session)
+    edit_result = _try_cart_edit_commands(text, session, db)
     if edit_result and state in {CART_MENU, CONFIRM_ORDER}:
         return edit_result
 
@@ -2038,6 +2098,16 @@ async def _run_order_rules(
                 return filler
         qty = _extract_positive_int(text)
         if qty is None or qty < 1:
+            product, error, _ = _resolve_product_match(text, db)
+            if error == "restricted":
+                return (
+                    "I'm unable to assist with that product through this channel. "
+                    "Please contact our medical compliance team directly.",
+                    session,
+                )
+            if product is not None:
+                _clear_pending_product(session)
+                return _prompt_product_quantity(session, product)
             name = session.get("order_product_name") or "your product"
             return (
                 f"Please type a positive quantity (e.g. *350*) or:\n"
@@ -2154,6 +2224,15 @@ async def _run_order_rules(
         return _format_order_review(session), session
 
     if state == CONFIRM_ORDER:
+        lowered = (text or "").strip().lower()
+        if (
+            lowered == "edit_details"
+            or "edit details" in lowered
+            or "fix details" in lowered
+        ):
+            session["order_state"] = COLLECT_CHECKOUT
+            country = _prefill_order_country(session) or ""
+            return checkout_prompt(country), session
         if _normalize_menu_action(text) == "edit":
             session["order_state"] = CART_MENU
             cart_text = _format_cart_lines(_get_cart(session))
@@ -2162,11 +2241,11 @@ async def _run_order_rules(
             return cart_text, session
         if _normalize_menu_action(text) == "confirm":
             return await _commit_order(session, db)
-        lowered = text.lower()
         if session.get("shipping_type") == "EMS" and ("express" in lowered or "ems" in lowered):
             return _format_order_review(session), session
         return (
-            "Tap *Confirm Order* or type *CONFIRM*. Tap *Edit Cart* to change items."
+            "Tap *Confirm Order* or type *CONFIRM*. "
+            "Tap *Edit Cart* to change items, or *Edit Details* to fix name/city/phone."
         ), session
 
     session["order_state"] = COLLECT_SKU
