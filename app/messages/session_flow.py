@@ -34,32 +34,39 @@ RESUME_AFTER_HANDOFF_IDS = frozenset(
     }
 ) | GREETING_IDS
 
-ORDER_RESET_IDS = frozenset(
+ORDER_CANCEL_IDS = frozenset(
     {
-        "new_order",
-        "main_menu",
         "cancel",
-        "clear",
-        "reset",
         "stop",
         "abort",
+    }
+)
+
+ORDER_CANCEL_PHRASES = (
+    "cancel order",
+    "order cancel",
+    "not needed",
+    "don't need",
+    "do not need",
+    "not needed cancel",
+)
+
+ORDER_RESTART_IDS = frozenset(
+    {
+        "new_order",
+        "clear",
+        "reset",
         "start_over",
     }
 )
 
-ORDER_RESET_PHRASES = (
+ORDER_RESTART_PHRASES = (
     "new order",
-    "main menu",
     "start over",
     "start fresh",
-    "not needed",
-    "don't need",
-    "do not need",
-    "cancel order",
     "clear cart",
     "i need new order",
     "need new order",
-    "not needed cancel",
 )
 
 DISCOUNT_KEYWORDS = (
@@ -180,15 +187,39 @@ def clear_human_handoff(session: dict) -> dict:
     return session
 
 
-def is_order_reset_request(message: str) -> bool:
-    key = (message or "").strip().lower()
+def _normalized_message_key(message: str) -> str:
+    return (message or "").strip().lower()
+
+
+def is_order_cancel_request(message: str) -> bool:
+    """Buyer wants to leave the order flow (cart cleared, show main menu)."""
+    key = _normalized_message_key(message)
     if not key:
         return False
-    if key in ORDER_RESET_IDS:
+    if key in ORDER_CANCEL_IDS:
         return True
-    if key.replace(" ", "_") in ORDER_RESET_IDS:
+    if key.replace(" ", "_") in ORDER_CANCEL_IDS:
         return True
-    return any(phrase in key for phrase in ORDER_RESET_PHRASES)
+    return any(phrase in key for phrase in ORDER_CANCEL_PHRASES)
+
+
+def is_order_restart_request(message: str) -> bool:
+    """Buyer wants to clear the cart and start ordering again."""
+    key = _normalized_message_key(message)
+    if not key:
+        return False
+    if is_order_cancel_request(message):
+        return False
+    if key in ORDER_RESTART_IDS:
+        return True
+    if key.replace(" ", "_") in ORDER_RESTART_IDS:
+        return True
+    return any(phrase in key for phrase in ORDER_RESTART_PHRASES)
+
+
+def is_order_reset_request(message: str) -> bool:
+    """Backward-compatible union of cancel + restart."""
+    return is_order_cancel_request(message) or is_order_restart_request(message)
 
 
 def resolve_business_type_button(text: str) -> str | None:

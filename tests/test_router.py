@@ -165,6 +165,23 @@ def test_parse_classifier_response_invalid_intent_defaults_faq():
 
 
 @pytest.mark.asyncio
+async def test_graph_router_node_cancel_routes_to_order():
+    out = await graph_mod.router_node(
+        {
+            "phone": "1",
+            "message": "cancel",
+            "message_id": "m1",
+            "session": {"lead_qualified": True},
+            "intent": None,
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": None,
+        }
+    )
+    assert out == {"intent": "order", "session": {"lead_qualified": True}}
+
+
+@pytest.mark.asyncio
 async def test_graph_router_node_main_menu_routes_to_menu_refresh():
     out = await graph_mod.router_node(
         {

@@ -40,17 +40,20 @@ from app.integrations.whatsapp import send_interactive_buttons, send_message
 from app.messages.onboarding import (
     BULK_LIST_PROMPT,
     checkout_prompt,
+    is_bare_order_qty,
     looks_like_bulk_order,
     parse_bulk_order_lines,
     parse_checkout_oneline,
     product_qty_prompt,
 )
 from app.messages.onboarding import _parse_product_qty_segment
+from app.messages.conversation_ui import SESSION_SHOW_MAIN_MENU, SESSION_SUPPRESS_NAV_FOOTER
 from app.messages.session_flow import (
     CART_ACTION_BUTTONS,
     CONFIRM_ORDER_BUTTONS,
     PRODUCT_CONFIRM_BUTTONS,
-    is_order_reset_request,
+    is_order_cancel_request,
+    is_order_restart_request,
 )
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -376,6 +379,40 @@ def _split_product_query_and_qty(text: str) -> tuple[str, int | None]:
     return product_query, qty
 
 
+def _unit_price_from_db(product: Product) -> float:
+    """Catalog price only — never invent or hardcode zero unless DB says so."""
+    return float(product.price_per_strip or 0.0)
+
+
+def _add_resolved_product_to_cart(session: dict, product: Product, qty: int) -> None:
+    """Add/merge cart line using DB unit price exclusively."""
+    _add_line_to_cart(
+        session,
+        _product_sku(product),
+        product.product_name,
+        qty,
+        _unit_price_from_db(product),
+    )
+
+
+def _lookup_product_by_pending(session: dict, db: Session) -> Product | None:
+    pending_sku = session.get("order_pending_sku")
+    pending_name = session.get("order_pending_product_name")
+    if pending_sku:
+        sku_match = re.fullmatch(r"PROD-(\d+)", str(pending_sku), re.IGNORECASE)
+        if sku_match:
+            product = db.query(Product).filter(Product.id == int(sku_match.group(1))).first()
+            if product is not None:
+                return product
+    if pending_name:
+        return (
+            db.query(Product)
+            .filter(Product.product_name == pending_name)
+            .first()
+        )
+    return None
+
+
 async def _apply_product_match_result(
     session: dict,
     product: Product,
@@ -384,12 +421,15 @@ async def _apply_product_match_result(
     phone: str,
 ) -> tuple[str, dict]:
     """Add direct match to cart, confirm fuzzy match, or ask for missing quantity."""
+    # Only keep explicit order qty (dose digits never become pending_qty).
+    explicit_qty = qty if qty is not None and qty >= 1 else None
+
     if match_mode == "token":
         _set_pending_product(
             session,
             sku=_product_sku(product),
             product_name=product.product_name,
-            qty=qty,
+            qty=explicit_qty,
         )
         session["order_state"] = COLLECT_SKU_CONFIRM
         if phone:
@@ -400,20 +440,13 @@ async def _apply_product_match_result(
             session,
         )
 
-    if qty is not None and qty >= 1:
-        unit_price = float(product.price_per_strip or 0.0)
-        _add_line_to_cart(
-            session,
-            _product_sku(product),
-            product.product_name,
-            qty,
-            unit_price,
-        )
+    if explicit_qty is not None:
+        _add_resolved_product_to_cart(session, product, explicit_qty)
         session["order_state"] = CART_MENU
         if phone:
             await _send_cart_action_buttons(phone)
         return (
-            f"Added *{product.product_name}* × {qty} to cart.\n\n"
+            f"Added *{product.product_name}* × {explicit_qty} to cart.\n\n"
             f"{_format_cart_lines(_get_cart(session))}",
             session,
         )
@@ -518,8 +551,7 @@ async def _process_bulk_order(
         if qty is None or match_mode == "token":
             pending.append((query, qty))
             continue
-        unit_price = float(product.price_per_strip or 0.0)
-        _add_line_to_cart(session, _product_sku(product), product.product_name, qty, unit_price)
+        _add_resolved_product_to_cart(session, product, qty)
         added.append(f"{product.product_name} × {qty}")
 
     if pending:
@@ -721,15 +753,39 @@ async def _send_product_confirm_buttons(phone: str, product_name: str) -> None:
         )
 
 
-async def _reset_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
-    had_active_order = bool(_get_cart(session) or session.get("order_state"))
+def _had_active_order(session: dict) -> bool:
+    return bool(_get_cart(session) or session.get("order_state"))
+
+
+def _clear_order_flow_state(session: dict) -> None:
     session.pop("last_order_ref", None)
     session.pop("last_order_total", None)
     session.pop("payment_method_chosen", None)
     _clear_order_session(session)
+
+
+async def _cancel_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
+    """Exit ordering — clear cart/state and surface the main menu on send_reply."""
+    had_active = _had_active_order(session)
+    _clear_order_flow_state(session)
+    session[SESSION_SHOW_MAIN_MENU] = True
+    session[SESSION_SUPPRESS_NAV_FOOTER] = True
+    if had_active:
+        return (
+            "❌ Order cancelled.\n\n"
+            "Your cart was cleared. What would you like to do next?",
+            session,
+        )
+    return "❌ Order cancelled.\n\nWhat would you like to do next?", session
+
+
+async def _restart_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
+    """Clear cart and stay in product collection."""
+    had_active = _had_active_order(session)
+    _clear_order_flow_state(session)
     session["order_state"] = COLLECT_SKU
-    if had_active_order:
-        return f"❌ Order cancelled.\n\n{BULK_LIST_PROMPT}", session
+    if had_active:
+        return f"🔄 Cart cleared — starting fresh.\n\n{BULK_LIST_PROMPT}", session
     return BULK_LIST_PROMPT, session
 
 
@@ -1026,15 +1082,9 @@ def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
             "quantity": qty,
         }
 
-    unit_price = float(product.price_per_strip or 0.0)
     _clear_pending_product(session)
-    _add_line_to_cart(
-        session,
-        _product_sku(product),
-        product.product_name,
-        qty,
-        unit_price,
-    )
+    _add_resolved_product_to_cart(session, product, qty)
+    unit_price = _unit_price_from_db(product)
     session["order_state"] = CART_MENU
     for key in ("order_sku", "order_product_name", "order_qty", "order_unit_price"):
         session.pop(key, None)
@@ -1405,12 +1455,7 @@ async def _try_payment_actions(
         return await _handle_payment_selection(message, session, db)
 
     if text == "new_order":
-        session.pop("last_order_ref", None)
-        session.pop("last_order_total", None)
-        session.pop("payment_method_chosen", None)
-        _clear_order_session(session)
-        session["order_state"] = COLLECT_SKU
-        return BULK_LIST_PROMPT, session
+        return await _restart_order_flow(session, session.get("phone") or "")
 
     return None
 
@@ -1623,28 +1668,32 @@ async def _handle_order_filler(session: dict, text: str) -> tuple[str, dict] | N
     product = session.get("order_product_name") or ""
     phone = session.get("phone") or ""
 
-    if is_order_reset_request(text):
-        return await _reset_order_flow(session, phone)
+    if is_order_cancel_request(text):
+        return await _cancel_order_flow(session, phone)
+
+    if is_order_restart_request(text):
+        return await _restart_order_flow(session, phone)
 
     if state == COLLECT_QTY and product:
         return (
             f"Still adding *{product}*.\n\n"
             f"{product_qty_prompt(product)}\n\n"
-            "Or type *cancel* or *new order* to start over.",
+            "Or type *cancel* to stop, or *new order* to start over.",
             session,
         )
 
     if state in {COLLECT_SKU, COLLECT_SKU_CONFIRM, CART_MENU}:
         return (
             f"{BULK_LIST_PROMPT}\n\n"
-            "Or reply *new order* to clear your cart and start fresh.",
+            "Or type *cancel* to stop, or *new order* to clear your cart and start fresh.",
             session,
         )
 
     if state in {COLLECT_CHECKOUT, CONFIRM_ORDER, SELECT_PAYMENT}:
         return (
             "You have checkout in progress. "
-            "Reply with your details or *CONFIRM*, or *new order* to start over.",
+            "Reply with your details or *CONFIRM*, type *cancel* to stop, "
+            "or *new order* to start over.",
             session,
         )
 
@@ -1875,17 +1924,14 @@ _EDIT_MARKERS = frozenset({"edit", "cart", "list", "update"})
 
 
 def _extract_positive_int(text: str) -> int | None:
+    """Explicit order qty only — never dose digits from product names."""
+    bare = is_bare_order_qty(text)
+    if bare is not None:
+        return bare
     _, parsed_qty = _parse_product_qty_segment(text or "")
     if parsed_qty is not None and parsed_qty >= 1:
         return parsed_qty
-
-    matches = re.findall(r"\d[\d,]*", (text or "").replace(",", ""))
-    if not matches:
-        return None
-    try:
-        return int(matches[-1].replace(",", ""))
-    except ValueError:
-        return None
+    return None
 
 
 def _parse_remove_command(text: str) -> int | None:
@@ -1994,8 +2040,11 @@ async def _run_order_rules(
 ) -> tuple[str, dict]:
     text = (message or "").strip()
     phone = session.get("phone") or ""
-    if is_order_reset_request(text):
-        return await _reset_order_flow(session, phone)
+    if is_order_cancel_request(text):
+        return await _cancel_order_flow(session, phone)
+
+    if is_order_restart_request(text):
+        return await _restart_order_flow(session, phone)
 
     if phone and (_is_order_status_query(text) or _is_order_account_query(text)):
         return await _handle_order_lookup(message, session, db)
@@ -2010,7 +2059,6 @@ async def _run_order_rules(
     if state == COLLECT_SKU_CONFIRM:
         pending_sku = session.get("order_pending_sku")
         pending_name = session.get("order_pending_product_name")
-        pending_qty = session.get("order_pending_qty")
         if not pending_sku or not pending_name:
             _clear_pending_product(session)
             session["order_state"] = COLLECT_SKU
@@ -2022,8 +2070,14 @@ async def _run_order_rules(
             return BULK_LIST_PROMPT, session
 
         if _normalize_menu_action(text) == "confirm":
+            product = _lookup_product_by_pending(session, db)
+            pending_qty = session.get("order_pending_qty")
+            if product is None:
+                _clear_pending_product(session)
+                session["order_state"] = COLLECT_SKU
+                return BULK_LIST_PROMPT, session
             if pending_qty:
-                _add_line_to_cart(session, pending_sku, pending_name, int(pending_qty), 0.0)
+                _add_resolved_product_to_cart(session, product, int(pending_qty))
                 _clear_pending_product(session)
                 session["order_state"] = CART_MENU
                 if phone:
@@ -2032,21 +2086,7 @@ async def _run_order_rules(
                     f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}",
                     session,
                 )
-            product = None
-            if pending_sku:
-                sku_match = re.fullmatch(r"PROD-(\d+)", pending_sku, re.IGNORECASE)
-                if sku_match:
-                    product = db.query(Product).filter(Product.id == int(sku_match.group(1))).first()
-            if product is None and pending_name:
-                product = (
-                    db.query(Product)
-                    .filter(Product.product_name == pending_name)
-                    .first()
-                )
             _clear_pending_product(session)
-            if product is None:
-                session["order_state"] = COLLECT_SKU
-                return BULK_LIST_PROMPT, session
             return _prompt_product_quantity(session, product)
 
         _clear_pending_product(session)
@@ -2090,13 +2130,54 @@ async def _run_order_rules(
         )
 
     if state == COLLECT_QTY:
-        if is_order_reset_request(text):
-            return await _reset_order_flow(session, phone)
+        if is_order_cancel_request(text):
+            return await _cancel_order_flow(session, phone)
+        if is_order_restart_request(text):
+            return await _restart_order_flow(session, phone)
         if _is_filler_message(text):
             filler = await _handle_order_filler(session, text)
             if filler:
                 return filler
-        qty = _extract_positive_int(text)
+
+        # 1) Bare order qty only ("100", "100 units") — never dose digits.
+        qty = is_bare_order_qty(text)
+
+        # 2) Explicit "Product - 350" for current or switched product.
+        if qty is None:
+            product_query, parsed_qty = _split_product_query_and_qty(text)
+            if parsed_qty is not None and parsed_qty >= 1:
+                product, error, match_mode = _resolve_product_match(product_query, db)
+                if error == "restricted":
+                    return (
+                        "I'm unable to assist with that product through this channel. "
+                        "Please contact our medical compliance team directly.",
+                        session,
+                    )
+                if product is not None:
+                    if match_mode == "token":
+                        _clear_pending_product(session)
+                        return await _apply_product_match_result(
+                            session, product, match_mode, parsed_qty, phone
+                        )
+                    _clear_pending_product(session)
+                    _add_resolved_product_to_cart(session, product, parsed_qty)
+                    continued = await _continue_bulk_queue(session, db, phone)
+                    if continued:
+                        return continued
+                    session["order_state"] = CART_MENU
+                    if phone:
+                        await _send_cart_action_buttons(phone)
+                    return (
+                        f"Added *{product.product_name}* × {parsed_qty} to cart.\n\n"
+                        f"{_format_cart_lines(_get_cart(session))}",
+                        session,
+                    )
+                # Same pending product with explicit "Name - qty"
+                pending_name = (session.get("order_product_name") or "").lower()
+                if pending_name and product_query.lower() in pending_name:
+                    qty = parsed_qty
+
+        # 3) Product switch (e.g. "Arkacan 100mcg") — ask qty, never assume.
         if qty is None or qty < 1:
             product, error, _ = _resolve_product_match(text, db)
             if error == "restricted":
@@ -2263,8 +2344,11 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     if payment_result is not None:
         return payment_result
 
-    if is_order_reset_request(text):
-        return await _reset_order_flow(session, phone)
+    if is_order_cancel_request(text):
+        return await _cancel_order_flow(session, phone)
+
+    if is_order_restart_request(text):
+        return await _restart_order_flow(session, phone)
 
     # Status / account lookups must not start a new cart.
     if _is_order_status_query(text) or _is_order_account_query(text):

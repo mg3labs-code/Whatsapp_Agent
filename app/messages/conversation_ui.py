@@ -21,6 +21,7 @@ MENU_ACK_IDS = MENU_OPTION_IDS | {SPEAK_MENU_ID}
 
 SESSION_PENDING_MENU_ACK = "pending_menu_ack"
 SESSION_SUPPRESS_NAV_FOOTER = "suppress_nav_footer"
+SESSION_SHOW_MAIN_MENU = "show_main_menu_after_reply"
 
 NAV_FOOTER_BODY = "Anything else?"
 

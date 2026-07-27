@@ -12,6 +12,7 @@ from app.messages.welcome import (
     should_send_ai_disclosure,
     should_send_greeting_buttons,
 )
+from app.messages.onboarding import send_country_picker
 from app.orchestrator import graph as graph_mod
 
 
@@ -110,6 +111,44 @@ def test_prepend_ai_disclosure_only_once():
 
 
 @pytest.mark.asyncio
+async def test_send_country_picker_includes_ai_disclosure(monkeypatch):
+    bodies: list[str] = []
+
+    async def capture_list(phone: str, **kwargs) -> bool:
+        bodies.append(kwargs.get("body_text", ""))
+        return True
+
+    monkeypatch.setattr("app.messages.onboarding.send_interactive_list", capture_list)
+
+    session = await send_country_picker("+91999", {})
+    assert session["country_picker_sent"] is True
+    assert session["ai_disclosure_sent"] is True
+    assert len(bodies) == 1
+    assert bodies[0].startswith(AI_DISCLOSURE_MESSAGE.split("\n")[0])
+    assert "select your country" in bodies[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_send_country_picker_skips_duplicate_disclosure(monkeypatch):
+    calls: list[str] = []
+
+    async def capture_list(phone: str, **kwargs) -> bool:
+        calls.append(kwargs.get("body_text", ""))
+        return True
+
+    monkeypatch.setattr("app.messages.onboarding.send_interactive_list", capture_list)
+
+    session = await send_country_picker(
+        "+91999",
+        {"ai_disclosure_sent": True, "country_picker_sent": False},
+    )
+    assert session["country_picker_sent"] is True
+    assert len(calls) == 1
+    assert "AI assistant" not in calls[0]
+    assert "select your country" in calls[0].lower()
+
+
+@pytest.mark.asyncio
 async def test_send_reply_node_skips_disclosure_when_greeting_sent(monkeypatch):
     sent: list[str] = []
 
@@ -177,7 +216,8 @@ async def test_send_reply_node_prepends_disclosure_once(monkeypatch):
     await graph_mod.send_reply_node(state)
 
     assert len(sent) == 1
-    assert sent[0].startswith("Hi! 👋 I'm the AI assistant for *New Life Medicare*")
+    assert sent[0].startswith(AI_DISCLOSURE_MESSAGE.split("\n")[0])
+    assert saved[0].get("ai_disclosure_sent") is True
     assert "country" in sent[0].lower()
     assert saved[0].get("phone") == "91999"
     assert sent_buttons == ["91999"]
@@ -209,3 +249,43 @@ async def test_send_reply_node_skips_disclosure_when_already_sent(monkeypatch):
     )
 
     assert sent == ["What type of business are you?"]
+
+
+@pytest.mark.asyncio
+async def test_send_reply_node_shows_main_menu_after_order_cancel(monkeypatch):
+    sent: list[str] = []
+    menus: list[str] = []
+
+    monkeypatch.setattr(
+        graph_mod,
+        "send_message",
+        AsyncMock(side_effect=lambda _p, text: sent.append(text) or True),
+    )
+    monkeypatch.setattr(
+        graph_mod,
+        "send_main_menu_list",
+        AsyncMock(side_effect=lambda phone, **kwargs: menus.append(phone) or True),
+    )
+    monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
+    monkeypatch.setattr(graph_mod, "save_session", AsyncMock())
+
+    await graph_mod.send_reply_node(
+        {
+            "phone": "+91999",
+            "message": "cancel",
+            "message_id": "m1",
+            "session": {
+                "lead_qualified": True,
+                "ai_disclosure_sent": True,
+                "show_main_menu_after_reply": True,
+                "suppress_nav_footer": True,
+            },
+            "intent": "order",
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": "❌ Order cancelled.\n\nWhat would you like to do next?",
+        }
+    )
+
+    assert "order cancelled" in sent[0].lower()
+    assert menus == ["91999"]

@@ -55,11 +55,13 @@ from app.integrations.whatsapp import (
 from app.messages.session_flow import (
     RESUME_BOT_BUTTONS,
     clear_human_handoff,
-    is_order_reset_request,
+    is_order_cancel_request,
+    is_order_restart_request,
     is_speak_to_team_request,
     should_resume_from_human_handoff,
 )
 from app.messages.conversation_ui import (
+    SESSION_SHOW_MAIN_MENU,
     SESSION_SUPPRESS_NAV_FOOTER,
     apply_menu_selection_ack,
     is_main_menu_request,
@@ -67,6 +69,7 @@ from app.messages.conversation_ui import (
     should_send_navigation_footer,
 )
 from app.messages.onboarding import SESSION_SKIP_WELCOME_COMPOSE
+from app.messages.welcome import prepend_ai_disclosure
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
 
@@ -167,12 +170,6 @@ class MessageState(TypedDict):
     greeting: bool
 
 
-WELCOME_MESSAGE = (
-    "Hi! 👋 I'm the AI assistant for *New Life Medicare*\n"
-    "I help with medicine orders, pricing, FAQs & your order history.\n"
-    "Reply *human* anytime to reach our team."
-)
-
 async def load_session_node(state: MessageState) -> dict:
     from app.session.manager import normalize_phone
 
@@ -253,6 +250,9 @@ async def router_node(state: MessageState) -> dict:
     if is_main_menu_request(message):
         return {"intent": "menu_refresh", "session": session}
 
+    if is_order_cancel_request(message) or is_order_restart_request(message):
+        return {"intent": "order", "session": session}
+
     if is_order_tracking_message(state.get("message") or ""):
         return {"intent": "order", "session": session}
 
@@ -274,8 +274,10 @@ async def router_node(state: MessageState) -> dict:
             return {"intent": "order", "session": session}
         if msg_key == "speak" or is_speak_to_team_request(message):
             return {"intent": "escalate", "session": session}
-        if is_order_reset_request(message) or is_main_menu_request(message):
+        if is_order_cancel_request(message) or is_order_restart_request(message):
             return {"intent": "order", "session": session}
+        if is_main_menu_request(message):
+            return {"intent": "menu_refresh", "session": session}
         return {"intent": "order", "session": session}
 
     if session.get("awaiting_faq_ship_country"):
@@ -451,16 +453,13 @@ async def send_reply_node(state: MessageState) -> dict:
 
     if final_reply:
         final_reply, session = apply_menu_selection_ack(final_reply, session)
-        skip_welcome = session.get(SESSION_SKIP_WELCOME_COMPOSE) or "New Life Medicare" in (
-            final_reply or ""
-        )
-        if state.get("greeting") and not skip_welcome:
-            final_reply = f"{WELCOME_MESSAGE}\n\n{final_reply}"
+        final_reply, session = prepend_ai_disclosure(final_reply, session)
+        skip_main_menu = bool(session.get(SESSION_SKIP_WELCOME_COMPOSE))
         try:
             await send_message(phone, final_reply)
         except Exception:
             logger.exception("send_message failed user_ref=%s", user_ref(phone))
-        if state.get("greeting") and not skip_welcome:
+        if state.get("greeting") and not skip_main_menu:
             try:
                 await send_main_menu_list(phone)
             except Exception:
@@ -468,6 +467,15 @@ async def send_reply_node(state: MessageState) -> dict:
                     "send_main_menu_list failed user_ref=%s",
                     user_ref(phone),
                 )
+        if session.get(SESSION_SHOW_MAIN_MENU):
+            try:
+                await send_main_menu_list(phone)
+            except Exception:
+                logger.exception(
+                    "send_main_menu_list after cancel failed user_ref=%s",
+                    user_ref(phone),
+                )
+            session.pop(SESSION_SHOW_MAIN_MENU, None)
         try:
             session["last_agent"] = str(state.get("intent") or session.get("last_agent") or "unknown")
             _persist_conversation(
