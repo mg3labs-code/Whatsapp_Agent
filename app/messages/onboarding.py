@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from app.integrations.whatsapp import send_interactive_list
+from app.messages.welcome import prepend_ai_disclosure
 
 SESSION_COUNTRY_PICKER_SENT = "country_picker_sent"
 SESSION_SKIP_WELCOME_COMPOSE = "skip_welcome_compose"
@@ -50,10 +51,85 @@ _COUNTRY_PROMPT = "🌎 *Select your country* from the list below."
 _COUNTRY_REMINDER = "Please select your country from the list above 👆"
 _CUSTOM_COUNTRY_PROMPT = "Please type your country name:"
 
-_BULK_LINE_RE = re.compile(
-    r"^(?P<name>.+?)\s*(?:[-–—]\s*|\s+[x×]\s*|\s+)(?P<qty>\d+)\s*$",
+# Explicit order qty: "Product - 100" / "Product x 100" / "Product × 100"
+_BULK_SEP_RE = re.compile(
+    r"^(?P<name>.+?)\s*(?:[-–—]\s*|\s+[x×]\s+)(?P<qty>\d[\d,]*)\s*$",
     re.IGNORECASE,
 )
+_TRAILING_BARE_QTY_RE = re.compile(r"^(?P<name>.+?)\s+(?P<qty>\d[\d,]*)\s*$")
+_ORDER_UNITS_QTY_RE = re.compile(
+    r"^(?P<qty>\d[\d,]*)\s*(?:units?|pcs?|pieces?|strips?|tablets?|tabs?)\s*$",
+    re.IGNORECASE,
+)
+_BARE_QTY_RE = re.compile(r"^\d[\d,]*$")
+# Dose / pack tokens — digits here must never be treated as order quantity
+_DOSE_OR_PACK_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:mg|mcg|ug|µg|g|ml|iu|i\.u\.|%|mcg/ml|mg/ml)"
+    r"|\d+\s*[x×*]\s*\d+",
+    re.IGNORECASE,
+)
+
+
+def _name_contains_dose_or_pack(name: str) -> bool:
+    return bool(_DOSE_OR_PACK_RE.search(name or ""))
+
+
+def _parse_qty_int(raw: str) -> int | None:
+    try:
+        value = int((raw or "").replace(",", ""))
+    except ValueError:
+        return None
+    return value if value >= 1 else None
+
+
+def is_bare_order_qty(text: str) -> int | None:
+    """Return qty when the whole message is clearly an order quantity (not a dose)."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    if _BARE_QTY_RE.fullmatch(stripped.replace(",", "")) or _BARE_QTY_RE.fullmatch(
+        stripped
+    ):
+        return _parse_qty_int(stripped)
+    units = _ORDER_UNITS_QTY_RE.fullmatch(stripped)
+    if units:
+        return _parse_qty_int(units.group("qty"))
+    return None
+
+
+def _parse_product_qty_segment(segment: str) -> tuple[str, int | None]:
+    """Parse product query + optional *explicit* order qty (dose-safe).
+
+    Quantity is accepted only when clearly an order qty:
+    - separator: 'Product - 100', 'Product x 100'
+    - trailing bare number only if the name already contains dose/pack units
+      (e.g. 'JGLUT 2000MG 30ML 350') — never 'Arkacan 100mcg' or dose digits alone
+    """
+    text = (segment or "").strip()
+    if not text:
+        return "", None
+
+    sep = _BULK_SEP_RE.match(text)
+    if sep:
+        qty = _parse_qty_int(sep.group("qty"))
+        name = sep.group("name").strip()
+        if qty is not None and name:
+            return name, qty
+
+    trailing = _TRAILING_BARE_QTY_RE.match(text)
+    if trailing:
+        name = trailing.group("name").strip()
+        qty = _parse_qty_int(trailing.group("qty"))
+        # Require dose/pack in the name so 'Arkacan 100' / '100mcg' are not qty.
+        if qty is not None and len(name) >= 3 and _name_contains_dose_or_pack(name):
+            return name, qty
+
+    return text, None
+
+
+def parse_order_line(text: str) -> tuple[str, int | None]:
+    """Public helper: (product_query, explicit_order_qty_or_none)."""
+    return _parse_product_qty_segment(text)
 
 
 def country_prompt(*, reminded: bool = False) -> str:
@@ -123,17 +199,6 @@ def looks_like_bulk_order(text: str) -> bool:
     return qty is not None
 
 
-def _parse_product_qty_segment(segment: str) -> tuple[str, int | None]:
-    """Parse 'Product - 100', 'Product x 100', or 'Product 100' (trailing qty)."""
-    match = _BULK_LINE_RE.match(segment)
-    if match:
-        return match.group("name").strip(), int(match.group("qty"))
-    trailing = re.match(r"^(.+?)\s+(\d+)\s*$", segment.strip())
-    if trailing and len(trailing.group(1).strip()) >= 3:
-        return trailing.group(1).strip(), int(trailing.group(2))
-    return segment.strip(), None
-
-
 def parse_bulk_order_lines(text: str) -> list[tuple[str, int | None]]:
     """Return (product_query, quantity or None) for each line/segment."""
     items: list[tuple[str, int | None]] = []
@@ -150,10 +215,14 @@ async def send_country_picker(phone: str, session: dict) -> dict:
     if session.get(SESSION_COUNTRY_PICKER_SENT) or not phone:
         return session
 
+    body_text, session = prepend_ai_disclosure(
+        "Welcome! Select your country to get started.",
+        session,
+    )
     await send_interactive_list(
         phone,
         header_text="New Life Medicare",
-        body_text="Welcome! Select your country to get started.",
+        body_text=body_text,
         footer_text="Pharmaceutical exports worldwide",
         button_text="Select Country",
         rows=COUNTRY_PICKER_ROWS,

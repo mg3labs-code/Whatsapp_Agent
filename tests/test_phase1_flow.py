@@ -246,7 +246,7 @@ async def test_order_checkout_reuses_qualification_country(order_db, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_order_reset_from_collect_qty(order_db, monkeypatch):
+async def test_order_restart_from_collect_qty(order_db, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
     session = {
@@ -261,6 +261,26 @@ async def test_order_reset_from_collect_qty(order_db, monkeypatch):
     assert session.get("order_state") == "COLLECT_SKU"
     assert "product name and quantity" in reply.lower()
     assert session.get("order_product_name") is None
+    assert session.get("show_main_menu_after_reply") is not True
+
+
+@pytest.mark.asyncio
+async def test_order_cancel_from_collect_qty(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    session = {
+        "phone": "+919876543212",
+        "lead_qualified": True,
+        "order_state": COLLECT_QTY,
+        "order_product_name": "JGLUT 2000MG 30ML",
+        "order_sku": "PROD-1",
+    }
+
+    reply, session = await run_order_agent("cancel", session, order_db)
+    assert session.get("order_state") is None
+    assert session.get("order_product_name") is None
+    assert session.get("show_main_menu_after_reply") is True
+    assert "order cancelled" in reply.lower()
 
 
 @pytest.mark.asyncio

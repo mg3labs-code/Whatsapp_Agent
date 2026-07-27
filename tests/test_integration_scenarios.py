@@ -85,12 +85,22 @@ def graph_env(monkeypatch, integration_db):
         sent_buyer.append(text)
         return True
 
+    async def capture_interactive_list(phone: str, **kwargs) -> bool:
+        body = kwargs.get("body_text", "")
+        if body:
+            sent_buyer.append(body)
+        return True
+
     async def capture_team(text: str) -> bool:
         team_alerts.append(text)
         return True
 
     monkeypatch.setattr(graph_mod, "send_message", capture_buyer)
     monkeypatch.setattr("app.messages.welcome.send_message", capture_buyer)
+    monkeypatch.setattr(
+        "app.messages.onboarding.send_interactive_list",
+        capture_interactive_list,
+    )
     monkeypatch.setattr(
         "app.messages.welcome.send_main_menu_list",
         AsyncMock(return_value=True),
@@ -148,16 +158,10 @@ def graph_env(monkeypatch, integration_db):
 
 def _assert_disclosure_delivered(sent: list[str], session: dict) -> None:
     assert session.get("greeted") is True
-    # Welcome may be skipped when country picker already embeds brand copy
-    # (SESSION_SKIP_WELCOME_COMPOSE). Accept either graph welcome or qual prompt.
     joined = "\n".join(sent).lower()
     assert sent, "expected at least one outbound buyer message"
-    assert (
-        "ai assistant" in joined
-        or "new life medicare" in joined
-        or "country" in joined
-        or "welcome" in joined
-    )
+    assert "ai assistant" in joined or "ai sales assistant" in joined
+    assert session.get("ai_disclosure_sent") is True
 
 
 async def _invoke(phone: str, text: str, mid: str, graph_env: dict) -> None:

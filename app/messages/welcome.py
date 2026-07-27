@@ -82,9 +82,9 @@ async def send_greeting_menu(
     if not force and not should_send_greeting_buttons(session):
         return session, False
 
-    await send_message(phone, GREETING_INTRO_TEXT)
+    intro, session = prepend_ai_disclosure(GREETING_INTRO_TEXT, session)
+    await send_message(phone, intro)
     ok = await send_main_menu_list(phone, body=GREETING_LIST_BODY)
     if ok:
         session[SESSION_FLAG_GREETING_BUTTONS_SENT] = True
-        session[SESSION_FLAG_AI_DISCLOSURE_SENT] = True
     return session, ok

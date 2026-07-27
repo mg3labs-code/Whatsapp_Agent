@@ -1,6 +1,8 @@
 from app.messages.session_flow import (
     clear_human_handoff,
     is_discount_request,
+    is_order_cancel_request,
+    is_order_restart_request,
     is_order_reset_request,
     is_speak_to_team_request,
     resolve_business_type_button,
@@ -25,7 +27,24 @@ def test_clear_human_handoff():
     assert "escalation_reason" not in session
 
 
-def test_is_order_reset_request_phrases():
+def test_is_order_cancel_request_phrases():
+    assert is_order_cancel_request("cancel") is True
+    assert is_order_cancel_request("order cancel") is True
+    assert is_order_cancel_request("not needed cancel") is True
+    assert is_order_cancel_request("I need new order") is False
+    assert is_order_cancel_request("350") is False
+
+
+def test_is_order_restart_request_phrases():
+    assert is_order_restart_request("I need new order") is True
+    assert is_order_restart_request("new order") is True
+    assert is_order_restart_request("start over") is True
+    assert is_order_restart_request("clear cart") is True
+    assert is_order_restart_request("cancel") is False
+    assert is_order_restart_request("350") is False
+
+
+def test_is_order_reset_request_union():
     assert is_order_reset_request("I need new order") is True
     assert is_order_reset_request("not needed cancel") is True
     assert is_order_reset_request("350") is False
