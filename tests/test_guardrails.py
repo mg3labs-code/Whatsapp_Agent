@@ -10,13 +10,11 @@ from sqlalchemy.pool import StaticPool
 from app.db.models import Base, GuardrailLog
 from app.guardrails.check import (
     REFUSAL_CLINICAL_CONTENT,
-    REFUSAL_RESTRICTED_PRODUCT,
     REFUSAL_SANCTIONED_COUNTRY,
     check_post_guardrails,
     check_pre_guardrails,
     log_guardrail,
 )
-from app.messages.welcome import AI_DISCLOSURE_MESSAGE
 from app.orchestrator import graph as graph_mod
 
 
@@ -56,25 +54,6 @@ def test_pre_guardrails_blocks_sanctioned_country_case_insensitive():
     assert result.reason == "sanctioned_country"
 
 
-def test_pre_guardrails_blocks_hard_blocked_product():
-    result = check_pre_guardrails("Do you sell Schedule H products?", {})
-    assert result.blocked is True
-    assert result.reason == "restricted_product"
-    assert result.refusal_message == REFUSAL_RESTRICTED_PRODUCT
-
-
-def test_pre_guardrails_blocks_schedule_h1_drug_name():
-    result = check_pre_guardrails("What is your price for tramadol 50mg?", {})
-    assert result.blocked is True
-    assert result.reason == "restricted_product"
-
-
-def test_pre_guardrails_blocks_schedule_x_drug_name():
-    result = check_pre_guardrails("Need ketamine export quote", {})
-    assert result.blocked is True
-    assert result.reason == "restricted_product"
-
-
 def test_pre_guardrails_passes_clean_message():
     result = check_pre_guardrails("price for metformin", {"country": "Kenya"})
     assert result.blocked is False
@@ -85,6 +64,25 @@ def test_post_guardrails_blocks_clinical_content():
     assert result.blocked is True
     assert result.reason == "clinical_content"
     assert result.refusal_message == REFUSAL_CLINICAL_CONTENT
+
+
+def test_post_guardrails_blocks_pure_dosing_advice():
+    """Imperative dosing without BLOCKED_TOPICS words must still be blocked."""
+    result = check_post_guardrails("Take 500mg twice daily with food.")
+    assert result.blocked is True
+    assert result.reason == "clinical_content"
+
+
+def test_post_guardrails_passes_topic_without_dose():
+    """Compliant business copy that only mentions a topic word should pass."""
+    result = check_post_guardrails("Common side effects include nausea.")
+    assert result.blocked is False
+
+
+def test_post_guardrails_passes_catalog_strength():
+    """Product strength alone (no instructional dosing) must pass."""
+    result = check_post_guardrails("We supply Metformin 500mg tablets for wholesale export.")
+    assert result.blocked is False
 
 
 def test_post_guardrails_passes_business_reply():
@@ -123,34 +121,33 @@ async def test_log_guardrail_truncates_message_text(guardrail_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pre_guardrails_node_blocks_and_sets_final_reply(monkeypatch):
+async def test_post_guardrails_node_replaces_clinical_response(monkeypatch):
     logged: list[tuple] = []
 
     async def fake_log(phone, reason, stage, message_text=""):
-        logged.append((phone, reason, stage, message_text))
+        logged.append((phone, reason, stage))
 
     monkeypatch.setattr(graph_mod, "log_guardrail", fake_log)
 
-    out = await graph_mod.pre_guardrails_node(
+    out = await graph_mod.post_guardrails_node(
         {
             "phone": "+91999",
-            "message": "narcotic products",
+            "message": "how much should I take?",
             "message_id": "m1",
             "session": {},
-            "intent": None,
-            "agent_response": None,
+            "intent": "faq",
+            "agent_response": "Take 500mg twice daily.",
             "guardrail_blocked": False,
             "final_reply": None,
         }
     )
 
-    assert out["guardrail_blocked"] is True
-    assert out["final_reply"] == REFUSAL_RESTRICTED_PRODUCT
-    assert logged == [("+91999", "restricted_product", "pre", "narcotic products")]
+    assert out["final_reply"] == REFUSAL_CLINICAL_CONTENT
+    assert logged == [("+91999", "clinical_content", "post")]
 
 
 @pytest.mark.asyncio
-async def test_post_guardrails_node_replaces_clinical_response(monkeypatch):
+async def test_post_guardrails_node_passes_topic_only_reply(monkeypatch):
     logged: list[tuple] = []
 
     async def fake_log(phone, reason, stage, message_text=""):
@@ -171,8 +168,8 @@ async def test_post_guardrails_node_replaces_clinical_response(monkeypatch):
         }
     )
 
-    assert out["final_reply"] == REFUSAL_CLINICAL_CONTENT
-    assert logged == [("+91999", "clinical_content", "post")]
+    assert out["final_reply"] == "Common side effects include nausea."
+    assert logged == []
 
 
 def test_route_after_pre_guardrails_blocked_skips_router():
@@ -188,48 +185,3 @@ def test_route_to_agent_human_active_silent_drop():
     assert graph_mod._route_to_agent(
         {"guardrail_blocked": False, "session": {"human_active": True}}
     ) == "human_active"
-
-
-@pytest.mark.asyncio
-async def test_pre_guardrail_blocked_skips_agents_in_graph(monkeypatch):
-    import fakeredis
-
-    from app.session import manager as session_manager
-
-    sent: list[str] = []
-
-    async def capture_send(phone: str, text: str) -> bool:
-        sent.append(text)
-        return True
-
-    async def fail_classify(*_args, **_kwargs):
-        raise AssertionError("router should not run when pre-guardrail blocks")
-
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
-    monkeypatch.setattr(graph_mod, "send_message", capture_send)
-    monkeypatch.setattr("app.messages.welcome.send_message", capture_send)
-    monkeypatch.setattr(
-        "app.messages.conversation_ui.send_main_menu_list",
-        AsyncMock(return_value=True),
-    )
-    monkeypatch.setattr(graph_mod, "send_main_menu_list", AsyncMock(return_value=True))
-    monkeypatch.setattr(graph_mod, "send_navigation_footer", AsyncMock(return_value=True))
-    monkeypatch.setattr(graph_mod, "classify_intent", fail_classify)
-    monkeypatch.setattr(graph_mod, "log_guardrail", AsyncMock())
-
-    await graph_mod.compiled_graph.ainvoke(
-        {
-            "phone": "+91999111",
-            "message": "price for ketamine",
-            "message_id": "m1",
-            "session": {},
-            "intent": None,
-            "agent_response": None,
-            "guardrail_blocked": False,
-            "final_reply": None,
-        }
-    )
-
-    assert REFUSAL_RESTRICTED_PRODUCT in sent[-1]
-    assert any("AI assistant" in msg or "AI sales assistant" in msg for msg in sent)

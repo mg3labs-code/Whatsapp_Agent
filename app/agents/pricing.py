@@ -28,7 +28,7 @@ PRICING_SYSTEM_PROMPT = (
     "the database tool, and return a professional formatted price quote.\n"
     "Rules:\n"
     "- Always call the DB tool before quoting any price. Never guess prices.\n"
-    "- If company or country not in session context, ask for them before quoting.\n"
+    "- If destination country is not in session context, ask the buyer for their country before quoting.\n"
     "- The tool returns a single *USD price per strip* from the catalog. Quote that exact value.\n"
     "- If the buyer asks for totals, multiply *USD price per strip* by their quantity (use clear math).\n"
     "- Use *asterisks* for bold (WhatsApp format), not markdown **double asterisks**.\n"
@@ -116,13 +116,11 @@ async def run_pricing_agent(message: str, session: dict, db: Session) -> str:
             "Let me confirm with our team and get back to you shortly."
         )
 
-    company = session.get("company") or "(not provided)"
     country = session.get("country") or "(not provided)"
     # SECURITY: Langfuse input — no full message body
     set_span_io(
         input_data={
             "message_len": len(message),
-            "company": company,
             "country": country,
         }
     )
@@ -135,7 +133,6 @@ async def run_pricing_agent(message: str, session: dict, db: Session) -> str:
             "role": "user",
             "content": (
                 f"Buyer context:\n"
-                f"- Company: {company}\n"
                 f"- Country: {country}\n\n"
                 f"Buyer message: {message}"
             ),

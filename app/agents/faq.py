@@ -48,22 +48,37 @@ try:
 except ValueError:
     SCORE_MIN_EXCLUSIVE = 0.41
 
+# First miss: honest, no false "connecting you" promise (escalation fires on 2nd miss).
 NO_CONTEXT_REPLY = (
-    "I don't have specific information on that. Let me connect you with our team."
+    "I don't have specific information on that in our knowledge base. "
+    "Could you rephrase, or type *speak to team* if you'd like a specialist?"
 )
+
+CONTINUE_FAQ = "faq"
+FAQ_MISS_ESCALATE_AFTER = 2
 
 FAQ_SYSTEM_PROMPT = (
     "You are a helpful assistant for New Life Medicare pharmaceutical exports.\n"
     "Answer the buyer's question using ONLY the context provided below.\n"
-    "If the answer is not in the context, say: 'I'll need to check on that and get back to you.\n"
-    "Let me connect you with our team for this.'\n"
+    "If the answer is not in the context, say exactly: "
+    "'I don't have specific information on that in our knowledge base. "
+    "Could you rephrase, or type *speak to team* if you'd like a specialist?'\n"
     "Never make up information about regulations, shipping times, or product specifications.\n"
     "Use *asterisks* for bold text. Keep answers concise and professional."
 )
 
 ERROR_REPLY = (
     "I'm having trouble searching our knowledge base right now. "
-    "Let me connect you with our team."
+    "Please try again in a moment, or type *speak to team* for help."
+)
+
+# Soft no-answer signals from LLM (legacy + current copy) — count toward miss escalation.
+_SOFT_NO_ANSWER_MARKERS = (
+    "don't have specific information",
+    "i don't have specific information",
+    "let me connect you with our team",
+    "connect you with our team for this",
+    "i'll need to check on that",
 )
 
 
@@ -103,22 +118,59 @@ def _pinecone_query_sync(api_key: str, vector: list[float]) -> Any:
     return index.query(vector=vector, top_k=TOP_K, include_metadata=True)
 
 
+def _is_soft_no_answer(reply: str) -> bool:
+    """True when LLM (or fallback) admits it cannot answer from context."""
+    lowered = (reply or "").lower()
+    return any(marker in lowered for marker in _SOFT_NO_ANSWER_MARKERS)
+
+
+def _record_faq_miss(session: dict) -> tuple[str, str]:
+    """Increment miss counter; return (buyer_reply, next_intent).
+
+    On the 2nd consecutive miss, clear the counter, set escalation_reason, and
+    return an empty buyer reply so escalation_agent owns the message (no duplicate
+    "connect you" copy).
+    """
+    miss_count = int(session.get("faq_miss_count", 0) or 0) + 1
+    session["faq_miss_count"] = miss_count
+    if miss_count >= FAQ_MISS_ESCALATE_AFTER:
+        session["faq_miss_count"] = 0
+        session["escalation_reason"] = "faq_no_match_repeated"
+        return "", "escalate"
+    return NO_CONTEXT_REPLY, CONTINUE_FAQ
+
+
+def _record_faq_error(session: dict) -> tuple[str, str]:
+    """Same miss accounting for infra failures; first miss keeps ERROR_REPLY copy."""
+    miss_count = int(session.get("faq_miss_count", 0) or 0) + 1
+    session["faq_miss_count"] = miss_count
+    if miss_count >= FAQ_MISS_ESCALATE_AFTER:
+        session["faq_miss_count"] = 0
+        session["escalation_reason"] = "faq_no_match_repeated"
+        return "", "escalate"
+    return ERROR_REPLY, CONTINUE_FAQ
+
+
 @observe(name="faq_agent", capture_input=False)
 async def run_faq_agent(
     message: str,
     phone: str = "",
     session: dict | None = None,
-) -> str:
+) -> tuple[str, dict, str]:
     """Run Pinecone RAG + GPT-4o-mini on one buyer message.
 
-    Returns a WhatsApp-ready string. On missing env, retrieval failure, or no
-    chunks above the score threshold, returns a safe escalation-style message
-    (no LLM call when there is no qualifying context).
+    Returns (reply_text, updated_session, next_intent). On missing env, retrieval
+    failure, or no chunks above the score threshold, returns a safe no-match message
+    (no LLM call when there is no qualifying context). After two consecutive misses
+    (no chunks, soft LLM no-answer, empty reply, or infra error), next_intent is
+    ``escalate`` so the orchestrator can hand off like speak-to-team. On escalate the
+    reply text is empty — escalation_agent provides the buyer-facing handoff message.
     """
+    session = dict(session or {})
     destination = _extract_destination_country(message)
     if destination:
         if is_shipment_excluded_country(destination):
-            return SHIPMENT_EXCLUDED_REFUSAL
+            return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_FAQ
         db = SessionLocal()
         try:
             options = get_shipping_options(destination, total_g=0, db=db)
@@ -128,18 +180,19 @@ async def run_faq_agent(
             return (
                 f"Yes, we ship to {destination}. Express (EMS): approximately 7-14 days. "
                 "Standard LP: approximately 15-30 days. Reply 'place an order' when ready."
-            )
+            ), session, CONTINUE_FAQ
         return (
             f"We do not have standard shipping rates configured for {destination} yet. "
             "Our team can confirm if shipping is possible — type 'speak to team' and "
             "someone will follow up."
-        )
+        ), session, CONTINUE_FAQ
 
     openai_key = os.getenv("OPENAI_API_KEY")
     pinecone_key = os.getenv("PINECONE_API_KEY")
     if not openai_key or not pinecone_key:
         logger.error("OPENAI_API_KEY or PINECONE_API_KEY missing; FAQ agent cannot run")
-        return ERROR_REPLY
+        reply, next_intent = _record_faq_error(session)
+        return reply, session, next_intent
 
     # SECURITY: Langfuse input — metadata only, not full message body
     set_span_io(input_data={"message_len": len(message)})
@@ -166,7 +219,8 @@ async def run_faq_agent(
 
         if not context_chunks:
             set_span_io(output_data={"status": "no_context"})
-            return NO_CONTEXT_REPLY
+            reply, next_intent = _record_faq_miss(session)
+            return reply, session, next_intent
 
         context = "\n\n".join(context_chunks)
         user_content = f"Context:\n{context}\n\nBuyer question:\n{message}"
@@ -179,16 +233,23 @@ async def run_faq_agent(
             model=CHAT_MODEL,
             messages=chat_messages,
         )
-        reply = (chat.choices[0].message.content or "").strip() or NO_CONTEXT_REPLY
+        raw_reply = (chat.choices[0].message.content or "").strip()
+        if not raw_reply or _is_soft_no_answer(raw_reply):
+            set_span_io(output_data={"status": "soft_no_answer", "chunks": len(context_chunks)})
+            reply, next_intent = _record_faq_miss(session)
+            return reply, session, next_intent
+
+        session["faq_miss_count"] = 0
         set_span_io(
             output_data={
-                "reply_len": len(reply),
+                "reply_len": len(raw_reply),
                 "chunks": len(context_chunks),
                 "agent": "faq",
             }
         )
-        return reply
+        return raw_reply, session, CONTINUE_FAQ
     except Exception:
         # SECURITY: log agent name only — not message content
         logger.exception("FAQ agent failed")
-        return ERROR_REPLY
+        reply, next_intent = _record_faq_error(session)
+        return reply, session, next_intent

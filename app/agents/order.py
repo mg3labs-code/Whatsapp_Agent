@@ -52,6 +52,7 @@ from app.messages.session_flow import (
     CART_ACTION_BUTTONS,
     CONFIRM_ORDER_BUTTONS,
     PRODUCT_CONFIRM_BUTTONS,
+    clear_conversation_counters,
     is_order_cancel_request,
     is_order_restart_request,
 )
@@ -768,6 +769,7 @@ async def _cancel_order_flow(session: dict, phone: str = "") -> tuple[str, dict]
     """Exit ordering — clear cart/state and surface the main menu on send_reply."""
     had_active = _had_active_order(session)
     _clear_order_flow_state(session)
+    session = clear_conversation_counters(session)
     session[SESSION_SHOW_MAIN_MENU] = True
     session[SESSION_SUPPRESS_NAV_FOOTER] = True
     if had_active:

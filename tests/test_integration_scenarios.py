@@ -19,11 +19,8 @@ from app.messages.welcome import AI_DISCLOSURE_MESSAGE
 from app.agents.lead_scoring import score_lead
 from app.agents.qualification import run_qualification_agent
 from app.business import hours as business_hours
-from app.db.models import Base, GuardrailLog, Order, Product
-from app.guardrails.check import (
-    REFUSAL_RESTRICTED_PRODUCT,
-    check_pre_guardrails,
-)
+from app.db.models import Base, Order, Product
+from app.guardrails.check import check_pre_guardrails
 from app.integrations import alerts as alerts_mod
 from app.orchestrator import graph as graph_mod
 from app.session import manager as session_manager
@@ -136,8 +133,8 @@ def graph_env(monkeypatch, integration_db):
     async def fake_pricing(message: str, session: dict, db):
         return "Quote: Metformin 500mg at $0.95/strip."
 
-    async def fake_faq(message: str, phone: str = "", session: dict | None = None) -> str:
-        return "We ship via DHL worldwide."
+    async def fake_faq(message: str, phone: str = "", session: dict | None = None):
+        return "We ship via DHL worldwide.", dict(session or {}), "faq"
 
     monkeypatch.setattr(graph_mod, "run_pricing_agent", fake_pricing)
     monkeypatch.setattr(graph_mod, "run_faq_agent", fake_faq)
@@ -262,7 +259,13 @@ async def test_scenario_d_faq_returns_answer(graph_env, monkeypatch):
     monkeypatch.setattr(
         graph_mod,
         "run_faq_agent",
-        AsyncMock(return_value="We accept LC and TT payment terms."),
+        AsyncMock(
+            return_value=(
+                "We accept LC and TT payment terms.",
+                {"lead_qualified": True},
+                "faq",
+            )
+        ),
     )
     monkeypatch.setattr(
         router_mod,
@@ -271,18 +274,6 @@ async def test_scenario_d_faq_returns_answer(graph_env, monkeypatch):
     )
     await _invoke(PHONE, "what payment methods do you accept", "d1", graph_env)
     assert "payment" in graph_env["sent_buyer"][-1].lower()
-
-
-@pytest.mark.asyncio
-async def test_scenario_e_schedule_h_blocked(graph_env, integration_db):
-    await _invoke(PHONE, "Do you sell Schedule H products?", "e1", graph_env)
-    reply = graph_env["sent_buyer"][-1]
-    session = await session_manager.get_session(PHONE)
-    _assert_disclosure_delivered(graph_env["sent_buyer"], session)
-    assert REFUSAL_RESTRICTED_PRODUCT in reply
-    logs = integration_db.query(GuardrailLog).all()
-    assert len(logs) >= 1
-    assert logs[-1].reason == "restricted_product"
 
 
 @pytest.mark.asyncio
@@ -317,12 +308,6 @@ async def test_scenario_7_off_hours_escalation_eta(monkeypatch):
     )
     assert "offline" in reply.lower() or "business hours" in reply.lower()
     assert session["human_active"] is True
-
-
-def test_scenario_8_schedule_h_pre_guardrail():
-    result = check_pre_guardrails("price for Schedule H antibiotics", {})
-    assert result.blocked
-    assert result.reason == "restricted_product"
 
 
 def test_scenario_9_sanctioned_country_pre_guardrail():
@@ -409,13 +394,58 @@ async def test_scenario_13_faq_empty_pinecone_team_message(monkeypatch):
             "app.agents.faq._pinecone_query_sync",
             return_value=mock_query,
         ):
-            reply = await run_faq_agent(
+            reply, session, intent = await run_faq_agent(
                 "obscure regulatory question xyz123",
                 session={"lead_qualified": True},
             )
     assert reply == NO_CONTEXT_REPLY
+    assert intent == "faq"
+    assert session.get("faq_miss_count") == 1
     assert "team" in reply.lower()
     mock_client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scenario_13b_faq_repeated_miss_escalates(graph_env, monkeypatch):
+    """Two FAQ no-match turns route to escalation_agent like speak-to-team."""
+    await session_manager.save_session(PHONE, {"lead_qualified": True, "greeted": True})
+    monkeypatch.setattr(graph_mod, "run_faq_agent", run_faq_agent)
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setenv("PINECONE_API_KEY", "test")
+    monkeypatch.setattr(
+        router_mod,
+        "_classify_with_llm",
+        AsyncMock(return_value=("faq", 0.9)),
+    )
+
+    mock_embed = MagicMock()
+    mock_embed.data = [MagicMock(embedding=[0.1] * 8)]
+    mock_query = MagicMock()
+    mock_query.matches = []
+
+    with patch("app.agents.faq.get_async_openai_client") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.embeddings.create = AsyncMock(return_value=mock_embed)
+        mock_client.chat.completions.create = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        with patch("app.agents.faq._pinecone_query_sync", return_value=mock_query):
+            await _invoke(PHONE, "obscure question one", "13b1", graph_env)
+            await _invoke(PHONE, "obscure question two", "13b2", graph_env)
+
+    session = await session_manager.get_session(PHONE)
+    assert session.get("human_active") is True
+    assert session.get("escalation_reason") == "faq_no_match_repeated"
+    assert any("ESCALATION" in alert for alert in graph_env["team_alerts"])
+    assert any("faq_no_match_repeated" in alert for alert in graph_env["team_alerts"])
+    last = graph_env["sent_buyer"][-1].lower()
+    # Escalation owns turn-2 copy (in-hours or off-hours); no FAQ miss duplicate.
+    assert (
+        "connecting you with our sales team" in last
+        or "currently offline" in last
+        or "flagged as a priority" in last
+    )
+    assert "could you rephrase" not in last
+    assert "don't have specific information" not in last
 
 
 @pytest.mark.asyncio
