@@ -1,327 +1,194 @@
 # WASA Agent Reference
-# Complete specifications for all 5 agents + guardrails
+# Specifications aligned with live code in `app/agents/` and `app/guardrails/`
 
-## AGENT 1: PRICING AGENT (app/agents/pricing.py)
-Model: GPT-4o with function/tool calling
-Cost tier: High — use only for confirmed pricing queries
+## AGENT 1: PRICING (`app/agents/pricing.py`)
 
-### Input
-- message: buyer's message text
-- session: dict (must contain "company" and "country" or agent asks for them)
-- db: SQLAlchemy Session
+**Model:** GPT-4o with function/tool calling  
+**Input:** `message`, `session`, `db`  
+**Output:** `str` (WhatsApp-ready reply)
 
-### Tool: get_product_by_name(query: str)
-- Fuzzy match on `Product.product_name`, `Product.salt_name`, and `Product.manufacturing_company` (ILIKE)
-- Returns: product dict with `price_per_strip` (USD) OR `{"error": "product_not_found"}` OR `{"error": "product_restricted"}`
-- NEVER call this more than 3 times per turn
+### Tool: `get_product_by_name(query)`
+- Fuzzy match on `Product.product_name`, `salt_name`, `manufacturing_company` (ILIKE)
+- Returns catalog dict with `price_per_strip` (USD), or:
+  - `{"error": "product_not_found"}`
+  - `{"error": "product_restricted", "name", "schedule_category"}` when `is_restricted=True`
+- Max **3** tool calls per turn
+
+### Restricted products
+Pre-guardrails do **not** block drug names in free text. Restriction is **catalog-level**: pricing tool returns `product_restricted`; the LLM is instructed to say the product is not available for export via this channel.
+
+### Qualification gate
+Order and pricing require `session.lead_qualified=True`. FAQ does not.
+
+---
+
+## AGENT 2: FAQ / RAG (`app/agents/faq.py`)
+
+**Model:** GPT-4o-mini (only when qualifying chunks exist)  
+**Input:** `message`, `phone`, `session`  
+**Output:** `(reply_text, updated_session, next_intent)` where `next_intent` is `"faq"` or `"escalate"`
+
+### RAG process
+1. Optional shortcut: "ship/deliver/send to {country}" → shipping lookup (no Pinecone)
+2. Embed message → `text-embedding-3-small`
+3. Pinecone query `top_k=3`; use chunks with score **>** `FAQ_PINECONE_MIN_SCORE` (default **0.41**)
+4. No qualifying chunks → increment `faq_miss_count`, return `NO_CONTEXT_REPLY` (1st miss) or escalate (2nd miss)
+5. With chunks → GPT-4o-mini grounded on chunk text only
+
+### Miss counter (`faq_miss_count`)
+Consecutive failures that increment toward escalation (threshold **2**):
+- No Pinecone chunks above threshold
+- LLM empty reply or soft no-answer (matches markers like "don't have specific information")
+- Missing API keys / Pinecone or OpenAI errors
+
+Reset to **0** on a successful grounded answer. Cleared on human handoff resume and main menu (`clear_human_handoff`).
+
+### Buyer copy
+**1st miss** (`NO_CONTEXT_REPLY`):
+> I don't have specific information on that in our knowledge base. Could you rephrase, or type *speak to team* if you'd like a specialist?
+
+**2nd miss:** empty reply from FAQ; `next_intent="escalate"`, `escalation_reason="faq_no_match_repeated"`. Orchestrator routes to **escalation_agent** (same path as speak-to-team). Escalation owns the handoff message — no duplicate FAQ text.
 
 ### System prompt
-The live system prompt is in `app/agents/pricing.py` (`PRICING_SYSTEM_PROMPT`). It instructs GPT-4o to call the tool first and quote the **single catalog USD price per strip** (no multi-tier DB fields).
-
-### Output: formatted string ready to send to WhatsApp
+Live prompt: `FAQ_SYSTEM_PROMPT` in `faq.py` (must match `NO_CONTEXT_REPLY` when context is insufficient).
 
 ---
 
-## AGENT 2: FAQ/RAG AGENT (app/agents/faq.py)
-Model: GPT-4o-mini
-Cost tier: Low — cheap and fast for FAQ lookups
+## AGENT 3: ORDER (`app/agents/order.py`)
 
-### Input
-- message: buyer's question text
+**Model:** GPT-4o-mini when `ORDER_AGENT_USE_LLM=true` (default); rule-based fallback otherwise  
+**Input:** `message`, `session`, `db`  
+**Output:** `(reply_text, updated_session)`
 
-### RAG Process
-1. Embed message → text-embedding-3-small → 1536-dim vector
-2. Pinecone query: top_k=3, include_metadata=True
-3. Filter: only use chunks with score > FAQ_PINECONE_MIN_SCORE (default **0.41**; tune **0.40–0.42** per `scripts/analyze_faq_thresholds` on your index)
-4. If no chunks above threshold → return escalation message (do NOT call LLM)
-5. Build context: join chunk texts with "\n\n"
-
-### System Prompt (production-ready)
+### State machine (high level)
 ```
-You are a helpful assistant for New Life Medicare pharmaceutical exports.
-Answer the buyer's question using ONLY the provided context. Rules:
-1. If the answer is not in the context, say: "I'll need to check on that and get back to you.
-   Let me connect you with our team for this." — then stop, do not improvise.
-2. Never fabricate shipping timelines, document requirements, or regulatory claims.
-3. Use *asterisks* for bold (WhatsApp format).
-4. Keep answers under 400 words.
-5. End with a clarifying question if appropriate.
-Context: {context}
+COLLECT_SKU → COLLECT_SKU_CONFIRM → COLLECT_QTY → CART_MENU
+  → (add/edit/remove/qty) → checkout path
+COLLECT_COUNTRY → COLLECT_CITY → COLLECT_CONTACT
+  → SHIPPING_CHOICE (EMS/LP or PENDING_QUOTE)
+  → COLLECT_CHECKOUT → CONFIRM_ORDER → SELECT_PAYMENT → ORDER_COMPLETE
 ```
 
-### Output: grounded answer string OR escalation fallback message
+Session keys include: `order_state`, `order_cart`, `order_country`, `order_city`, `order_contact`, shipping fields, payment selection.
+
+On commit: `order_ref`, DB rows, `send_order_alert` to order team WhatsApp numbers, clear order session keys.
 
 ---
 
-## AGENT 3: ORDER COLLECTION AGENT (app/agents/order.py)
-Model: GPT-4o-mini + function tools (rule-based fallback if `OPENAI_API_KEY` missing)
-Session keys used: order_state, order_cart (list of lines), order_sku/order_product_name/order_moq
-                   (while adding a line), order_country, order_city, order_contact, order_payment
+## AGENT 4: QUALIFICATION (`app/agents/qualification.py`)
 
-### State Machine (COLLECT IN EXACT ORDER)
+**Model:** None — rule-based + WhatsApp interactive lists  
+**Input:** `message`, `session`, `db`  
+**Output:** `(reply_text, updated_session, next_intent)`
+
+### State machine (current — 2 steps)
 ```
-COLLECT_SKU → COLLECT_QTY → CART_MENU (repeat add / edit / remove / qty commands)
-  CART_MENU: *add* another product | *done* checkout | *edit* | *remove 2* | *qty 1 500*
-
-COLLECT_SKU
-  Question: "I'll help you place your order! Which product would you like to add? (name or SKU)"
-  Validate: product exists in DB (fuzzy search)
-  On valid: save pending line → COLLECT_QTY
-
-COLLECT_QTY
-  Question: "How many units of {product_name}?"
-  On valid: append/merge into order_cart → CART_MENU
-
-COLLECT_COUNTRY
-  Question: "Which country should we ship to?"
-  Validate: country NOT in SANCTIONED_COUNTRIES (case-insensitive check)
-  On sanctioned: return guardrail refusal, reset ALL order_* session keys
-  On valid: save country → advance to COLLECT_CITY
-
-COLLECT_CITY
-  Question: "Which city or port of entry in {country}?"
-  Validate: len(message.strip()) >= 2
-  On valid: save city → advance to COLLECT_CONTACT
-
-COLLECT_CONTACT
-  Question: "Your name and company name for this order?"
-  Validate: len(message.strip()) >= 3
-  On valid: save contact → advance to COLLECT_PAYMENT
-
-COLLECT_PAYMENT
-  Question: "Preferred payment terms? (T/T Advance, Letter of Credit, or 30-day net)"
-  On valid: save payment_terms → CONFIRM_ORDER (review summary)
-
-CONFIRM_ORDER
-  Show full cart + shipping + payment. User must reply *CONFIRM* (or yes/ok).
-  *edit* returns to CART_MENU. On CONFIRM → commit.
-
-ORDER_COMPLETE / commit
-  1. order_ref = ORD-YYYYMMDD-####; one DB row per cart line (order_ref-L01, L02, …)
-  2. Write Order rows + send_order_alert (all lines)
-  3. Clear order_* session keys
-  4. Return confirmation:
-     "✅ *Order Confirmed!*
-     📋 *Order Summary:*
-     • Product: {product_name}
-     • Quantity: {qty} units
-     • Ship to: {city}, {country}
-     • Contact: {contact}
-     • Payment: {payment_terms}
-     • Order Ref: {order_ref}
-     Our sales team will contact you within 24 hours with the proforma invoice. Thank you!"
+COLLECT_COUNTRY  → country picker / typed country; excluded → escalate
+COLLECT_BIZ_TYPE → interactive list or typed biz type
+QUAL_COMPLETE    → score_lead(), persist lead, route by score
 ```
 
-### Shipping Flow (added in shipping PR)
+Legacy states (`COLLECT_COMPANY`, `COLLECT_VOLUME`, `COLLECT_LICENSE`) normalize to `COLLECT_COUNTRY`.
 
-After COLLECT_CONTACT, the order agent calculates shipment weight and looks
-up shipping rates before asking for payment terms:
-
-State: SHIPPING_CHOICE
-- Calculates total_weight_g from cart items (product weight × qty + box weight)
-- Queries shipping_rates table for EMS (express) and LP (normal) rates
-- If both available: asks buyer to choose express or normal
-- If only EMS available (LP null at that weight): auto-selects EMS
-- If country not in shipping_rates: sets shipping to PENDING_QUOTE, team follows up
-
-Weight data sources (weight_source column on products):
-- exact: name matched exactly with weight sheet
-- normalized: matched after stripping dose/pack/form suffix
-- brand: matched on brand name prefix
-- estimated: not in weight sheet — calculated from form+dose+pack
-- manual: manually entered
-
-Seed command (run after alembic upgrade head):
-```
-python scripts/seed_all_shipping_data.py \
-    --weight Intelligent_Weight_Sheet.xlsx \
-    --catalog catalog.xlsx \
-    --ems EXPRESS_SHIPPING_CHARGES.xlsx \
-    --lp REGULAR__LP__SHIPPING_CHARGES.xlsx
-```
+### Lead scoring
+Uses `app/agents/lead_scoring.score_lead()` (client SOP, 0–100). At `QUAL_COMPLETE`:
+- **Disqualified** → escalate (compliance message)
+- **manual_review_only** → escalate (`manual_review`)
+- **score ≥ 80** (`HOT_LEAD_MIN_SCORE`) → escalate (`hot_lead`)
+- Else → `pending_intent` handoff (pricing/order/faq) or main menu prompt
 
 ---
 
-## AGENT 4: QUALIFICATION AGENT (app/agents/qualification.py)
-Model: None — rule-based state machine with NLP extraction
-Session keys: qual_state, company, country, business_type, annual_volume_usd, license_number
+## AGENT 5: ESCALATION (`app/agents/escalation.py`)
 
-### State Machine (COLLECT IN EXACT ORDER)
-```
-COLLECT_COMPANY
-  Question: "Welcome to New Life Medicare! To provide accurate pricing and ensure compliance
-  with export regulations, could I get your company name and country?"
-  Extract: company name from response (take full response if one line, else first sentence)
-  Advance immediately to COLLECT_COUNTRY
+**Model:** None  
+**Input:** `message`, `session`, `reason`, `phone`  
+**Output:** `(reply_text, updated_session)`
 
-COLLECT_COUNTRY
-  Question: "Thank you! And which country are you based in?"
-  Extract: country name (accept any non-empty response)
-  Advance to COLLECT_BIZ_TYPE
+### Side effects
+- `session.human_active = True`
+- `session.escalation_reason = reason`
+- `send_escalation_alert()` → WhatsApp to `LEADS_ALERT_PHONE_NUMBERS`
 
-COLLECT_BIZ_TYPE
-  Question: "What type of business are you? (hospital, pharmaceutical distributor, pharmacy chain,
-  independent pharmacy, or other)"
-  Extract business type using keyword matching:
-  - "hospital" or "clinic" or "medical center" → "hospital"
-  - "distributor" or "wholesale" or "wholesaler" → "distributor"
-  - "pharmacy chain" or "chain pharmacy" or "retail chain" → "pharmacy_chain"
-  - "pharmacy" or "chemist" or "drugstore" → "pharmacy"
-  - anything else → "other"
-  Advance to COLLECT_VOLUME
-
-COLLECT_VOLUME
-  Question: "What is your approximate annual pharmaceutical purchase volume in USD?
-  (For example: $50,000, $500,000, or $2 million)"
-  Extract number using these patterns:
-  - "$2 million" or "2m" or "2 mil" → 2000000
-  - "$500k" or "500,000" or "500 thousand" → 500000
-  - "$50,000" or "50000" → 50000
-  - bare integer → use as-is
-  On extraction failure: "Could you share the approximate USD amount? (e.g., $100,000)"
-  Advance to COLLECT_LICENSE
-
-COLLECT_LICENSE
-  Question: "Do you hold a valid pharmaceutical import/distribution license? If yes, please
-  share the license number. (This is optional)"
-  If response contains alphanumeric code (length > 3): license_number = response
-  If response is "no" / "don't have" / "not yet": license_number = None
-  Advance to QUAL_COMPLETE
-
-QUAL_COMPLETE
-  1. Calculate lead_score using calculate_lead_score(session)
-  2. Write Lead to DB
-  3. Set session["lead_qualified"] = True, session["lead_score"] = score
-  4. Clear qual_state from session
-  5. If score > 85 → return next_intent = "escalate"
-     Transition message: "Thank you for the information! Based on your business profile,
-     I'd like to connect you with our Senior Export Manager directly..."
-  6. If score <= 85 → return next_intent = session.pop("pending_intent", "faq")
-     Transition message: "Thank you! I have everything I need. Let me now help with your query..."
-```
-
-### Lead Scoring (EXACT — do not change weights)
-```python
-score = 0
-# Business type (max 30)
-hospital → 30, distributor → 25, pharmacy_chain → 20, pharmacy → 10, other → 5
-
-# Annual volume (max 30)
-≥ $500,000 → 30
-≥ $100,000 → 20
-≥ $25,000  → 10
-< $25,000  → 5
-
-# License present (20)
-license_number is not None → +20
-
-# Country tier (max 20)
-tier1 = [UAE, KSA, Saudi Arabia, Germany, UK, United Kingdom, USA, Singapore, Australia, Canada, France, Netherlands] → +20
-tier2 = [Kenya, Nigeria, Tanzania, Bangladesh, Pakistan, Ghana, Ethiopia, Uganda, South Africa] → +10
-other → +5
-
-# Cap at 100
-return min(score, 100)
-```
+### Buyer templates
+**In hours:** connecting with sales team, 30–60 min ETA, `exports@newlifemedicare.com`  
+**Off hours:** team offline, next open time, query flagged priority
 
 ---
 
-## AGENT 5: ESCALATION AGENT (app/agents/escalation.py)
-Model: None — rule-based
-Side effects: Slack alert, session.human_active = True
+## ROUTER (`app/agents/router.py`)
 
-### Triggers (ANY ONE)
-- HUMAN_KEYWORDS detected (no LLM)
-- Intent confidence < 0.65 (qualified leads only)
-- lead_score > 85 after qualification
-- Complaint/frustration keyword
+**Classifier:** GPT-4o-mini JSON `{intent, confidence}`
 
-### Response Templates
+### Early exits (no LLM)
+- HUMAN_KEYWORDS / speak-to-team phrases → `escalate`
+- Discount request → `escalate` + `escalation_reason=discount_request`
+- Menu button `speak` → `escalate`
 
-IN HOURS:
-```
-I'm connecting you with our sales team right now, {company or ""}!
+### Qualified leads
+- Classifier confidence **< 0.45** → increment `clarification_count`; route FAQ once, escalate on **2nd** low-confidence turn
+- `intent=qualify` from classifier → mapped to `faq` (never re-trap qualified buyers)
 
-Our team will reach out to you directly within the next 30–60 minutes.
-For urgent matters, you can also reach us at exports@newlifemedicare.com
-
-Reference your phone number when contacting us. 🙏
-```
-
-OFF HOURS:
-```
-Thank you for reaching out to New Life Medicare!
-
-Our team is currently offline (Business hours: Mon–Sat, 10 AM – 8 PM IST). Our AI assistant is available 24/7.
-
-Your query has been flagged as a priority and we'll get back to you on {next_business_open}.
-
-For urgent inquiries: exports@newlifemedicare.com
-```
-
-### After sending reply
-- session["human_active"] = True
-- Send Slack alert with: phone (hashed for privacy), company, country, lead_score, reason
-- Save session
+### Unqualified leads
+- `faq` → allowed immediately
+- `pricing` / `order` → `qualify` with `pending_intent`
 
 ---
 
-## GUARDRAILS (app/guardrails/check.py)
+## GUARDRAILS (`app/guardrails/check.py`)
 
-### Pre-LLM Checks (run BEFORE any agent, zero API cost)
-1. Country in SANCTIONED_COUNTRIES → BLOCK
-2. Message contains HARD_BLOCKED_PRODUCTS keywords → BLOCK
+### Pre-LLM (`check_pre_guardrails`)
+1. `session.disqualified` or `lifecycle_stage == disqualified` → block
+2. `session.country` in shipment-excluded list → block
 
-### Post-LLM Checks (run AFTER agent response, catch clinical content)
-1. Response contains BLOCKED_TOPICS words → REPLACE with refusal
+**Removed:** blanket schedule-drug substring pre-filter on inbound messages. Restriction is catalog-level via pricing only.
 
-### Refusal Messages (use these EXACTLY)
-Sanctioned country: "I'm sorry, we're unable to process orders for that destination due to export compliance requirements. Please contact our compliance team directly."
-Restricted product: "I'm unable to assist with that product query through this channel. Please contact our medical compliance team directly."
-Clinical content: "I can't assist with that query. For medical or clinical questions, please consult a qualified healthcare professional."
+`faq_miss_count`, `clarification_count`, and `clarification_attempts` are cleared on human handoff resume, main menu, and order cancel (`clear_human_handoff` / `clear_conversation_counters`).
+
+### Post-LLM (`check_post_guardrails`)
+Blocks **clinical dosing advice**:
+1. Regex: imperative/frequency dosing (e.g. "take 500mg twice daily") — no topic word required
+2. OR `BLOCKED_TOPICS` phrase within ±80 characters of `\d+ mg|ml|mcg`
+
+**Passes:** topic without dose ("prescription required", "side effects include nausea"); product strength only ("Metformin 500mg strips").
+
+### Refusal messages (exact strings in code)
+- **Sanctioned / disqualified:** `REFUSAL_SANCTIONED_COUNTRY`
+- **Restricted product (pricing path):** `REFUSAL_RESTRICTED_PRODUCT` — used when agents/guardrails surface catalog restriction, not pre-filter
+- **Clinical content:** `REFUSAL_CLINICAL_CONTENT`
 
 ### Logging
-Every trigger → GuardrailLog entry in DB.
-message_text field: truncated to 200 chars max.
+Every block → `guardrail_logs` table; `message_text` capped at 200 chars.
 
 ---
 
-## REAL-TIME SCENARIO EXAMPLES
+## ORCHESTRATOR HANDOFFS (`app/orchestrator/graph.py`)
 
-### Scenario A: New buyer asks for price
-Turn 1: "Hi, I need price for Amoxicillin 500mg, 10,000 strips"
-  → session: {} → qualify_agent
-  → Qual asks: company name + country
+| From | Condition | To |
+|------|-----------|-----|
+| `qualify_agent` | `next_intent != continue_qual` | order / pricing / faq / escalate |
+| `faq_agent` | `next_intent == escalate` | `escalation_agent` (FAQ reply cleared) |
+| `router` | `human_active` | `human_active` node |
+| All agents | normal | `post_guardrails` → `send_reply` |
 
-Turn 2: "Al Noor Pharmaceuticals LLC — Dubai, UAE"
-  → qual collects company + country
+---
 
-Turn 3-5: business type, volume, license answers
+## SCENARIO EXAMPLES
 
-Turn 6: QUAL_COMPLETE → lead_score: 75 → qualified → pricing_agent
-  → Pricing Agent queries DB → returns formatted quote using USD per strip from catalog
+### A — New buyer asks price
+Unqualified + pricing intent → qualify (country + biz type) → score → pricing agent with DB tool.
 
-### Scenario B: Multi-turn order placement
-Turn 1: "I want to order"
-  → intent: order → order_agent → asks for product name
+### B — Multi-turn order
+Qualified → order state machine → cart → shipping → confirm → team order alert.
 
-Turn 2: "Metformin 500mg"
-  → validates, saves SKU, asks for quantity
+### C — Hot lead
+Qual complete, score ≥ 80 → escalate + `human_active` + team WhatsApp alert.
 
-Turn 3: "0"
-  → validates: not a positive integer → rejects, asks for a positive number
+### D — FAQ miss loop (fixed)
+Miss 1 → honest no-context + rephrase hint. Miss 2 → escalation handoff only (no duplicate connect copy).
 
-Turn 4: "2000"
-  → valid → saves qty → asks for country
+### E — Restricted product
+Buyer asks price for `is_restricted=True` catalog row → pricing tool returns `product_restricted` → agent refuses export via channel (not pre-guardrail block).
 
-Turn 5-7: country (Kenya), city (Nairobi), contact (Priya Sharma, MedEx)
-
-Turn 8: "T/T advance"
-  → ORDER_COMPLETE → writes to DB → Slack alert → confirmation sent
-
-### Scenario C: Immediate escalation (high value)
-Turn 1-5: Qualification → "NHS Supply Chain — UK" + hospital + $2M volume
-  → lead_score: 92 → ESCALATE
-  → "Connecting you with our Senior Export Manager..."
-  → Slack alert fired
-  → session.human_active = True
+### F — Speak to team
+Keyword/button → router `escalate` → escalation_agent (no classifier call).

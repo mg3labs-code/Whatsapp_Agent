@@ -180,11 +180,21 @@ def should_resume_from_human_handoff(message: str) -> bool:
     return False
 
 
+def clear_conversation_counters(session: dict) -> dict:
+    """Reset FAQ miss and router clarification counters (fresh topic after menu/handoff/cancel)."""
+    session = dict(session or {})
+    session.pop("faq_miss_count", None)
+    session.pop("clarification_count", None)
+    session.pop("clarification_attempts", None)
+    return session
+
+
 def clear_human_handoff(session: dict) -> dict:
+    """Clear team handoff flags and conversation counters (fresh start after resume or menu)."""
     session = dict(session or {})
     session.pop("human_active", None)
     session.pop("escalation_reason", None)
-    return session
+    return clear_conversation_counters(session)
 
 
 def _normalized_message_key(message: str) -> str:

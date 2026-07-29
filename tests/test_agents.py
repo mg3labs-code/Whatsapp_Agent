@@ -242,9 +242,11 @@ async def test_run_faq_agent_missing_keys(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("PINECONE_API_KEY", raising=False)
 
-    out = await run_faq_agent("What are your payment terms?")
+    out, session, intent = await run_faq_agent("What are your payment terms?")
 
     assert out == ERROR_REPLY
+    assert intent == "faq"
+    assert session.get("faq_miss_count") == 1
 
 
 @pytest.mark.asyncio
@@ -268,10 +270,12 @@ async def test_faq_agent_no_context(monkeypatch):
         patch("pinecone.Pinecone", return_value=mock_pc_instance),
         patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
     ):
-        out = await run_faq_agent("Any question", session={"lead_qualified": True})
+        reply, session, intent = await run_faq_agent("Any question", session={"lead_qualified": True})
 
-    assert "connect you" in out.lower()
-    assert out == NO_CONTEXT_REPLY
+    assert "specific information" in reply.lower() or "rephrase" in reply.lower()
+    assert reply == NO_CONTEXT_REPLY
+    assert intent == "faq"
+    assert session.get("faq_miss_count") == 1
     mock_client.chat.completions.create.assert_not_called()
 
 
@@ -304,16 +308,113 @@ async def test_faq_agent_with_context(monkeypatch):
         patch("pinecone.Pinecone", return_value=mock_pc_instance),
         patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
     ):
-        out = await run_faq_agent("Do you export to Kenya?")
+        reply, session, intent = await run_faq_agent("Do you export to Kenya?")
 
-    assert isinstance(out, str)
-    assert len(out) > 0
+    assert isinstance(reply, str)
+    assert len(reply) > 0
+    assert intent == "faq"
+    assert session.get("faq_miss_count", 0) == 0
     mock_client.chat.completions.create.assert_awaited_once()
     call_kw = mock_client.chat.completions.create.await_args
     assert call_kw.kwargs["model"] == "gpt-4o-mini"
     messages = call_kw.kwargs["messages"]
     assert messages[0]["content"] == FAQ_SYSTEM_PROMPT
     assert "We ship worldwide" in messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_faq_agent_second_miss_escalates(monkeypatch):
+    """Two consecutive no-context FAQ turns → escalate intent with reason set."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+
+    mock_index = MagicMock()
+    mock_index.query.return_value = MagicMock(matches=[])
+    mock_pc_instance = MagicMock()
+    mock_pc_instance.Index.return_value = mock_index
+
+    mock_emb = MagicMock()
+    mock_emb.data = [MagicMock(embedding=[0.01] * 8)]
+
+    mock_client = MagicMock()
+    mock_client.embeddings.create = AsyncMock(return_value=mock_emb)
+
+    with (
+        patch("pinecone.Pinecone", return_value=mock_pc_instance),
+        patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
+    ):
+        session = {"lead_qualified": True, "faq_miss_count": 1}
+        reply, session, intent = await run_faq_agent("Still unknown question", session=session)
+
+    assert reply == ""
+    assert intent == "escalate"
+    assert session.get("faq_miss_count", 0) == 0
+    assert session.get("escalation_reason") == "faq_no_match_repeated"
+    mock_client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_faq_agent_error_counts_toward_miss(monkeypatch):
+    """Infra/API failures increment the same miss counter as no-context."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+
+    mock_client = MagicMock()
+    mock_client.embeddings.create = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch("app.agents.faq.get_async_openai_client", return_value=mock_client):
+        session = {"lead_qualified": True, "faq_miss_count": 1}
+        reply, session, intent = await run_faq_agent("Any question", session=session)
+
+    assert reply == ""
+    assert intent == "escalate"
+    assert session.get("escalation_reason") == "faq_no_match_repeated"
+
+
+@pytest.mark.asyncio
+async def test_faq_agent_soft_llm_no_answer_counts_as_miss(monkeypatch):
+    """Chunks found but LLM admits no answer → miss counter, not a reset."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+
+    mock_index = MagicMock()
+    mock_index.query.return_value = MagicMock(
+        matches=[MagicMock(score=0.91, metadata={"text": "Unrelated chunk."})]
+    )
+    mock_pc_instance = MagicMock()
+    mock_pc_instance.Index.return_value = mock_index
+
+    mock_emb = MagicMock()
+    mock_emb.data = [MagicMock(embedding=[0.02] * 8)]
+
+    mock_chat = MagicMock()
+    mock_chat.choices = [
+        MagicMock(
+            message=MagicMock(
+                content=(
+                    "I don't have specific information on that in our knowledge base. "
+                    "Could you rephrase, or type *speak to team* if you'd like a specialist?"
+                )
+            )
+        )
+    ]
+
+    mock_client = MagicMock()
+    mock_client.embeddings.create = AsyncMock(return_value=mock_emb)
+    mock_client.chat.completions.create = AsyncMock(return_value=mock_chat)
+
+    with (
+        patch("pinecone.Pinecone", return_value=mock_pc_instance),
+        patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
+    ):
+        reply, session, intent = await run_faq_agent(
+            "obscure question",
+            session={"lead_qualified": True},
+        )
+
+    assert reply == NO_CONTEXT_REPLY
+    assert intent == "faq"
+    assert session.get("faq_miss_count") == 1
 
 
 @pytest.fixture
@@ -930,10 +1031,11 @@ async def test_faq_agent_no_context_returns_escalation_without_qualification(mon
         patch("pinecone.Pinecone", return_value=mock_pc_instance),
         patch("app.agents.faq.get_async_openai_client", return_value=mock_client),
     ):
-        out = await run_faq_agent("i need medicines", session={})
+        reply, session, intent = await run_faq_agent("i need medicines", session={})
 
-    assert out == NO_CONTEXT_REPLY or "connect you" in out.lower()
-    assert "quick details" not in out.lower()
+    assert reply == NO_CONTEXT_REPLY or "rephrase" in reply.lower() or "speak to team" in reply.lower()
+    assert intent == "faq"
+    assert "quick details" not in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -1026,8 +1128,8 @@ async def test_qualification_high_score_escalates(qual_db):
 
 
 @pytest.mark.asyncio
-async def test_pricing_agent_asks_for_company(monkeypatch, pricing_db):
-    """Session missing company → model may reply without tool; expect company ask."""
+async def test_pricing_agent_uses_country_context(monkeypatch, pricing_db):
+    """Pricing prompt includes country from session; no company field."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
 
     mock_response = MagicMock()
@@ -1035,10 +1137,7 @@ async def test_pricing_agent_asks_for_company(monkeypatch, pricing_db):
         MagicMock(
             message=MagicMock(
                 tool_calls=None,
-                content=(
-                    "I'd be happy to help with pricing. Could you please share your "
-                    "*company name* and country so I can prepare an accurate quote?"
-                ),
+                content="Quote for Amoxicillin 5000 units to India: contact export team.",
             )
         )
     ]
@@ -1046,6 +1145,14 @@ async def test_pricing_agent_asks_for_company(monkeypatch, pricing_db):
     mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
     with patch("app.agents.pricing.get_async_openai_client", return_value=mock_client):
-        out = await run_pricing_agent("price for amoxicillin 5000 units", {}, pricing_db)
+        out = await run_pricing_agent(
+            "price for amoxicillin 5000 units",
+            {"country": "India"},
+            pricing_db,
+        )
 
-    assert "company" in out.lower()
+    assert "export team" in out.lower()
+    call_kwargs = mock_client.chat.completions.create.await_args.kwargs
+    user_content = call_kwargs["messages"][1]["content"]
+    assert "Country: India" in user_content
+    assert "Company:" not in user_content

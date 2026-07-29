@@ -1,141 +1,157 @@
 # WASA Architecture Reference
 # WhatsApp AI Sales Agent — New Life Medicare
 
-## FULL MESSAGE PIPELINE (Every message goes through this exact sequence)
+This document reflects the **live codebase** (`app/orchestrator/graph.py`, agents, guardrails). When in doubt, trust the code.
+
+## FULL MESSAGE PIPELINE
 
 ```
 WhatsApp Buyer
      │
      ▼
-Meta Cloud API v18
+Meta Cloud API
      │  POST /webhook (JSON payload)
      ▼
-FastAPI Webhook Handler
-     │  Return HTTP 200 INSTANTLY
-     │  Then: BackgroundTasks.add_task(process_message)
+FastAPI webhook handler (app/webhook/router.py)
+     │  Return HTTP 200 immediately
+     │  BackgroundTasks → process_message
      ▼
-parse_meta_payload()
-     │  Extract: phone, text, message_id
-     │  If None (status update, not a message) → DROP SILENTLY
+parse_meta_payload() → phone, text, message_id
+     │  Status-only payloads → drop
      ▼
 Deduplication (Redis)
-     │  SISMEMBER wasa:processed_ids message_id
-     │  If exists → DROP SILENTLY (prevent double-processing on Meta retries)
-     │  If new → SADD (24h TTL)
+     │  wasa:processed_ids — drop retries
      ▼
 LangGraph compiled_graph.ainvoke(state)
      │
-     ├── Node 1: load_session_node
-     │     Redis GET session:{phone} → state.session (dict, default {})
+     ├── load_session_node
+     │     Redis GET session:{phone}; hydrate from Postgres if needed
      │
-     ├── Node 2: pre_guardrails_node (NO LLM — pure rule check)
-     │     Check: state.session["country"] in SANCTIONED_COUNTRIES → BLOCK
-     │     Check: state.message contains HARD_BLOCKED_PRODUCTS → BLOCK
-     │     If blocked: state.guardrail_blocked=True, state.final_reply=refusal, log to DB
+     ├── greeting_node
+     │     First visit: session.greeted = True → welcome/disclosure on send
      │
-     ├── Node 3: router_node (GPT-4o-mini for classification)
-     │     Step 1: HUMAN_KEYWORDS check → "escalate" (no LLM)
-     │     Step 2: Off-hours check → immediate off_hours response
-     │     Step 3: LLM intent classification (JSON mode)
-     │     Step 4: New lead + pricing/order intent → override to "qualify"
-     │     Step 5: Confidence < 0.65 → override to "escalate"
+     ├── pre_guardrails_node (no LLM)
+     │     check_pre_guardrails(message, session)
+     │     Blocks: disqualified lead, shipment-excluded country in session
+     │     If blocked → final_reply = refusal, log guardrail_logs → send_reply
      │
-     ├── Conditional routing (route_to_agent function)
-     │     guardrail_blocked=True → send_reply
-     │     session.human_active=True → human_active (no-op → END)
-     │     intent=pricing → pricing_agent_node
-     │     intent=faq → faq_agent_node
-     │     intent=order → order_agent_node
-     │     intent=qualify → qualify_agent_node
-     │     intent=escalate → escalation_agent_node
+     ├── router_node
+     │     human_active + resume phrase → clear handoff
+     │     disqualified session → intent escalate
+     │     main menu / order mid-flow / qual mid-flow overrides
+     │     else classify_intent() (GPT-4o-mini JSON + rules)
      │
-     ├── [One of 5 agent nodes executes]
-     │     Sets: state.agent_response = reply string
-     │     Sets: state.session = updated session dict
+     ├── Conditional routing (_route_to_agent)
+     │     guardrail_blocked → send_reply
+     │     human_active → human_active node
+     │     intent → pricing | faq | order | qualify | escalate | menu_refresh
      │
-     ├── Node: post_guardrails_node (LLM response safety check)
-     │     Check: state.agent_response contains BLOCKED_TOPICS → replace with refusal
-     │     Otherwise: state.final_reply = state.agent_response
+     ├── [Agent node]
+     │     Sets agent_response + updated session
+     │     qualify / faq may set intent for same-turn handoff
      │
-     └── Node: send_reply_node
-           send_message(phone, final_reply) → Meta Cloud API
-           save_session(phone, session) → Redis (24h TTL)
+     ├── qualify_agent → post_guardrails OR re-route to order/pricing/faq/escalate
+     ├── faq_agent → post_guardrails OR escalation_agent (2nd consecutive miss)
+     ├── pricing/order/escalation → post_guardrails
+     │
+     ├── post_guardrails_node
+     │     check_post_guardrails(agent_response) — clinical dosing rules
+     │     Blocked → final_reply = refusal; else final_reply = agent_response
+     │
+     └── send_reply_node
+           send_message(phone, final_reply)
+           save_session(phone, session) → Redis
+           persist conversation summaries → Postgres
            → END
+
+human_active node → sends hold + Continue with Bot buttons → END (no agent)
+menu_refresh → resend main menu → send_reply
 ```
 
 ## AGENT RESPONSIBILITIES
 
-| Agent | Intent | LLM | Key Data Source | Multi-turn |
-|-------|--------|-----|-----------------|------------|
-| Pricing | pricing | GPT-4o (tool calling) | PostgreSQL products table | No |
-| FAQ/RAG | faq | GPT-4o-mini | Pinecone vector index | No |
-| Order | order | None (rule-based) | PostgreSQL orders table | Yes (6 steps) |
-| Qualification | qualify | None (rule-based) | PostgreSQL leads table | Yes (5 steps) |
-| Escalation | escalate | None | Slack, Meta Business Inbox | No |
+| Agent | Intent | LLM | Data source | Multi-turn |
+|-------|--------|-----|-------------|------------|
+| Pricing | pricing | GPT-4o (tool calling) | PostgreSQL `products` | No |
+| FAQ/RAG | faq | GPT-4o-mini | Pinecone `wasa-faq` | No (miss counter in session) |
+| Order | order | GPT-4o-mini optional (`ORDER_AGENT_USE_LLM`); rule fallback | PostgreSQL orders/products/shipping | Yes |
+| Qualification | qualify | None (rule-based + UI lists) | PostgreSQL `leads` | Yes (2 steps) |
+| Escalation | escalate | None | WhatsApp team alerts | No |
+
+## TEAM ALERTS
+
+Escalations and new leads → **WhatsApp DMs** to `LEADS_ALERT_PHONE_NUMBERS` (fallback: `ESCALATION_PHONE_NUMBERS`).
+
+New orders → `ORDER_ALERT_PHONE_NUMBERS`.
+
+Implementation: `app/integrations/alerts.py` (not Slack).
 
 ## SESSION SCHEMA (Redis JSON, 24h TTL)
+
+Key fields (not exhaustive):
 
 ```json
 {
   "lead_qualified": true,
   "lead_score": 75,
-  "company": "Al Noor Pharmaceuticals LLC",
-  "country": "UAE",
+  "lead_category": "warm",
+  "company": "Acme Pharma",
+  "country": "Kenya",
   "business_type": "distributor",
-  "annual_volume_usd": 300000,
-  "license_number": "UAE-MOHAP-2024-0491",
+  "buyer_type": "distributor",
   "human_active": false,
+  "escalation_reason": null,
+  "faq_miss_count": 0,
+  "clarification_count": 0,
   "pending_intent": "pricing",
-
-  "qual_state": "QUAL_COMPLETE",
-
-  "order_state": "COLLECT_QTY",
-  "order_sku": "AMX-500-10",
-  "order_product_name": "Amoxicillin 500mg",
-  "order_qty": null,
-  "order_country": null,
-  "order_city": null,
-  "order_contact": null,
-  "order_payment": null
+  "pending_query": "price for metformin",
+  "qual_state": "COLLECT_BIZ_TYPE",
+  "order_state": "COLLECT_SKU",
+  "order_cart": [],
+  "greeted": true,
+  "last_agent": "faq"
 }
 ```
 
-## ESCALATION TRIGGERS (ANY ONE → escalation_agent)
+## ESCALATION TRIGGERS (→ escalation_agent)
 
-1. HUMAN_KEYWORDS in message (keyword list, no LLM)
-2. Intent classification confidence < 0.65 (for qualified leads only)
-3. Lead score > 85 immediately after qualification
-4. session.human_active = True (silently drop — no reply at all)
-5. FAQ agent returns no relevant context (redirected internally)
+1. **Speak to team** / HUMAN_KEYWORDS / discount request (`router.classify_intent`)
+2. **FAQ 2nd consecutive miss** — no Pinecone chunks, soft LLM no-answer, empty reply, or infra error (`faq_no_match_repeated`)
+3. **Qualified lead, classifier confidence < 0.45** twice in a row (`clarification_count` ≥ 2)
+4. **Hot lead** after qualification — `lead_score >= 80` (`HOT_LEAD_MIN_SCORE`)
+5. **Manual review** or **disqualified** paths from qualification scoring
+6. **Excluded country** during qualification
+7. **Disqualified session** re-contact (`router` → escalate)
+
+When `human_active=True`, router sends to **human_active** node (hold message + resume buttons), not silent drop.
 
 ## OFF-HOURS BEHAVIOR
 
-- business_hours: Mon–Sat, 10:00–20:00 IST (configurable via env); Sunday limited; AI 24/7
-- If message received outside hours:
-  1. Do NOT run any agent
-  2. Reply with: off-hours message + next business open time
-  3. Fire Slack alert to sales team (they may choose to respond manually)
-  4. Do NOT set human_active (AI resumes next business day automatically)
+- Business hours: Mon–Sat **10:00–20:00 IST** (env: `BUSINESS_HOURS_START`, `BUSINESS_HOURS_END`, `BUSINESS_TIMEZONE`)
+- **Agents still run** 24/7; only the **escalation buyer copy** changes off-hours
+- Off-hours escalation: offline message + priority flag; still sets `human_active=True` and sends WhatsApp team alert
 
-## RAILWAY DEPLOYMENT ARCHITECTURE
+## GUARDRAILS (summary)
+
+**Pre-LLM** (`check_pre_guardrails`):
+- Disqualified lead
+- Shipment-excluded country in session
+
+**Not pre-blocked at conversation level:** schedule drug names in free text. Restricted products are enforced per catalog row in **pricing** (`is_restricted` / `product_restricted`).
+
+**Post-LLM** (`check_post_guardrails`):
+- Imperative/frequency dosing (e.g. "take 500mg twice daily")
+- OR `BLOCKED_TOPICS` phrase within ±80 chars of `\d+ mg|ml|mcg`
+- Topic words alone (e.g. "prescription required", "side effects") **pass**
+- Catalog strengths alone (e.g. "Metformin 500mg strips") **pass**
+
+## DEPLOYMENT (Railway)
 
 ```
-GitHub (main branch)
-     │ auto-deploy on push
-     ▼
-Railway Service (FastAPI)
-     │ DATABASE_URL from Railway env
-     ├── PostgreSQL Service (Railway managed)
-     │     tables: products, leads, orders, guardrail_logs
-     │
-     │ REDIS_URL from env (external)
-     ├── Upstash Redis (external managed)
-     │     keys: session:{phone}, wasa:processed_ids
-     │
-     │ Pinecone (external)
-     └── Vector index: wasa-faq (1536 dims, cosine)
-
-Meta Cloud API ←→ Railway Service (/webhook endpoint)
-Langfuse ← Railway Service (traces all LLM calls)
-Slack ← Railway Service (escalation + order alerts)
+GitHub → Railway (FastAPI)
+  ├── PostgreSQL (products, leads, orders, guardrail_logs, conversations)
+  ├── Redis / Upstash (sessions, dedup)
+  ├── Pinecone (wasa-faq index)
+  └── Meta WhatsApp Cloud API webhook
+Langfuse — LLM tracing (optional)
 ```

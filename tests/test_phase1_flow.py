@@ -274,12 +274,16 @@ async def test_order_cancel_from_collect_qty(order_db, monkeypatch):
         "order_state": COLLECT_QTY,
         "order_product_name": "JGLUT 2000MG 30ML",
         "order_sku": "PROD-1",
+        "faq_miss_count": 1,
+        "clarification_count": 1,
     }
 
     reply, session = await run_order_agent("cancel", session, order_db)
     assert session.get("order_state") is None
     assert session.get("order_product_name") is None
     assert session.get("show_main_menu_after_reply") is True
+    assert "faq_miss_count" not in session
+    assert "clarification_count" not in session
     assert "order cancelled" in reply.lower()
 
 

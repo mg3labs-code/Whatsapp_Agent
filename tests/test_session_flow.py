@@ -22,9 +22,20 @@ def test_should_not_resume_on_speak():
 
 
 def test_clear_human_handoff():
-    session = clear_human_handoff({"human_active": True, "escalation_reason": "hot_lead"})
+    session = clear_human_handoff(
+        {
+            "human_active": True,
+            "escalation_reason": "hot_lead",
+            "faq_miss_count": 2,
+            "clarification_count": 1,
+            "clarification_attempts": 1,
+        }
+    )
     assert "human_active" not in session
     assert "escalation_reason" not in session
+    assert "faq_miss_count" not in session
+    assert "clarification_count" not in session
+    assert "clarification_attempts" not in session
 
 
 def test_is_order_cancel_request_phrases():

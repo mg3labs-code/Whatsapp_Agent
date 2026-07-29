@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from unittest.mock import AsyncMock
 
 from app.db.models import Base, Order, Product
+from app.agents.faq import NO_CONTEXT_REPLY
 from app.orchestrator import graph as graph_mod
 from app.session import manager as session_manager
 
@@ -104,10 +105,10 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
 
 @pytest.mark.asyncio
 async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
-    async def fake_run(message: str, phone: str = "", session: dict | None = None) -> str:
+    async def fake_run(message: str, phone: str = "", session: dict | None = None):
         assert message == "what documents"
         assert phone == "+1"
-        return "FAQ_REPLY"
+        return "FAQ_REPLY", dict(session or {}), "faq"
 
     monkeypatch.setattr(graph_mod, "run_faq_agent", fake_run)
     state: graph_mod.MessageState = {
@@ -125,6 +126,58 @@ async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
         "agent_response": "FAQ_REPLY",
         "session": {"phone": "+1", "last_agent": "faq"},
     }
+
+
+@pytest.mark.asyncio
+async def test_faq_agent_node_escalates_on_repeated_miss(monkeypatch):
+    async def fake_run(message: str, phone: str = "", session: dict | None = None):
+        updated = dict(session or {})
+        updated["escalation_reason"] = "faq_no_match_repeated"
+        return "", updated, "escalate"
+
+    monkeypatch.setattr(graph_mod, "run_faq_agent", fake_run)
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "obscure question",
+        "message_id": "x",
+        "session": {"faq_miss_count": 1},
+        "intent": "faq",
+        "agent_response": None,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    out = await graph_mod.faq_agent_node(state)
+    assert out["intent"] == "escalate"
+    assert out["agent_response"] == ""
+    assert out["session"]["escalation_reason"] == "faq_no_match_repeated"
+
+
+def test_route_after_faq_escalates():
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "unknown",
+        "message_id": "x",
+        "session": {},
+        "intent": "escalate",
+        "agent_response": NO_CONTEXT_REPLY,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    assert graph_mod._after_faq(state) == "escalate"
+
+
+def test_route_after_faq_continues_to_post_guardrails():
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "unknown",
+        "message_id": "x",
+        "session": {},
+        "intent": "faq",
+        "agent_response": NO_CONTEXT_REPLY,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    assert graph_mod._after_faq(state) == "post_guardrails"
 
 
 @pytest.mark.asyncio

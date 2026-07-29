@@ -324,12 +324,19 @@ async def faq_agent_node(state: MessageState) -> dict:
     if state.get("phone") and not session.get("phone"):
         session["phone"] = state["phone"]
     session["last_agent"] = "faq"
-    reply = await run_faq_agent(
+    reply, updated_session, next_intent = await run_faq_agent(
         state["message"],
         phone=state.get("phone") or "",
         session=session,
     )
-    return {"agent_response": _merge_prior_reply(state, reply), "session": session}
+    result: dict = {"session": updated_session}
+    if next_intent == "escalate":
+        # Escalation agent owns the buyer-facing copy (avoid duplicate "connect you").
+        result["intent"] = "escalate"
+        result["agent_response"] = ""
+    else:
+        result["agent_response"] = _merge_prior_reply(state, reply)
+    return result
 
 
 async def order_agent_node(state: MessageState) -> dict:
@@ -523,6 +530,12 @@ def _route_after_qualify(state: MessageState) -> str:
     return _after_qualify(state)
 
 
+def _after_faq(state: MessageState) -> str:
+    if state.get("intent") == "escalate":
+        return "escalate"
+    return "post_guardrails"
+
+
 def _route_to_agent(state: MessageState) -> str:
     if state.get("guardrail_blocked"):
         return "send_reply"
@@ -593,7 +606,16 @@ def _build_graph():
         },
     )
 
-    for agent_node in ("pricing_agent", "faq_agent", "order_agent", "escalation_agent"):
+    graph.add_conditional_edges(
+        "faq_agent",
+        _after_faq,
+        {
+            "post_guardrails": "post_guardrails",
+            "escalate": "escalation_agent",
+        },
+    )
+
+    for agent_node in ("pricing_agent", "order_agent", "escalation_agent"):
         graph.add_edge(agent_node, "post_guardrails")
 
     graph.add_edge("post_guardrails", "send_reply")
