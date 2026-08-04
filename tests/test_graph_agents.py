@@ -9,8 +9,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from unittest.mock import AsyncMock
-
 from app.db.models import Base, Order, Product
 from app.agents.faq import NO_CONTEXT_REPLY
 from app.orchestrator import graph as graph_mod
@@ -69,7 +67,7 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
         assert message == "hi"
         assert session == {"company": "Acme", "phone": "+1", "last_agent": "pricing"}
         assert db is mock_db
-        return "PRICE_REPLY"
+        return "PRICE_REPLY", session, "pricing"
 
     mock_db = MagicMock()
 
@@ -84,6 +82,8 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
 
     monkeypatch.setattr(graph_mod, "_get_db_generator", mock_factory)
     monkeypatch.setattr(graph_mod, "run_pricing_agent", fake_run)
+    interim = AsyncMock(return_value=True)
+    monkeypatch.setattr(graph_mod, "send_message", interim)
 
     state: graph_mod.MessageState = {
         "phone": "+1",
@@ -101,6 +101,7 @@ async def test_pricing_agent_node_calls_run_pricing_agent_and_closes_gen(monkeyp
         "session": {"company": "Acme", "phone": "+1", "last_agent": "pricing"},
     }
     assert closed == ["gen_finally"]
+    interim.assert_awaited_once_with("+1", "One moment, checking that for you...")
 
 
 @pytest.mark.asyncio
@@ -111,6 +112,8 @@ async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
         return "FAQ_REPLY", dict(session or {}), "faq"
 
     monkeypatch.setattr(graph_mod, "run_faq_agent", fake_run)
+    interim = AsyncMock(return_value=True)
+    monkeypatch.setattr(graph_mod, "send_message", interim)
     state: graph_mod.MessageState = {
         "phone": "+1",
         "message": "what documents",
@@ -126,6 +129,7 @@ async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
         "agent_response": "FAQ_REPLY",
         "session": {"phone": "+1", "last_agent": "faq"},
     }
+    interim.assert_awaited_once_with("+1", "One moment, checking that for you...")
 
 
 @pytest.mark.asyncio
@@ -136,6 +140,7 @@ async def test_faq_agent_node_escalates_on_repeated_miss(monkeypatch):
         return "", updated, "escalate"
 
     monkeypatch.setattr(graph_mod, "run_faq_agent", fake_run)
+    monkeypatch.setattr(graph_mod, "send_message", AsyncMock(return_value=True))
     state: graph_mod.MessageState = {
         "phone": "+1",
         "message": "obscure question",
@@ -152,6 +157,43 @@ async def test_faq_agent_node_escalates_on_repeated_miss(monkeypatch):
     assert out["session"]["escalation_reason"] == "faq_no_match_repeated"
 
 
+@pytest.mark.asyncio
+async def test_pricing_agent_node_escalates_on_repeated_miss(monkeypatch):
+    async def fake_run(message: str, session: dict, db):
+        updated = dict(session or {})
+        updated["escalation_reason"] = "pricing_no_match_repeated"
+        return "", updated, "escalate"
+
+    mock_db = MagicMock()
+
+    def mock_factory():
+        def mock_get_db():
+            try:
+                yield mock_db
+            finally:
+                pass
+
+        return mock_get_db()
+
+    monkeypatch.setattr(graph_mod, "_get_db_generator", mock_factory)
+    monkeypatch.setattr(graph_mod, "run_pricing_agent", fake_run)
+    monkeypatch.setattr(graph_mod, "send_message", AsyncMock(return_value=True))
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "unknown drug",
+        "message_id": "x",
+        "session": {"pricing_miss_count": 1},
+        "intent": "pricing",
+        "agent_response": None,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    out = await graph_mod.pricing_agent_node(state)
+    assert out["intent"] == "escalate"
+    assert out["agent_response"] == ""
+    assert out["session"]["escalation_reason"] == "pricing_no_match_repeated"
+
+
 def test_route_after_faq_escalates():
     state: graph_mod.MessageState = {
         "phone": "+1",
@@ -164,6 +206,20 @@ def test_route_after_faq_escalates():
         "final_reply": None,
     }
     assert graph_mod._after_faq(state) == "escalate"
+
+
+def test_route_after_pricing_escalates():
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "unknown",
+        "message_id": "x",
+        "session": {},
+        "intent": "escalate",
+        "agent_response": "",
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    assert graph_mod._after_pricing(state) == "escalate"
 
 
 def test_route_after_faq_continues_to_post_guardrails():

@@ -52,7 +52,8 @@ LangGraph compiled_graph.ainvoke(state)
      │
      ├── qualify_agent → post_guardrails OR re-route to order/pricing/faq/escalate
      ├── faq_agent → post_guardrails OR escalation_agent (2nd consecutive miss)
-     ├── pricing/order/escalation → post_guardrails
+     ├── pricing_agent → post_guardrails OR escalate (repeated catalog miss)
+     ├── order/escalation → post_guardrails
      │
      ├── post_guardrails_node
      │     check_post_guardrails(agent_response) — clinical dosing rules
@@ -102,6 +103,7 @@ Key fields (not exhaustive):
   "human_active": false,
   "escalation_reason": null,
   "faq_miss_count": 0,
+  "pricing_miss_count": 0,
   "clarification_count": 0,
   "pending_intent": "pricing",
   "pending_query": "price for metformin",
@@ -117,6 +119,7 @@ Key fields (not exhaustive):
 
 1. **Speak to team** / HUMAN_KEYWORDS / discount request (`router.classify_intent`)
 2. **FAQ 2nd consecutive miss** — no Pinecone chunks, soft LLM no-answer, empty reply, or infra error (`faq_no_match_repeated`)
+2b. **Pricing 2nd consecutive catalog miss** — product not found after suggestions (`pricing_no_match_repeated`)
 3. **Qualified lead, classifier confidence < 0.45** twice in a row (`clarification_count` ≥ 2)
 4. **Hot lead** after qualification — `lead_score >= 80` (`HOT_LEAD_MIN_SCORE`)
 5. **Manual review** or **disqualified** paths from qualification scoring
@@ -137,7 +140,9 @@ When `human_active=True`, router sends to **human_active** node (hold message + 
 - Disqualified lead
 - Shipment-excluded country in session
 
-**Not pre-blocked at conversation level:** schedule drug names in free text. Restricted products are enforced per catalog row in **pricing** (`is_restricted` / `product_restricted`).
+Restricted products are enforced with two layers:
+- **pre-check list** (`restricted_terms`) loaded from client schedule workbook, applied before catalog matching, and
+- **catalog flags** (`products.is_restricted`) for rows that exist in sellable catalog data.
 
 **Post-LLM** (`check_post_guardrails`):
 - Imperative/frequency dosing (e.g. "take 500mg twice daily")

@@ -9,6 +9,36 @@ from app.integrations import alerts as alerts_mod
 
 
 @pytest.mark.asyncio
+async def test_run_escalation_agent_uses_queued_buyer_reply(monkeypatch):
+    alerts: list[tuple] = []
+
+    async def capture_alert(phone, session, reason):
+        alerts.append((phone, session, reason))
+        return True
+
+    monkeypatch.setattr(escalation_mod, "is_business_hours", lambda: True)
+    monkeypatch.setattr(escalation_mod, "send_escalation_alert", capture_alert)
+
+    reply, session = await escalation_mod.run_escalation_agent(
+        "ignored",
+        {
+            "phone": "+91999",
+            "escalation_buyer_reply": (
+                "Compliance copy only — no sales SLA stack."
+            ),
+        },
+        "disqualified",
+        phone="+91999",
+    )
+
+    assert reply == "Compliance copy only — no sales SLA stack."
+    assert "escalation_buyer_reply" not in session
+    assert session["escalation_reason"] == "disqualified"
+    assert "connecting you with our sales team" not in reply.lower()
+    assert alerts == [("+91999", session, "disqualified")]
+
+
+@pytest.mark.asyncio
 async def test_run_escalation_agent_in_hours_sets_human_active(monkeypatch):
     alerts: list[tuple] = []
 
@@ -27,10 +57,29 @@ async def test_run_escalation_agent_in_hours_sets_human_active(monkeypatch):
     )
 
     assert session["human_active"] is True
-    assert "connecting you with our sales team" in reply.lower()
+    assert "connecting you with our export team" in reply.lower()
     assert "Acme Pharma" in reply
-    assert "30–60 minutes" in reply
+    assert "30–60 minutes" not in reply
+    assert "follow up" in reply.lower() or "soon" in reply.lower()
     assert alerts == [("+91999", session, "human_keywords")]
+
+
+@pytest.mark.asyncio
+async def test_run_escalation_compliance_does_not_set_human_active(monkeypatch):
+    monkeypatch.setattr(
+        escalation_mod,
+        "send_escalation_alert",
+        AsyncMock(return_value=True),
+    )
+    reply, session = await escalation_mod.run_escalation_agent(
+        "Iran",
+        {"disqualified": True, "country": "Iran"},
+        "disqualified",
+        phone="+91999",
+    )
+    assert session.get("human_active") is not True
+    assert session.get("compliance_locked") is True
+    assert "compliance" in reply.lower() or "unable" in reply.lower()
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from app.agents.lead_scoring import (
     map_business_type_to_buyer_type,
     score_lead,
 )
+from app.agents.escalation import SESSION_ESCALATION_BUYER_REPLY
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
     classify_country,
@@ -31,6 +32,7 @@ from app.integrations.whatsapp import send_interactive_list
 from app.messages.conversation_ui import MAIN_MENU_ID, MENU_OPTION_IDS, send_main_menu_list
 from app.messages.onboarding import (
     COUNTRY_BUTTON_IDS,
+    ORDER_START_PROMPT,
     SESSION_AWAITING_CUSTOM_COUNTRY,
     country_prompt,
     custom_country_prompt,
@@ -90,11 +92,12 @@ _QUAL_COMPLETE_BUTTONS = [
 _PENDING_INTENT_HANDOFF: dict[str, str] = {
     "order": (
         "Thank you! ✅ You're all set.\n\n"
-        "Which product(s) would you like to order? Share product names or SKUs."
+        f"{ORDER_START_PROMPT}"
     ),
     "pricing": (
         "Thank you! ✅ You're all set.\n\n"
-        "Please share the product name and quantity you need a quote for."
+        "Share a *product name* for a USD *per strip* quote.\n"
+        "Quantity is optional — only if you want a line total."
     ),
 }
 
@@ -214,7 +217,11 @@ async def run_qualification_agent(
     phone = session.get("phone") or ""
 
     if is_session_disqualified(session):
-        return SHIPMENT_EXCLUDED_REFUSAL, session, "escalate"
+        return await _queue_escalate(
+            session,
+            "disqualified",
+            SHIPMENT_EXCLUDED_REFUSAL,
+        )
 
     state = _normalize_qual_state(session.get("qual_state"))
     session["qual_state"] = state
@@ -309,8 +316,9 @@ async def _finalize_country(
                 "Lead upsert after excluded country failed user_ref=%s",
                 user_ref(session.get("phone") or phone),
             )
-        session = await _apply_escalation_handoff(session, "excluded_country")
-        return SHIPMENT_EXCLUDED_REFUSAL, session, "escalate"
+        return await _queue_escalate(
+            session, "excluded_country", SHIPMENT_EXCLUDED_REFUSAL
+        )
 
     session["country"] = country
     session["qual_state"] = COLLECT_BIZ_TYPE
@@ -372,8 +380,21 @@ async def _handle_collect_biz_type(
     )
 
 
+async def _queue_escalate(
+    session: dict, reason: str, buyer_reply: str
+) -> tuple[str, dict, str]:
+    """Queue one buyer message for escalation_agent (alert + copy happen there once)."""
+    session["escalation_reason"] = reason
+    session[SESSION_ESCALATION_BUYER_REPLY] = buyer_reply
+    return "", session, "escalate"
+
+
 async def _apply_escalation_handoff(session: dict, reason: str) -> dict:
-    """Mark human takeover and notify leads team (WhatsApp DMs)."""
+    """Mark human takeover and notify leads team (WhatsApp DMs).
+
+    Prefer routing through escalation_agent for buyer copy. Kept for paths that
+    already set human_active before returning escalate (legacy callers).
+    """
     session["human_active"] = True
     session["escalation_reason"] = reason
     phone = session.get("phone") or ""
@@ -413,29 +434,36 @@ async def _handle_qual_complete(
                 "Lead upsert after score disqualify failed user_ref=%s",
                 user_ref(phone),
             )
-        reply = (
-            "Thank you for your interest. We're unable to process this request through "
-            "our automated channel due to export compliance requirements. "
-            "Our compliance team will review and contact you if applicable."
+        return await _queue_escalate(
+            session,
+            "disqualified",
+            (
+                "Thank you for your interest. We're unable to process this request through "
+                "our automated channel due to export compliance requirements. "
+                "Our compliance team has been notified and will follow up if applicable."
+            ),
         )
-        return reply, session, "escalate"
 
     if result.manual_review_only:
-        reply = (
-            "Thank you for the details. Your enquiry requires a compliance review by "
-            "our specialist team. We'll contact you shortly."
+        return await _queue_escalate(
+            session,
+            "manual_review",
+            (
+                "Thank you for the details. Your enquiry needs a compliance review. "
+                "Our team has been notified and will follow up with you."
+            ),
         )
-        session = await _apply_escalation_handoff(session, "manual_review")
-        return reply, session, "escalate"
 
-    if result.score >= HOT_LEAD_MIN_SCORE:
-        reply = (
-            "Thank you for the information! Based on your business profile, "
-            "I'd like to connect you with our Senior Export Manager directly. "
-            "They'll reach out to you shortly."
-        )
-        session = await _apply_escalation_handoff(session, "hot_lead")
-        return reply, session, "escalate"
+    # Hot leads: alert the export desk once, but keep full bot services available.
+    if result.score >= HOT_LEAD_MIN_SCORE and not session.get("_hot_lead_alerted"):
+        try:
+            await send_escalation_alert(phone or "unknown", session, "hot_lead")
+            session["_hot_lead_alerted"] = True
+        except Exception:
+            logger.exception(
+                "Hot lead alert failed user_ref=%s",
+                user_ref(phone),
+            )
 
     pending_query = session.pop("pending_query", None)
     pending = session.pop("pending_intent", None)

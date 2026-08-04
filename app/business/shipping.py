@@ -400,7 +400,8 @@ def format_shipping_choice_message(options: dict, order_ref: str) -> str | None:
         if not options or not options.get("available"):
             country = (options or {}).get("country") or "your country"
             return (
-                f"📦 Our team will confirm shipping cost for {country} shortly."
+                f"📦 Our team will confirm shipping cost for {country}. "
+                "We've notified the export desk."
             )
 
         weight_g = options.get("weight_g", 0)
@@ -432,7 +433,10 @@ def format_shipping_choice_message(options: dict, order_ref: str) -> str | None:
             )
 
         country = options.get("country") or "your country"
-        return f"📦 Our team will confirm shipping cost for {country} shortly."
+        return (
+            f"📦 Our team will confirm shipping cost for {country}. "
+            "We've notified the export desk."
+        )
     except Exception:
         logger.exception("format_shipping_choice_message failed")
         return None
@@ -462,7 +466,7 @@ def format_cart_with_shipping(
             else:
                 line_total = float(item.get("line_total", 0))
 
-            lines.append(f"• {name} × {qty_int} = ${line_total:.2f}")
+            lines.append(f"• {name} × {qty_int} strips = ${line_total:.2f}")
 
         lines.append("─────────────────")
 
@@ -479,7 +483,9 @@ def format_cart_with_shipping(
                 f"Shipping  : ${shipping_cost:.2f} ({label}{day_suffix})"
             )
         else:
-            lines.append("Shipping  : TBD")
+            lines.append(
+                "Shipping  : TBD (export desk will confirm — not in total yet)"
+            )
 
         total = sub + shipping_cost
         lines.append("═════════════════")

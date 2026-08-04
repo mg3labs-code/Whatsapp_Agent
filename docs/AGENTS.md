@@ -3,16 +3,30 @@
 
 ## AGENT 1: PRICING (`app/agents/pricing.py`)
 
-**Model:** GPT-4o with function/tool calling  
+**Model:** GPT-4o with function/tool calling (single-product free text)  
 **Input:** `message`, `session`, `db`  
-**Output:** `str` (WhatsApp-ready reply)
+**Output:** `(reply_text, updated_session, next_intent)` where `next_intent` is `"pricing"` or `"escalate"`
 
-### Tool: `get_product_by_name(query)`
-- Fuzzy match on `Product.product_name`, `salt_name`, `manufacturing_company` (ILIKE)
+### Multi-product lists (no LLM)
+When the message looks like a bulk/list (`looks_like_bulk_order` — commas, newlines, or `Name - qty`):
+- Parse lines with `parse_bulk_order_lines` (same as order agent)
+- Resolve each line with order’s `_resolve_product_match` (token fallback)
+- Return deterministic USD-per-strip quotes (+ line totals when qty present)
+- Restricted → channel refusal note; unmatched → “Couldn't match” + **Did you mean…** suggestions
+- Quantity is **optional** for quotes; default is per-strip price only
+
+### Tool: `get_product_by_name(query)` (single-product LLM path)
+- Same resolve as order: ILIKE on trade/salt/manufacturer, then token fallback (`lookup_product_ilike` + `_resolve_product_match`)
 - Returns catalog dict with `price_per_strip` (USD), or:
-  - `{"error": "product_not_found"}`
+  - `{"error": "product_not_found", "query", "suggestions"}`
   - `{"error": "product_restricted", "name", "schedule_category"}` when `is_restricted=True`
 - Max **3** tool calls per turn
+- Strong system prompt: extract clean search string, never invent prices, surface suggestions on miss
+
+### Miss counter (`pricing_miss_count`)
+**1st consecutive catalog miss:** suggest-on-miss reply (no escalate).  
+**2nd miss:** empty reply; `next_intent="escalate"`, `escalation_reason="pricing_no_match_repeated"`. Orchestrator routes to **escalation_agent**.  
+Cleared on successful quote / restricted catalog hit, menu, handoff resume, and order cancel (`clear_conversation_counters`).
 
 ### Restricted products
 Pre-guardrails do **not** block drug names in free text. Restriction is **catalog-level**: pricing tool returns `product_restricted`; the LLM is instructed to say the product is not available for export via this channel.
@@ -60,18 +74,20 @@ Live prompt: `FAQ_SYSTEM_PROMPT` in `faq.py` (must match `NO_CONTEXT_REPLY` when
 **Input:** `message`, `session`, `db`  
 **Output:** `(reply_text, updated_session)`
 
-### State machine (high level)
+### State machine (primary buyer flow)
 ```
 COLLECT_SKU → COLLECT_SKU_CONFIRM → COLLECT_QTY → CART_MENU
-  → (add/edit/remove/qty) → checkout path
-COLLECT_COUNTRY → COLLECT_CITY → COLLECT_CONTACT
-  → SHIPPING_CHOICE (EMS/LP or PENDING_QUOTE)
-  → COLLECT_CHECKOUT → CONFIRM_ORDER → SELECT_PAYMENT → ORDER_COMPLETE
+  → (add / edit / remove / qty) → checkout
+COLLECT_CHECKOUT  → Name, City (WhatsApp phone; reuses session.country)
+  → SHIPPING_CHOICE (EMS / LP) or PENDING_QUOTE (desk quote; no wire yet)
+  → CONFIRM_ORDER → wire confirm (one bubble: total + T/T details + buttons)
 ```
+
+**Legacy / LLM fallback only** (not the primary interactive path): `COLLECT_COUNTRY`, `COLLECT_CITY`, `COLLECT_CONTACT`. Prefer `COLLECT_CHECKOUT` + session country.
 
 Session keys include: `order_state`, `order_cart`, `order_country`, `order_city`, `order_contact`, shipping fields, payment selection.
 
-On commit: `order_ref`, DB rows, `send_order_alert` to order team WhatsApp numbers, clear order session keys.
+On commit: `order_ref`, DB rows, `send_order_alert` to order team WhatsApp numbers; buyer gets a **single** WhatsApp interactive message (confirm + total + wire + New Order / Order Status / Speak).
 
 ---
 
@@ -94,7 +110,7 @@ Legacy states (`COLLECT_COMPANY`, `COLLECT_VOLUME`, `COLLECT_LICENSE`) normalize
 Uses `app/agents/lead_scoring.score_lead()` (client SOP, 0–100). At `QUAL_COMPLETE`:
 - **Disqualified** → escalate (compliance message)
 - **manual_review_only** → escalate (`manual_review`)
-- **score ≥ 80** (`HOT_LEAD_MIN_SCORE`) → escalate (`hot_lead`)
+- **score ≥ 80** (`HOT_LEAD_MIN_SCORE`) → team alert only (`hot_lead`); bot services stay open (not `human_active`)
 - Else → `pending_intent` handoff (pricing/order/faq) or main menu prompt
 
 ---
@@ -110,28 +126,54 @@ Uses `app/agents/lead_scoring.score_lead()` (client SOP, 0–100). At `QUAL_COMP
 - `session.escalation_reason = reason`
 - `send_escalation_alert()` → WhatsApp to `LEADS_ALERT_PHONE_NUMBERS`
 
+### When the team is alerted (leads / order desk)
+
+| Trigger | Alert | Channel |
+|---------|-------|---------|
+| Speak to team / human keywords / discount | Yes (via escalation_agent) | Leads |
+| Hot lead (score ≥ 80) after qual | Yes (alert only — bot services stay open) | Leads |
+| FAQ / pricing 2nd consecutive miss | Yes | Leads |
+| Pricing API outage/error | Yes | Leads |
+| Hot lead / manual review / disqualified / excluded country | Yes | Leads |
+| Order checkout / set shipping to excluded country | Yes | Leads |
+| FAQ “ship to X” with no rates | Yes (auto, no speak gate) | Leads |
+| FAQ / guardrail excluded-country inquiry | Yes | Leads |
+| Order cart shipping rates unavailable | Yes (draft order, **no wire**) | Order desk |
+| New order confirmed | Yes | Order desk |
+| human_active follow-up (already escalated) | No (hold only) | — |
+
 ### Buyer templates
-**In hours:** connecting with sales team, 30–60 min ETA, `exports@newlifemedicare.com`  
-**Off hours:** team offline, next open time, query flagged priority
+**In hours:** connecting with export team, soft follow-up (no minute/hour SLA), `exports@newlifemedicare.com`  
+**Off hours:** team offline, next open time, query flagged priority  
+**Reason-specific:** hot lead / manual review / disqualified / pricing outage use one dedicated message (no double-merge with default escalate copy)  
+**Speak menu:** selection header only; escalation owns the handoff body (no double “connecting”)
 
 ---
 
 ## ROUTER (`app/agents/router.py`)
 
-**Classifier:** GPT-4o-mini JSON `{intent, confidence}`
+**Layered design:** deterministic short-circuits → optional keyword fallback → LLM free-text classifier (with session context) → business policy.
+
+**Classifier:** GPT-4o-mini JSON `{intent, confidence}` — used for free text only (not bare greetings / buttons).
 
 ### Early exits (no LLM)
 - HUMAN_KEYWORDS / speak-to-team phrases → `escalate`
 - Discount request → `escalate` + `escalation_reason=discount_request`
 - Menu button `speak` → `escalate`
+- **Pure greeting** (`hi` / `hello` / … with no pricing/order/FAQ substance) → `menu_refresh` (disclosure once per Redis session + main menu; never FAQ miss)
+- **Main menu escape** (`main_menu` button or free text `menu` / `main menu` / `show menu` / `options`) → `menu_refresh` even mid-order / mid-qual (clears unfinished `qual_state` so buyers are not re-trapped)
+- Mid-qual **Speak to Team** / **FAQs** short-circuit to escalate / faq (not stuck in country picker)
+- Mixed greeting + request (e.g. `hi, price for metformin`) → LLM → primary intent
+- **Catalog product name** (DB match, e.g. `KLENSMART 60MG`) → `pricing` (or `qualify` + `pending_intent=pricing` if unqualified). Skipped when message is clearly FAQ-process (`ship`/`documents`/…) or clear order request.
 
 ### Qualified leads
 - Classifier confidence **< 0.45** → increment `clarification_count`; route FAQ once, escalate on **2nd** low-confidence turn
-- `intent=qualify` from classifier → mapped to `faq` (never re-trap qualified buyers)
+- `intent=qualify` from classifier → mapped to `faq` (never re-trap qualified buyers; greetings already exited to menu)
 
 ### Unqualified leads
 - `faq` → allowed immediately
 - `pricing` / `order` → `qualify` with `pending_intent`
+- Pure greeting → `menu_refresh` (menu first; qual starts when they pick pricing/order)
 
 ---
 
@@ -140,13 +182,16 @@ Uses `app/agents/lead_scoring.score_lead()` (client SOP, 0–100). At `QUAL_COMP
 ### Pre-LLM (`check_pre_guardrails`)
 1. `session.disqualified` or `lifecycle_stage == disqualified` → block
 2. `session.country` in shipment-excluded list → block
+3. Soft inbound clinical: obvious dosing / “how do I take” asks → short clinician / Speak-to-Team refusal (**no RAG**). Skipped when the message looks commercial (price, quote, order, cart, strip, etc.) so “Metformin 500mg price” still reaches pricing/FAQ.
 
-**Removed:** blanket schedule-drug substring pre-filter on inbound messages. Restriction is catalog-level via pricing only.
+Restricted product control is dual-source:
+- pre-check term list (`restricted_terms`, from schedule workbook), and
+- catalog row restriction (`products.is_restricted`) when a sellable row exists.
 
-`faq_miss_count`, `clarification_count`, and `clarification_attempts` are cleared on human handoff resume, main menu, and order cancel (`clear_human_handoff` / `clear_conversation_counters`).
+`faq_miss_count`, `pricing_miss_count`, `clarification_count`, and `clarification_attempts` are cleared on human handoff resume, main menu, and order cancel (`clear_human_handoff` / `clear_conversation_counters`).
 
-### Post-LLM (`check_post_guardrails`)
-Blocks **clinical dosing advice**:
+### Post-LLM (`check_post_guardrails`) — keep these (most important)
+Blocks **clinical dosing advice** in outbound replies:
 1. Regex: imperative/frequency dosing (e.g. "take 500mg twice daily") — no topic word required
 2. OR `BLOCKED_TOPICS` phrase within ±80 characters of `\d+ mg|ml|mcg`
 
@@ -155,7 +200,8 @@ Blocks **clinical dosing advice**:
 ### Refusal messages (exact strings in code)
 - **Sanctioned / disqualified:** `REFUSAL_SANCTIONED_COUNTRY`
 - **Restricted product (pricing path):** `REFUSAL_RESTRICTED_PRODUCT` — used when agents/guardrails surface catalog restriction, not pre-filter
-- **Clinical content:** `REFUSAL_CLINICAL_CONTENT`
+- **Clinical outbound:** `REFUSAL_CLINICAL_CONTENT`
+- **Clinical inbound (soft):** `REFUSAL_CLINICAL_INBOUND`
 
 ### Logging
 Every block → `guardrail_logs` table; `message_text` capped at 200 chars.
@@ -179,10 +225,10 @@ Every block → `guardrail_logs` table; `message_text` capped at 200 chars.
 Unqualified + pricing intent → qualify (country + biz type) → score → pricing agent with DB tool.
 
 ### B — Multi-turn order
-Qualified → order state machine → cart → shipping → confirm → team order alert.
+Qualified → cart → checkout (Name, City) → shipping → confirm → one wire bubble + team order alert.
 
 ### C — Hot lead
-Qual complete, score ≥ 80 → escalate + `human_active` + team WhatsApp alert.
+Qual complete, score ≥ 80 → team WhatsApp alert; buyer keeps pricing / order / FAQ (not locked to human-only).
 
 ### D — FAQ miss loop (fixed)
 Miss 1 → honest no-context + rephrase hint. Miss 2 → escalation handoff only (no duplicate connect copy).

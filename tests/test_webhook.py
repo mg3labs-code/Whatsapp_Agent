@@ -309,3 +309,14 @@ def test_post_webhook_rejects_unsigned_payload(monkeypatch):
 
     assert response.status_code == 200
     assert mock_invoke.call_count == 0
+
+
+def test_indiapost_webhook_disabled_for_release():
+    """Inbound India Post webhooks are off for v1 — never process payloads."""
+    client = TestClient(_build_test_app())
+    response = client.post(
+        "/webhook/indiapost",
+        json={"article_number": "EB123"},
+        headers={"Authorization": "Bearer anything"},
+    )
+    assert response.status_code == 404

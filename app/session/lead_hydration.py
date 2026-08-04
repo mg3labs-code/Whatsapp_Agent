@@ -56,6 +56,21 @@ def clear_stale_qualification_flags(session: dict) -> dict:
     return session
 
 
+def clear_mid_qualification_for_menu(session: dict) -> dict:
+    """Pause unfinished qualification when buyer opens Main Menu / types menu.
+
+    Unlike ``clear_stale_qualification_flags``, this also clears mid-qual for
+    *unqualified* buyers so they are not re-trapped after seeing the menu.
+    Country / business_type already collected are kept for a smoother resume.
+    """
+    session = dict(session or {})
+    for key in QUAL_UI_KEYS:
+        session.pop(key, None)
+    if not session.get("lead_qualified"):
+        session.pop("pending_intent", None)
+    return session
+
+
 def mark_session_qualified(session: dict) -> dict:
     """Mark buyer qualified and clear mid-qual UI state.
 
@@ -136,6 +151,12 @@ def hydrate_session_from_lead(session: dict, lead: Lead) -> dict:
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         session["qual_completed_at"] = created.isoformat()
+
+    # Returning buyer — skip first-visit welcome / qual pickers (not AI disclosure;
+    # Meta compliance requires disclosure on each new Redis session via prepend_ai_disclosure).
+    session["greeted"] = True
+    session["greeting_buttons_sent"] = True
+    session["country_picker_sent"] = True
 
     session["hydrated_from_lead"] = True
     return session

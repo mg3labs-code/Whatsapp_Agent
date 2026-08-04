@@ -302,7 +302,7 @@ def get_static_payment_details_text(
             f"Amount: {symbol}{amount:,.2f} {currency_code}\n"
             f"Reference: {order_ref}\n\n"
             "Our team will share international wire transfer details with you directly.\n"
-            "Our team will confirm receipt manually within 24 hours."
+            "Our team will confirm receipt after your transfer."
         )
 
     lines = [
@@ -321,7 +321,7 @@ def get_static_payment_details_text(
             f"Reference: {order_ref}",
             "",
             "Please mention the reference exactly as above.",
-            "Our team will confirm receipt manually within 24 hours.",
+            "Our team will confirm receipt after your transfer.",
         ]
     )
     return "\n".join(lines)
@@ -365,7 +365,7 @@ async def check_overdue_payments() -> None:
             await send_message(
                 latest.phone,
                 f"Friendly reminder: payment for *{base_ref}* is still pending. "
-                "Please share your UTR/reference once transferred.",
+                "Please complete the wire transfer using the details we shared.",
             )
             await send_order_team_alert(
                 f"⏰ Overdue payment alert — {base_ref} (>{OVERDUE_HOURS}h) still awaiting payment."

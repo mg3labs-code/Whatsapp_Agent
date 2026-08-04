@@ -23,9 +23,13 @@ from app.business.countries import (
 )
 from app.business.shipping import get_shipping_options
 from app.db.database import SessionLocal
+from app.integrations.alerts import send_escalation_alert
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
+
+# Sample cart weights so FAQ availability matches checkout better than total_g=0 only.
+_FAQ_SHIP_WEIGHT_SAMPLES_G = (500, 1500, 5000)
 
 _DESTINATION_COUNTRY_RE = re.compile(
     r"\b(?:ship|deliver|send)\s+to\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,3})\b",
@@ -151,6 +155,47 @@ def _record_faq_error(session: dict) -> tuple[str, str]:
     return ERROR_REPLY, CONTINUE_FAQ
 
 
+def _faq_shipping_availability(destination: str, db) -> dict:
+    """Merge EMS/LP availability across sample weights (closer to checkout reality)."""
+    merged: dict = {
+        "available": False,
+        "EMS": None,
+        "LP": None,
+        "country": destination,
+    }
+    for weight_g in _FAQ_SHIP_WEIGHT_SAMPLES_G:
+        options = get_shipping_options(destination, total_g=weight_g, db=db)
+        if not options.get("available"):
+            continue
+        merged["available"] = True
+        merged["country"] = options.get("country") or destination
+        if options.get("EMS"):
+            merged["EMS"] = options["EMS"]
+        if options.get("LP"):
+            merged["LP"] = options["LP"]
+        if merged["EMS"] and merged["LP"]:
+            break
+    return merged
+
+
+def _format_faq_ship_available(destination: str, options: dict) -> str:
+    """Only mention services that exist in catalog; caveat final weight at checkout."""
+    parts = [f"Yes, we ship to {destination}."]
+    ems = options.get("EMS")
+    lp = options.get("LP")
+    if ems:
+        days = ems.get("days") or "7-14 days"
+        parts.append(f"Express (EMS): approximately {days}.")
+    if lp:
+        days = lp.get("days") or "15-30 days"
+        parts.append(f"Standard (LP): approximately {days}.")
+    parts.append(
+        "Exact services and cost depend on your final order weight — "
+        "confirmed at checkout. Reply *place an order* when ready."
+    )
+    return " ".join(parts)
+
+
 @observe(name="faq_agent", capture_input=False)
 async def run_faq_agent(
     message: str,
@@ -167,24 +212,41 @@ async def run_faq_agent(
     reply text is empty — escalation_agent provides the buyer-facing handoff message.
     """
     session = dict(session or {})
+    buyer_phone = phone or session.get("phone") or ""
     destination = _extract_destination_country(message)
     if destination:
         if is_shipment_excluded_country(destination):
+            try:
+                await send_escalation_alert(
+                    buyer_phone or "unknown",
+                    {**session, "country": destination},
+                    "excluded_country_inquiry",
+                )
+            except Exception:
+                logger.exception("FAQ excluded-country alert failed")
             return SHIPMENT_EXCLUDED_REFUSAL, session, CONTINUE_FAQ
         db = SessionLocal()
         try:
-            options = get_shipping_options(destination, total_g=0, db=db)
+            options = _faq_shipping_availability(destination, db)
         finally:
             db.close()
         if options.get("available"):
             return (
-                f"Yes, we ship to {destination}. Express (EMS): approximately 7-14 days. "
-                "Standard LP: approximately 15-30 days. Reply 'place an order' when ready."
-            ), session, CONTINUE_FAQ
+                _format_faq_ship_available(destination, options),
+                session,
+                CONTINUE_FAQ,
+            )
+        try:
+            await send_escalation_alert(
+                buyer_phone or "unknown",
+                {**session, "country": destination},
+                "shipping_rates_unavailable",
+            )
+        except Exception:
+            logger.exception("FAQ shipping-rates alert failed")
         return (
             f"We do not have standard shipping rates configured for {destination} yet. "
-            "Our team can confirm if shipping is possible — type 'speak to team' and "
-            "someone will follow up."
+            "I've notified our team — they'll follow up about shipping options."
         ), session, CONTINUE_FAQ
 
     openai_key = os.getenv("OPENAI_API_KEY")

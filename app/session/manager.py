@@ -50,7 +50,7 @@ async def ping_redis() -> bool:
 
 
 async def redis_key_stats() -> dict:
-    """Counts keys by prefix — safe for /health/redis (no values)."""
+    """Counts keys by prefix for startup diagnostics (no values returned to clients)."""
     client = _get_redis_client()
     session_keys: list[str] = []
     wasa_keys: list[str] = []
@@ -67,8 +67,6 @@ async def redis_key_stats() -> dict:
         "db_size": db_size,
         "session_key_count": len(session_keys),
         "wasa_key_count": len(wasa_keys),
-        "session_key_samples": session_keys[:5],
-        "wasa_key_samples": wasa_keys[:5],
     }
 
 
@@ -97,8 +95,7 @@ async def save_session(phone: str, data: dict) -> None:
         payload["phone"] = normalize_phone(phone)
         await client.set(key, json.dumps(payload), ex=86400)
         logger.info(
-            "Session saved key=%s user_ref=%s qual_state=%s lead_qualified=%s",
-            key,
+            "Session saved user_ref=%s qual_state=%s lead_qualified=%s",
             user_ref(phone),
             payload.get("qual_state"),
             payload.get("lead_qualified"),

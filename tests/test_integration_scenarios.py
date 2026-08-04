@@ -131,7 +131,7 @@ def graph_env(monkeypatch, integration_db):
     monkeypatch.setattr("app.guardrails.check.SessionLocal", log_session)
 
     async def fake_pricing(message: str, session: dict, db):
-        return "Quote: Metformin 500mg at $0.95/strip."
+        return "Quote: Metformin 500mg at $0.95/strip.", dict(session or {}), "pricing"
 
     async def fake_faq(message: str, phone: str = "", session: dict | None = None):
         return "We ship via DHL worldwide.", dict(session or {}), "faq"
@@ -226,7 +226,7 @@ async def test_scenario_b_multi_turn_order(graph_env, monkeypatch):
     assert session.get("lead_qualified") is True
 
 @pytest.mark.asyncio
-async def test_scenario_c_hot_lead_escalation(graph_env, monkeypatch):
+async def test_scenario_c_hot_lead_keeps_services(graph_env, monkeypatch):
     monkeypatch.setattr(
         router_mod,
         "_classify_with_llm",
@@ -245,13 +245,12 @@ async def test_scenario_c_hot_lead_escalation(graph_env, monkeypatch):
 
     session = await session_manager.get_session(PHONE)
     assert session.get("lead_score", 0) >= 80
-    assert session.get("human_active") is True
-    assert any(
-        "senior export manager" in m.lower() or "connect" in m.lower()
-        for m in graph_env["sent_buyer"]
-    )
-    assert any("ESCALATION" in a for a in graph_env["team_alerts"])
-
+    assert session.get("human_active") is not True
+    assert session.get("lead_qualified") is True
+    assert any("ESCALATION" in a or "hot_lead" in a.lower() for a in graph_env["team_alerts"])
+    assert not any("30–60" in m or "30-60" in m for m in graph_env["sent_buyer"])
+    # Not blocked — may have pricing handoff or menu, not compliance lock
+    assert not any("unable to process" in m.lower() for m in graph_env["sent_buyer"])
 
 @pytest.mark.asyncio
 async def test_scenario_d_faq_returns_answer(graph_env, monkeypatch):
@@ -340,7 +339,6 @@ async def test_scenario_11_order_resume_mid_flow(graph_env, monkeypatch):
             "order_state": "COLLECT_QTY",
             "order_product_name": "Metformin 500mg",
             "order_sku": "PROD-0001",
-            "order_moq": 1,
         },
     )
     await _invoke(PHONE, "2000", "s11", graph_env)

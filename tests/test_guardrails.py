@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.models import Base, GuardrailLog
 from app.guardrails.check import (
     REFUSAL_CLINICAL_CONTENT,
+    REFUSAL_CLINICAL_INBOUND,
     REFUSAL_SANCTIONED_COUNTRY,
     check_post_guardrails,
     check_pre_guardrails,
@@ -56,6 +57,30 @@ def test_pre_guardrails_blocks_sanctioned_country_case_insensitive():
 
 def test_pre_guardrails_passes_clean_message():
     result = check_pre_guardrails("price for metformin", {"country": "Kenya"})
+    assert result.blocked is False
+
+
+def test_pre_guardrails_soft_blocks_obvious_dosing_ask():
+    result = check_pre_guardrails(
+        "what dosage should I take of metformin 500mg?",
+        {"country": "Kenya"},
+    )
+    assert result.blocked is True
+    assert result.reason == "clinical_inbound"
+    assert result.refusal_message == REFUSAL_CLINICAL_INBOUND
+
+
+def test_pre_guardrails_allows_product_strength_price_ask():
+    """Catalog strength + commercial intent must not soft-block."""
+    result = check_pre_guardrails("Metformin 500mg price", {"country": "Kenya"})
+    assert result.blocked is False
+
+
+def test_pre_guardrails_allows_faq_without_dosing_language():
+    result = check_pre_guardrails(
+        "Do you ship Metformin 500mg to Kenya?",
+        {"country": "Kenya"},
+    )
     assert result.blocked is False
 
 

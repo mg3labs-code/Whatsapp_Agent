@@ -44,7 +44,26 @@ _configure_logging()
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="WASA - WhatsApp AI Sales Agent", version="1.0.0")
+
+def _fastapi_docs_enabled() -> bool:
+    """OpenAPI/Swagger only in local/dev unless ENABLE_API_DOCS overrides."""
+    flag = os.getenv("ENABLE_API_DOCS", "").strip().lower()
+    if flag in {"1", "true", "yes"}:
+        return True
+    if flag in {"0", "false", "no"}:
+        return False
+    return not is_railway_production()
+
+
+_docs_kwargs: dict = {}
+if not _fastapi_docs_enabled():
+    _docs_kwargs = {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+app = FastAPI(
+    title="WASA - WhatsApp AI Sales Agent",
+    version="1.0.0",
+    **_docs_kwargs,
+)
 
 
 @app.on_event("startup")
@@ -90,36 +109,6 @@ async def shutdown_event() -> None:
 async def health() -> dict[str, str]:
     # SECURITY: no env vars, DB URLs, or internal connection details
     return {"status": "ok", "version": "1.0.0"}
-
-
-@app.get("/health/redis")
-async def health_redis() -> dict:
-    """Diagnose Redis connectivity and whether session keys exist (no secret values)."""
-    if not redis_configured():
-        return {
-            "status": "misconfigured",
-            "redis_configured": False,
-            "hint": "Set REDIS_URL on the WASA app service to ${{Redis.REDIS_URL}} from Railway.",
-        }
-    if not await ping_redis():
-        return {
-            "status": "unreachable",
-            "redis_configured": True,
-            "ping_ok": False,
-            "hint": "App cannot reach Redis. Use the private REDIS_URL from the Redis plugin.",
-        }
-    stats = await redis_key_stats()
-    return {
-        "status": "ok",
-        "redis_configured": True,
-        "ping_ok": True,
-        **stats,
-        "key_patterns": {
-            "sessions": "session:{phone} — TTL 24h, written after each bot reply",
-            "dedup": "wasa:msgid:{id} — TTL 24h, one per WhatsApp message",
-            "locks": "wasa:lock:{phone} — TTL 30s, deleted after each message",
-        },
-    }
 
 
 app.include_router(webhook_router, prefix="")

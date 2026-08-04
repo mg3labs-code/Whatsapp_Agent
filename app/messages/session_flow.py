@@ -149,11 +149,58 @@ _TYPED_BIZ_SHORTCUTS: dict[str, str] = {
 }
 
 
+# Free-text substance — if present with a greeting prefix, route via LLM (not menu-only).
+_GREETING_SUBSTANCE_MARKERS: tuple[str, ...] = (
+    "price",
+    "pricing",
+    "cost",
+    "quote",
+    "order",
+    "buy",
+    "purchase",
+    "cart",
+    "checkout",
+    "ship",
+    "shipping",
+    "deliver",
+    "delivery",
+    "document",
+    "documents",
+    "policy",
+    "timeline",
+    "track",
+    "awb",
+    "discount",
+    "human",
+    "agent",
+    "speak",
+    "faq",
+    "product",
+)
+
+
 def is_greeting_message(message: str) -> bool:
+    """True for greetings and greeting-prefixed chat (used for handoff resume)."""
     key = (message or "").strip().lower()
     if key in GREETING_IDS:
         return True
     return key.startswith(("hi ", "hello ", "hey "))
+
+
+def is_pure_greeting(message: str) -> bool:
+    """True only for bare greetings with no product/pricing/order/FAQ substance.
+
+    Used by the router so \"hi\" shows the menu, while \"hi, price for X\" still
+    goes to the LLM classifier (primary intent = pricing).
+    """
+    key = (message or "").strip().lower()
+    if not key:
+        return False
+    if key in GREETING_IDS:
+        return True
+    if not key.startswith(("hi ", "hello ", "hey ", "hi,", "hello,", "hey,")):
+        return False
+    return not any(marker in key for marker in _GREETING_SUBSTANCE_MARKERS)
 
 
 def is_discount_request(message: str) -> bool:
@@ -181,9 +228,10 @@ def should_resume_from_human_handoff(message: str) -> bool:
 
 
 def clear_conversation_counters(session: dict) -> dict:
-    """Reset FAQ miss and router clarification counters (fresh topic after menu/handoff/cancel)."""
+    """Reset FAQ/pricing miss and router clarification counters (menu/handoff/cancel)."""
     session = dict(session or {})
     session.pop("faq_miss_count", None)
+    session.pop("pricing_miss_count", None)
     session.pop("clarification_count", None)
     session.pop("clarification_attempts", None)
     return session

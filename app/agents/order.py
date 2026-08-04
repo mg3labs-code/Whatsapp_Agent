@@ -14,13 +14,14 @@ from langfuse import observe
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.agents.pricing import get_product_by_name
+from app.agents.pricing import lookup_product_ilike
 from app.session.lead_hydration import mark_session_qualified, phone_lookup_variants
 from app.session.lead_persistence import upsert_lead_from_session
 from app.business.countries import (
     SHIPMENT_EXCLUDED_REFUSAL,
     is_shipment_excluded_country,
 )
+from app.business.restricted_products import match_restricted_term
 from app.business.shipping import (
     calculate_cart_weight,
     format_cart_with_shipping,
@@ -28,7 +29,11 @@ from app.business.shipping import (
     get_shipping_options,
 )
 from app.db.models import Order, Product
-from app.integrations.alerts import send_order_alert
+from app.integrations.alerts import (
+    send_escalation_alert,
+    send_order_alert,
+    send_shipping_quote_alert,
+)
 from app.integrations.cashfree import get_static_payment_details_text
 from app.integrations.indiapost import (
     extract_tracking_number,
@@ -41,13 +46,18 @@ from app.messages.onboarding import (
     BULK_LIST_PROMPT,
     checkout_prompt,
     is_bare_order_qty,
+    is_qty_instruction_echo,
     looks_like_bulk_order,
     parse_bulk_order_lines,
     parse_checkout_oneline,
     product_qty_prompt,
 )
 from app.messages.onboarding import _parse_product_qty_segment
-from app.messages.conversation_ui import SESSION_SHOW_MAIN_MENU, SESSION_SUPPRESS_NAV_FOOTER
+from app.messages.conversation_ui import (
+    SESSION_REPLY_ALREADY_SENT,
+    SESSION_SHOW_MAIN_MENU,
+    SESSION_SUPPRESS_NAV_FOOTER,
+)
 from app.messages.session_flow import (
     CART_ACTION_BUTTONS,
     CONFIRM_ORDER_BUTTONS,
@@ -62,6 +72,12 @@ logger = logging.getLogger(__name__)
 
 ORDER_MODEL = "gpt-4o-mini"
 MAX_TOOL_CALLS_PER_TURN = 8
+# Guardrails against abuse / fat-finger (strips per line).
+MAX_STRIPS_PER_LINE = 50_000
+# Seconds before the same phone can commit another order (Redis NX lock).
+ORDER_COMMIT_COOLDOWN_SECONDS = 120
+# Prevent shipping-quote alert / draft-order spam for the same phone.
+PENDING_QUOTE_COOLDOWN_SECONDS = 3600
 
 COLLECT_SKU = "COLLECT_SKU"
 COLLECT_SKU_CONFIRM = "COLLECT_SKU_CONFIRM"
@@ -73,6 +89,7 @@ COLLECT_CONTACT = "COLLECT_CONTACT"
 SHIPPING_CHOICE = "SHIPPING_CHOICE"
 COLLECT_CHECKOUT = "COLLECT_CHECKOUT"
 CONFIRM_ORDER = "CONFIRM_ORDER"
+PENDING_SHIPPING_QUOTE = "PENDING_SHIPPING_QUOTE"
 SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
 ORDER_COMPLETE = "ORDER_COMPLETE"
@@ -124,11 +141,13 @@ ORDER_SYSTEM_PROMPT = (
     "- Interpret natural language (e.g. 'I need 2000 metformin', 'remove the amoxicillin', "
     "'ship to Nairobi Kenya', 'I'm done adding').\n"
     "- Always call lookup_product before add_to_cart; use the exact catalog name from lookup.\n"
-    "- add_to_cart requires a positive integer quantity (parse '2k' as 2000, 'two thousand' as 2000).\n"
+    "- add_to_cart requires a positive integer quantity of *strips* "
+    "(parse '2k' as 2000, 'two thousand' as 2000).\n"
     "- update_cart_line / remove_from_cart: use line_number OR product_query.\n"
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
     "- At checkout, reuse session.country as order_country when present — do not re-ask country.\n"
-    "- Collect shipping contact in one message (name, city, phone) when phase is COLLECT_CHECKOUT.\n"
+    "- Collect shipping contact as Name, City when phase is COLLECT_CHECKOUT; "
+    "use the buyer's WhatsApp number (do not ask for a separate phone).\n"
     "- set_shipping / set_contact: extract from natural phrases.\n"
     f"- Payment is always {PAYMENT_METHOD}; never ask for other payment terms.\n"
     "- After contact is collected, shipping options (EMS express / LP normal) are shown when available.\n"
@@ -170,7 +189,7 @@ ORDER_TOOLS = [
                     "product_query": {"type": "string"},
                     "quantity": {
                         "type": "integer",
-                        "description": "Unit count (positive integer).",
+                        "description": "Number of strips (positive integer).",
                     },
                 },
                 "required": ["product_query", "quantity"],
@@ -181,13 +200,16 @@ ORDER_TOOLS = [
         "type": "function",
         "function": {
             "name": "update_cart_line",
-            "description": "Change quantity on a cart line by line number and/or product name.",
+            "description": "Change strip quantity on a cart line by line number and/or product name.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "line_number": {"type": "integer"},
                     "product_query": {"type": "string"},
-                    "quantity": {"type": "integer"},
+                    "quantity": {
+                        "type": "integer",
+                        "description": "New strip quantity (positive integer).",
+                    },
                 },
                 "required": ["quantity"],
             },
@@ -241,7 +263,7 @@ ORDER_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_contact",
-            "description": "Buyer name and company for the order.",
+            "description": "Buyer contact name for the order (city collected separately).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -629,7 +651,7 @@ def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
         line_total = qty * unit_price
         total += line_total
         if idx <= max_lines:
-            lines.append(f"{idx}. {name} × {qty} = {_format_money(line_total)}")
+            lines.append(f"{idx}. {name} × {qty} strips = {_format_money(line_total)}")
     if item_count > max_lines:
         remaining = item_count - max_lines
         lines.append(
@@ -665,7 +687,12 @@ def _selected_shipping_option(session: dict) -> dict[str, Any] | None:
 
 
 def _apply_shipping_after_contact(session: dict, db: Session) -> str:
-    """Compute weight + rates after contact collected; advance order_state."""
+    """Compute weight + rates after contact collected; advance order_state.
+
+    When rates are unavailable: PENDING_SHIPPING_QUOTE (no Confirm→pay).
+    Marks ``_finalize_pending_shipping_quote`` so the async caller persists a
+    draft order, alerts the export desk, and does *not* send wire details.
+    """
     cart = _get_cart(session)
     country = session.get("order_country") or ""
     order_ref = session.get("order_ref") or ""
@@ -684,12 +711,7 @@ def _apply_shipping_after_contact(session: dict, db: Session) -> str:
     session["shipping_options"] = options
 
     if not options.get("available"):
-        session["shipping_type"] = "PENDING_QUOTE"
-        session["shipping_cost_usd"] = 0
-        session["shipping_days"] = None
-        session["order_state"] = CONFIRM_ORDER
-        lead = format_shipping_choice_message(options, order_ref) or ""
-        return f"{lead}\n\n{_format_order_review(session)}".strip()
+        return _mark_pending_shipping_quote(session, options)
 
     ems = options.get("EMS")
     lp = options.get("LP")
@@ -720,11 +742,222 @@ def _apply_shipping_after_contact(session: dict, db: Session) -> str:
             "Please reply *express* or *normal*"
         )
 
+    return _mark_pending_shipping_quote(session, options)
+
+
+def _mark_pending_shipping_quote(session: dict, options: dict) -> str:
+    """No catalog rates — hold payment until desk confirms full (product+shipping) total."""
+    if not session.get("order_ref"):
+        session["order_ref"] = (
+            f"ORD-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
+        )
     session["shipping_type"] = "PENDING_QUOTE"
     session["shipping_cost_usd"] = 0
     session["shipping_days"] = None
-    session["order_state"] = CONFIRM_ORDER
-    return _format_order_review(session)
+    session["order_state"] = PENDING_SHIPPING_QUOTE
+    session["_finalize_pending_shipping_quote"] = True
+    country = (options or {}).get("country") or session.get("order_country") or "your country"
+    cart = _get_cart(session)
+    subtotal = _cart_total(cart)
+    ref = session.get("order_ref") or ""
+    return (
+        f"📦 We don't have standard shipping rates on file for *{country}* yet "
+        f"(or for this shipment weight).\n\n"
+        f"Product subtotal: {_format_money(subtotal)} USD "
+        f"(shipping *not* included — T/T Advance requires the *full* total).\n\n"
+        f"We've notified the export desk. They'll confirm shipping and the "
+        f"*full amount* to pay. Wire details will follow once that total is ready.\n\n"
+        f"Reference: *{ref}*"
+    ).strip()
+
+
+async def _submit_pending_shipping_quote(
+    session: dict, db: Session
+) -> tuple[str, dict]:
+    """Persist draft order for ops; alert desk; no wire / no partial payment."""
+    cart = _get_cart(session)
+    phone = session.get("phone") or ""
+    if not cart:
+        session["order_state"] = COLLECT_SKU
+        session.pop("_finalize_pending_shipping_quote", None)
+        return "Your cart is empty.\n\n" + BULK_LIST_PROMPT, session
+
+    if not await _try_acquire_pending_quote_lock(phone):
+        session.pop("_finalize_pending_shipping_quote", None)
+        ref = session.get("last_order_ref") or session.get("order_ref")
+        _clear_order_session(session)
+        ref_bit = f" (*{ref}*)" if ref else ""
+        return (
+            f"We've already notified the export desk about your shipping quote{ref_bit}. "
+            "They'll follow up with the *full* amount — please wait for their reply. "
+            "No need to resubmit. Type *my orders* to check status.",
+            session,
+        )
+
+    order_ref = session.get("order_ref") or (
+        f"ORD-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
+    )
+    session["order_ref"] = order_ref
+    contact = session.get("order_contact") or ""
+    product_subtotal = _cart_total(cart)
+
+    shipping_kwargs = {
+        "total_weight_g": session.get("total_weight_g"),
+        "box_no": session.get("box_no"),
+        "shipping_type": "PENDING_QUOTE",
+        "shipping_cost_usd": 0,
+        "shipping_days": None,
+    }
+
+    for idx, item in enumerate(cart, start=1):
+        db.add(
+            Order(
+                phone=phone,
+                sku=item["sku"],
+                product_name=item.get("product_name"),
+                quantity=int(item["quantity"]),
+                country=session["order_country"],
+                city=session["order_city"],
+                contact_name=session["order_contact"],
+                order_ref=f"{order_ref}-L{idx:02d}",
+                status="pending_quote",
+                payment_status="pending_shipping_quote",
+                **shipping_kwargs,
+            )
+        )
+    db.commit()
+    logger.info(
+        "Pending shipping quote saved order_ref=%s product_subtotal=%s",
+        order_ref,
+        product_subtotal,
+    )
+
+    try:
+        await send_shipping_quote_alert(session, order_ref=order_ref)
+    except Exception:
+        logger.exception("send_shipping_quote_alert failed order_ref=%s", order_ref)
+
+    if not session.get("country") and session.get("order_country"):
+        session["country"] = session["order_country"]
+    if not session.get("lifecycle_stage"):
+        session["lifecycle_stage"] = "qualified"
+
+    buyer_reply = (
+        f"📦 *Request {order_ref} received*\n\n"
+        f"Product subtotal: {_format_money(product_subtotal)} USD "
+        f"(shipping not included yet).\n\n"
+        "We've notified the export desk. They'll confirm shipping and the "
+        "*full amount* for T/T Advance. "
+        "Payment / wire details will be shared only after that total is ready.\n\n"
+        "Type *my orders* anytime to check status."
+    )
+
+    _clear_order_session(session)
+    session.pop("cart", None)
+    session.pop("pending_product", None)
+    session.pop("_finalize_pending_shipping_quote", None)
+    session.pop("_shipping_quote_alert_pending", None)
+    session = mark_session_qualified(session)
+    session["greeted"] = True
+    session["last_order_ref"] = order_ref
+    session["last_order_contact"] = contact
+    session["last_order_awaiting_shipping_quote"] = True
+    session.pop("last_order_total", None)
+
+    try:
+        upsert_lead_from_session(session, db)
+    except Exception:
+        logger.exception(
+            "Lead upsert after pending quote failed order_ref=%s",
+            order_ref,
+        )
+
+    return buyer_reply, session
+
+
+async def _after_contact_shipping(
+    session: dict, db: Session, phone: str, reply: str
+) -> tuple[str, dict]:
+    """Finalize pending-quote path or send confirm buttons when rates exist."""
+    if session.pop("_finalize_pending_shipping_quote", None) or (
+        session.get("order_state") == PENDING_SHIPPING_QUOTE
+    ):
+        return await _submit_pending_shipping_quote(session, db)
+    await _flush_shipping_quote_alert(session)
+    if session.get("order_state") == CONFIRM_ORDER and phone:
+        await _send_confirm_order_buttons(phone)
+    return reply, session
+
+
+async def _flush_shipping_quote_alert(session: dict) -> None:
+    if not session.pop("_shipping_quote_alert_pending", None):
+        return
+    try:
+        await send_shipping_quote_alert(
+            session, order_ref=session.get("order_ref") or ""
+        )
+    except Exception:
+        logger.exception("send_shipping_quote_alert failed")
+
+
+async def _alert_excluded_country_attempt(
+    session: dict, country: str, *, phone: str = ""
+) -> None:
+    """Notify leads when order flow hits an excluded destination (matches FAQ/qual)."""
+    buyer = phone or session.get("phone") or "unknown"
+    dest = (country or "").strip() or session.get("order_country") or session.get("country")
+    try:
+        await send_escalation_alert(
+            buyer,
+            {**session, "country": dest or "Unknown"},
+            "excluded_country",
+        )
+    except Exception:
+        logger.exception("order excluded-country alert failed")
+
+
+async def _refuse_excluded_country(
+    session: dict, country: str, *, phone: str = ""
+) -> tuple[str, dict]:
+    await _alert_excluded_country_attempt(session, country, phone=phone)
+    _clear_order_session(session)
+    return SANCTIONED_COUNTRY_REFUSAL, session
+
+
+async def _try_acquire_order_commit_lock(phone: str) -> bool:
+    """True if commit may proceed; False if this phone confirmed too recently."""
+    from app.session.manager import _get_redis_client, normalize_phone, redis_configured
+
+    if not phone or not redis_configured():
+        return True
+    try:
+        client = _get_redis_client()
+        key = f"wasa:order_commit:{normalize_phone(phone)}"
+        was_new = await client.set(
+            key, "1", ex=ORDER_COMMIT_COOLDOWN_SECONDS, nx=True
+        )
+        return was_new is not None
+    except Exception:
+        logger.exception("order commit cooldown check failed; allowing commit")
+        return True
+
+
+async def _try_acquire_pending_quote_lock(phone: str) -> bool:
+    """True if a new shipping-quote draft/alert may proceed for this phone."""
+    from app.session.manager import _get_redis_client, normalize_phone, redis_configured
+
+    if not phone or not redis_configured():
+        return True
+    try:
+        client = _get_redis_client()
+        key = f"wasa:pending_quote:{normalize_phone(phone)}"
+        was_new = await client.set(
+            key, "1", ex=PENDING_QUOTE_COOLDOWN_SECONDS, nx=True
+        )
+        return was_new is not None
+    except Exception:
+        logger.exception("pending quote cooldown check failed; allowing submit")
+        return True
 
 
 async def _send_cart_action_buttons(phone: str) -> None:
@@ -806,11 +1039,19 @@ def _format_order_review(session: dict) -> str:
     if not cart_review:
         cart_review = _format_cart_lines(cart)
 
+    pending_note = ""
+    if (session.get("shipping_type") or "").upper() == "PENDING_QUOTE":
+        pending_note = (
+            "_Shipping is TBD — total above is products only. "
+            "The export desk will confirm shipping before final invoice._\n\n"
+        )
+
     return (
         f"{cart_review}\n\n"
         f"Ship to: {session.get('order_city', '')}, {session.get('order_country', '')}\n"
         f"Contact: {session.get('order_contact', '')}\n"
         f"Payment: {PAYMENT_METHOD}\n\n"
+        f"{pending_note}"
         "Tap *Confirm Order* or type *CONFIRM* to place the order."
     )
 
@@ -911,7 +1152,10 @@ def _lookup_product_query(query: str, db: Session) -> tuple[Product | None, str 
             return None, "restricted"
         return product, None
 
-    result = get_product_by_name(text, db)
+    if match_restricted_term(text, db):
+        return None, "restricted"
+
+    result = lookup_product_ilike(text, db)
     if result.get("error") == "product_restricted":
         return None, "restricted"
     if result.get("error") != "product_not_found":
@@ -967,6 +1211,26 @@ def _resolve_product_match(
 def _resolve_product_row(query: str, db: Session) -> tuple[Product | None, str | None]:
     product, error, _ = _resolve_product_match(query, db)
     return product, error
+
+
+def message_looks_like_catalog_product(message: str, db: Session) -> bool:
+    """True when free text matches a catalog product (for router → pricing).
+
+    Strips common list bullets. Does not treat restricted-only differently —
+    pricing agent owns the restricted refusal copy.
+    """
+    text = (message or "").strip()
+    if len(text) < 3:
+        return False
+    # WhatsApp list bullets / leading markers
+    text = re.sub(r"^[\s•\-\*\u2022]+", "", text).strip()
+    if len(text) < 3:
+        return False
+    product, error, _ = _resolve_product_match(text, db)
+    if product is not None:
+        return True
+    # Restricted catalog hit still means "this is a product name", not FAQ.
+    return error == "restricted"
 
 
 def _suggest_products(query: str, db: Session) -> list[str]:
@@ -1059,6 +1323,14 @@ def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
         return {"error": "invalid_quantity"}
     if qty < 1:
         return {"error": "invalid_quantity", "message": "Quantity must be a positive integer."}
+    if qty > MAX_STRIPS_PER_LINE:
+        return {
+            "error": "invalid_quantity",
+            "message": (
+                f"Quantity too large. Max {MAX_STRIPS_PER_LINE:,} strips per line — "
+                "contact our team for larger lots."
+            ),
+        }
 
     product_query = (args.get("product_query") or "").strip()
     product, error, match_mode = _resolve_product_match(product_query, db)
@@ -1110,6 +1382,16 @@ def _tool_update_cart_line(args: dict, session: dict) -> dict:
         qty = int(args.get("quantity"))
     except (TypeError, ValueError):
         return {"error": "invalid_quantity"}
+    if qty < 1:
+        return {"error": "invalid_quantity", "message": "Quantity must be a positive integer."}
+    if qty > MAX_STRIPS_PER_LINE:
+        return {
+            "error": "invalid_quantity",
+            "message": (
+                f"Quantity too large. Max {MAX_STRIPS_PER_LINE:,} strips per line — "
+                "contact our team for larger lots."
+            ),
+        }
     idx = _find_cart_line(
         cart,
         args.get("line_number"),
@@ -1160,6 +1442,7 @@ def _tool_set_shipping(args: dict, session: dict) -> dict:
         country = (_prefill_order_country(session) or "").strip()
     if country:
         if is_shipment_excluded_country(country):
+            session["_excluded_country_alert_pending"] = country
             _clear_order_session(session)
             return {"error": "sanctioned_country", "message": SANCTIONED_COUNTRY_REFUSAL}
         session["order_country"] = country
@@ -1189,6 +1472,9 @@ def _tool_set_contact(args: dict, session: dict, db: Session) -> dict:
         "phase": session["order_state"],
         "review": _format_order_review(session),
         "shipping_message": shipping_message,
+        "shipping_quote_alert_pending": bool(
+            session.get("_shipping_quote_alert_pending")
+        ),
     }
 
 
@@ -1209,12 +1495,26 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     cart = _get_cart(session)
     if not cart:
         session["order_state"] = COLLECT_SKU
-        return "Your cart is empty. Which product would you like to add?", session
+        return "Your cart is empty.\n\n" + BULK_LIST_PROMPT, session
+
+    # T/T Advance = full total only — never wire product-only while shipping TBD.
+    if (session.get("shipping_type") or "").upper() == "PENDING_QUOTE" or (
+        session.get("order_state") == PENDING_SHIPPING_QUOTE
+    ):
+        return await _submit_pending_shipping_quote(session, db)
+
+    phone = session.get("phone") or ""
+    if not await _try_acquire_order_commit_lock(phone):
+        return (
+            "We just received an order confirmation from this chat. "
+            "Please wait a couple of minutes before placing another, "
+            "or type *my orders* to check status.",
+            session,
+        )
 
     order_ref = session.get("order_ref") or (
         f"ORD-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
     )
-    phone = session.get("phone") or ""
     contact = session.get("order_contact") or ""
     order_total = _cart_total(cart) + float(session.get("shipping_cost_usd") or 0)
     order_total = round(order_total, 2)
@@ -1281,6 +1581,7 @@ async def _commit_order(session: dict, db: Session) -> tuple[str, dict]:
     session["last_order_ref"] = order_ref
     session["last_order_total"] = order_total
     session["last_order_contact"] = contact
+    session.pop("last_order_awaiting_shipping_quote", None)
 
     # Lifetime qualify-once: buyers who qualify via order are remembered in Postgres.
     try:
@@ -1338,6 +1639,8 @@ def _order_total_from_lines(db: Session, lines: list[Order]) -> float:
 def _resolve_pending_payment(session: dict, db: Session) -> dict:
     """Restore payment context from session or latest awaiting_payment order in DB."""
     session = dict(session or {})
+    if session.get("last_order_awaiting_shipping_quote"):
+        return session
     if session.get("last_order_ref") and float(session.get("last_order_total") or 0) > 0:
         return session
 
@@ -1347,6 +1650,13 @@ def _resolve_pending_payment(session: dict, db: Session) -> dict:
         return session
 
     status = (latest.payment_status or latest.status or "").strip().lower()
+    if status in {"pending_shipping_quote", "pending_quote"}:
+        base_ref = (latest.order_ref or "").rsplit("-L", 1)[0]
+        if base_ref:
+            session["last_order_ref"] = base_ref
+            session["last_order_awaiting_shipping_quote"] = True
+            session.pop("last_order_total", None)
+        return session
     if status not in {"awaiting_payment", "pending", ""}:
         return session
 
@@ -1362,6 +1672,7 @@ def _resolve_pending_payment(session: dict, db: Session) -> dict:
     session["last_order_ref"] = base_ref
     session["last_order_total"] = total
     session["order_state"] = SELECT_PAYMENT
+    session.pop("last_order_awaiting_shipping_quote", None)
     if latest.contact_name and not session.get("last_order_contact"):
         session["last_order_contact"] = latest.contact_name
     return session
@@ -1380,6 +1691,14 @@ def _order_payment_currency() -> str:
 async def _handle_bank_transfer(
     session: dict, db: Session, order_ref: str, amount: float, phone: str
 ) -> tuple[str, dict]:
+    if session.get("last_order_awaiting_shipping_quote"):
+        return (
+            f"Order *{order_ref}* is waiting on a shipping quote from our export desk.\n"
+            "T/T Advance is for the *full* total (products + shipping). "
+            "Wire details will be shared once that amount is confirmed.",
+            session,
+        )
+
     instructions = get_static_payment_details_text(
         order_ref,
         amount,
@@ -1388,21 +1707,26 @@ async def _handle_bank_transfer(
     session.pop("order_state", None)
     session["payment_method_chosen"] = "wire_transfer"
 
-    if phone:
-        await send_message(phone, instructions)
-        await _send_post_payment_buttons(
-            phone,
-            f"Wire transfer details sent for *{order_ref}*.\n"
-            "Share your payment reference once you've transferred.",
-        )
-
-    return (
+    # One WhatsApp bubble: confirm + total + wire details + post-payment buttons.
+    combined = (
         f"✅ *Order {order_ref} confirmed!*\n"
         f"Total: {_format_money(amount)}\n\n"
-        "Wire transfer details have been sent. "
-        "Please complete the transfer and reply with your payment reference.",
-        session,
+        f"{instructions}"
     )
+    if phone:
+        # Interactive body max 1024; fall back to text + short button prompt if needed.
+        if len(combined) <= 1024:
+            await _send_post_payment_buttons(phone, combined)
+        else:
+            await send_message(phone, combined)
+            await _send_post_payment_buttons(
+                phone,
+                f"Order *{order_ref}* confirmed. Use the buttons below.",
+            )
+        session[SESSION_REPLY_ALREADY_SENT] = True
+        session[SESSION_SUPPRESS_NAV_FOOTER] = True
+
+    return combined, session
 
 
 async def _handle_payment_selection(
@@ -1713,7 +2037,12 @@ def _format_order_summary_for_status(
     order_status = (order.status or "processing").strip().lower()
     lines = [f"📋 *Order {base_ref}*"]
 
-    if payment_status in {"awaiting_payment", "payment_received"}:
+    if payment_status in {
+        "awaiting_payment",
+        "payment_received",
+        "pending_shipping_quote",
+        "pending_quote",
+    }:
         lines.append(f"Payment: {payment_status.replace('_', ' ').title()}")
         lines.append(_status_message(payment_status))
         return "\n".join(lines)
@@ -1766,6 +2095,14 @@ async def _build_order_status_reply(
 def _status_message(status: str, eta: str = "") -> str:
     mapping = {
         "awaiting_payment": "Awaiting your payment transfer.",
+        "pending_shipping_quote": (
+            "Export desk is confirming shipping and the full amount. "
+            "Wire details will follow once ready."
+        ),
+        "pending_quote": (
+            "Export desk is confirming shipping and the full amount. "
+            "Wire details will follow once ready."
+        ),
         "payment_received": "Payment received ✅ — processing your order.",
         "processing": "Being prepared for shipment.",
         "shipped": f"On the way! Expected delivery: {eta or 'To be shared soon.'}",
@@ -1799,7 +2136,17 @@ async def _execute_order_tool_async(
 ) -> dict:
     if name == "confirm_order":
         return await _tool_confirm_order(session, db)
-    return _execute_order_tool(name, args, session, db)
+    result = _execute_order_tool(name, args, session, db)
+    if name == "set_contact":
+        if session.pop("_finalize_pending_shipping_quote", None) or (
+            session.get("order_state") == PENDING_SHIPPING_QUOTE
+        ):
+            reply, updated = await _submit_pending_shipping_quote(session, db)
+            session.clear()
+            session.update(updated)
+            return {"ok": True, "committed": True, "final_reply": reply}
+        await _flush_shipping_quote_alert(session)
+    return result
 
 
 def _phase_hint(session: dict) -> str:
@@ -1811,10 +2158,11 @@ def _phase_hint(session: dict) -> str:
         CART_MENU: "Cart building — add, edit, remove, or proceed_to_checkout.",
         COLLECT_COUNTRY: "Collect shipping country (skip if session.country is set).",
         COLLECT_CITY: "Collect city/port of entry.",
-        COLLECT_CONTACT: "Collect buyer name and company.",
+        COLLECT_CONTACT: "Collect buyer name (use WhatsApp number; city already collected).",
         SHIPPING_CHOICE: "Buyer must choose express (EMS) or normal (LP) shipping.",
-        COLLECT_CHECKOUT: "Collect name, city, phone in one buyer message.",
+        COLLECT_CHECKOUT: "Collect name, city in one buyer message (WhatsApp phone).",
         CONFIRM_ORDER: "Show review; confirm_order only after explicit buyer confirmation.",
+        PENDING_SHIPPING_QUOTE: "No rates — desk quote; do not send wire / confirm payment.",
     }
     return hints.get(phase, "Order flow active.")
 
@@ -1894,6 +2242,11 @@ async def _run_order_llm(message: str, session: dict, db: Session) -> tuple[str,
                 db,
             )
             if result.get("error") == "sanctioned_country":
+                pending = session.pop("_excluded_country_alert_pending", None)
+                if pending:
+                    await _alert_excluded_country_attempt(
+                        session, str(pending), phone=session.get("phone") or ""
+                    )
                 return result.get("message", SANCTIONED_COUNTRY_REFUSAL), session
             if result.get("committed"):
                 return result.get("final_reply", ""), session
@@ -2033,7 +2386,7 @@ def _try_cart_edit_commands(
         result = _tool_update_cart_line({"line_number": line_no, "quantity": qty}, session)
         if result.get("error"):
             return f"Could not update line {line_no}.", session
-        return f"Updated line {line_no} to {qty} units.", session
+        return f"Updated line {line_no} to {qty} strips.", session
     return None
 
 
@@ -2064,7 +2417,7 @@ async def _run_order_rules(
         if not pending_sku or not pending_name:
             _clear_pending_product(session)
             session["order_state"] = COLLECT_SKU
-            return "Which product would you like to add? (name or SKU)", session
+            return "Which product would you like to add?\n\n" + BULK_LIST_PROMPT, session
 
         if _normalize_menu_action(text) == "reject":
             _clear_pending_product(session)
@@ -2141,6 +2494,16 @@ async def _run_order_rules(
             if filler:
                 return filler
 
+        # Buyer echoed prompt wording ("full line") — stay on same product.
+        if is_qty_instruction_echo(text):
+            name = session.get("order_product_name") or "your product"
+            return (
+                f"Still adding *{name}*.\n\n"
+                f"How many *strips* do you need?\n"
+                f"Reply with a *number only* (example: *350*).",
+                session,
+            )
+
         # 1) Bare order qty only ("100", "100 units") — never dose digits.
         qty = is_bare_order_qty(text)
 
@@ -2193,8 +2556,9 @@ async def _run_order_rules(
                 return _prompt_product_quantity(session, product)
             name = session.get("order_product_name") or "your product"
             return (
-                f"Please type a positive quantity (e.g. *350*) or:\n"
-                f"*{name} - 350*",
+                f"Still adding *{name}*.\n\n"
+                f"How many *strips* do you need?\n"
+                f"Reply with a *number only* (example: *350*).",
                 session,
             )
 
@@ -2208,7 +2572,8 @@ async def _run_order_rules(
             db,
         )
         if result.get("error"):
-            return "Could not add to cart. Please try again.", session
+            msg = result.get("message") or "Could not add to cart. Please try again."
+            return msg, session
 
         continued = await _continue_bulk_queue(session, db, phone)
         if continued:
@@ -2236,34 +2601,35 @@ async def _run_order_rules(
             if phone:
                 await _send_cart_action_buttons(phone)
             return cart_text, session
-        return "Tap *Checkout* or type *checkout*. Type product lines to add more.", session
+        return "Tap *Checkout* or type *checkout*. Send more lines as *Product - strips* to add.", session
 
     if state == COLLECT_CHECKOUT:
-        parsed = parse_checkout_oneline(text, _prefill_order_country(session))
+        parsed = parse_checkout_oneline(
+            text,
+            _prefill_order_country(session),
+            whatsapp_phone=session.get("phone"),
+        )
         if not parsed:
             country = _prefill_order_country(session) or "your country"
             return (
-                f"Please send all details in one message:\n"
-                f"*Name, City, Phone*\n\n"
-                f"Shipping country: *{country}*"
+                f"Please send *Name, City* in one message.\n\n"
+                f"Example: Jane Doe, Nairobi\n\n"
+                f"Shipping country: *{country}*\n"
+                f"(We'll use your WhatsApp number for contact.)"
             ), session
         country = parsed.get("country") or _prefill_order_country(session) or ""
         if country and is_shipment_excluded_country(country):
-            _clear_order_session(session)
-            return SANCTIONED_COUNTRY_REFUSAL, session
+            return await _refuse_excluded_country(session, country, phone=phone)
         if country:
             session["order_country"] = country
         session["order_city"] = parsed["city"]
         session["order_contact"] = parsed["contact"]
         reply = _apply_shipping_after_contact(session, db)
-        if session.get("order_state") == CONFIRM_ORDER and phone:
-            await _send_confirm_order_buttons(phone)
-        return reply, session
+        return await _after_contact_shipping(session, db, phone, reply)
 
     if state == COLLECT_COUNTRY:
         if is_shipment_excluded_country(text):
-            _clear_order_session(session)
-            return SANCTIONED_COUNTRY_REFUSAL, session
+            return await _refuse_excluded_country(session, text, phone=phone)
         session["order_country"] = text
         session["order_state"] = COLLECT_CITY
         return "Which city or port of entry?", session
@@ -2271,16 +2637,14 @@ async def _run_order_rules(
     if state == COLLECT_CITY:
         session["order_city"] = text
         session["order_state"] = COLLECT_CONTACT
-        return "Your name and company for this order?", session
+        return "Your *name* for this order? (We'll use your WhatsApp number for contact.)", session
 
     if state == COLLECT_CONTACT:
         if len(text) < 3:
-            return "Please share your name and company.", session
+            return "Please share your name for this order.", session
         session["order_contact"] = text
         reply = _apply_shipping_after_contact(session, db)
-        if session.get("order_state") == CONFIRM_ORDER and phone:
-            await _send_confirm_order_buttons(phone)
-        return reply, session
+        return await _after_contact_shipping(session, db, phone, reply)
 
     if state == SHIPPING_CHOICE:
         options = session.get("shipping_options") or {}
@@ -2328,8 +2692,11 @@ async def _run_order_rules(
             return _format_order_review(session), session
         return (
             "Tap *Confirm Order* or type *CONFIRM*. "
-            "Tap *Edit Cart* to change items, or *Edit Details* to fix name/city/phone."
+            "Tap *Edit Cart* to change items, or *Edit Details* to fix name/city."
         ), session
+
+    if state == PENDING_SHIPPING_QUOTE:
+        return await _submit_pending_shipping_quote(session, db)
 
     session["order_state"] = COLLECT_SKU
     return BULK_LIST_PROMPT, session
@@ -2372,6 +2739,8 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
         SHIPPING_CHOICE,
         COLLECT_CHECKOUT,
         CONFIRM_ORDER,
+        PENDING_SHIPPING_QUOTE,
+        SHIPPING_CHOICE,
     }:
         reply, session = await _run_order_rules(message, session, db)
         if (
