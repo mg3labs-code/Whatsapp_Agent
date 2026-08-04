@@ -12,7 +12,8 @@ from app.messages.conversation_ui import (
 
 AI_DISCLOSURE_MESSAGE = (
     "Hi — I'm the *AI assistant* for *New Life Medicare*\n"
-    "I can help with pricing, orders & FAQs. Reply *\"human\"* anytime to reach our team."
+    "I can help with pricing, orders & FAQs. "
+    "Type *speak to team* anytime to reach our export team."
 )
 
 GREETING_INTRO_TEXT = (
@@ -43,7 +44,7 @@ SESSION_FLAG_GREETING_BUTTONS_SENT = "greeting_buttons_sent"
 
 
 def should_send_ai_disclosure(session: dict | None) -> bool:
-    """True when this phone has not yet received the one-time AI disclosure."""
+    """True when this Redis session has not yet received the AI disclosure."""
     session = session or {}
     if session.get("human_active"):
         return False

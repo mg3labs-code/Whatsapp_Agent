@@ -45,6 +45,25 @@ def _verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
     return hmac.compare_digest(computed_sig, expected_sig)
 
 
+def _verify_indiapost_webhook_auth(request: Request) -> bool:
+    """Require INDIAPOST_WEBHOOK_SECRET via Bearer token or X-IndiaPost-Webhook-Secret."""
+    expected = os.getenv("INDIAPOST_WEBHOOK_SECRET", "").strip()
+    if not expected:
+        logger.error("INDIAPOST_WEBHOOK_SECRET not set — rejecting India Post webhook")
+        return False
+
+    auth = (request.headers.get("authorization") or "").strip()
+    header_secret = (request.headers.get("x-indiapost-webhook-secret") or "").strip()
+    if auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    else:
+        provided = header_secret
+
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
 @webhook_router.get("/webhook")
 async def verify_webhook(request: Request) -> Response:
     """Meta webhook verification handshake.
@@ -123,18 +142,16 @@ async def _process_indiapost_payload(payload: dict) -> None:
 async def receive_indiapost_webhook(
     request: Request, background_tasks: BackgroundTasks
 ) -> Response:
-    """India Post shipment tracking event webhooks (register URL with India Post)."""
-    try:
-        payload = await request.json()
-    except Exception:
-        logger.warning("India Post webhook JSON parse failed")
-        return Response(status_code=200)
+    """India Post inbound webhooks — disabled for this release.
 
-    if not isinstance(payload, dict):
-        return Response(status_code=200)
-
-    background_tasks.add_task(_process_indiapost_payload, payload)
-    return Response(status_code=200)
+    Tracking lookup via India Post API may still be used elsewhere. Do **not**
+    register this URL with India Post until re-enabled with
+    ``INDIAPOST_WEBHOOK_SECRET`` auth (see ``_verify_indiapost_webhook_auth``).
+    """
+    logger.info(
+        "India Post webhook hit but inbound webhooks are disabled for this release"
+    )
+    return Response(status_code=404)
 
 
 async def _is_duplicate(message_id: str, client) -> bool:

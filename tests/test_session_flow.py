@@ -4,6 +4,7 @@ from app.messages.session_flow import (
     is_order_cancel_request,
     is_order_restart_request,
     is_order_reset_request,
+    is_pure_greeting,
     is_speak_to_team_request,
     resolve_business_type_button,
     should_resume_from_human_handoff,
@@ -21,12 +22,27 @@ def test_should_not_resume_on_speak():
     assert should_resume_from_human_handoff("speak") is False
 
 
+def test_is_pure_greeting():
+    assert is_pure_greeting("hi") is True
+    assert is_pure_greeting("Hello") is True
+    assert is_pure_greeting("hey") is True
+    assert is_pure_greeting("good morning") is True
+    assert is_pure_greeting("hello again") is True
+    # Mixed greeting + request → LLM path, not menu-only
+    assert is_pure_greeting("hi, price for metformin") is False
+    assert is_pure_greeting("hi price for amoxicillin") is False
+    assert is_pure_greeting("hello I want to order") is False
+    assert is_pure_greeting("hey do you ship to Kenya") is False
+    assert is_pure_greeting("quote for metformin") is False
+
+
 def test_clear_human_handoff():
     session = clear_human_handoff(
         {
             "human_active": True,
             "escalation_reason": "hot_lead",
             "faq_miss_count": 2,
+            "pricing_miss_count": 1,
             "clarification_count": 1,
             "clarification_attempts": 1,
         }
@@ -34,6 +50,7 @@ def test_clear_human_handoff():
     assert "human_active" not in session
     assert "escalation_reason" not in session
     assert "faq_miss_count" not in session
+    assert "pricing_miss_count" not in session
     assert "clarification_count" not in session
     assert "clarification_attempts" not in session
 

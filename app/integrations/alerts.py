@@ -109,6 +109,36 @@ async def send_escalation_alert(phone: str, session: dict, reason: str) -> bool:
     return await send_leads_alert(message)
 
 
+async def send_shipping_quote_alert(session: dict, *, order_ref: str = "") -> bool:
+    """Notify ops when catalog shipping rates are unavailable for a cart."""
+    session = session or {}
+    phone = session.get("phone") or "unknown"
+    country = session.get("order_country") or session.get("country") or "Unknown"
+    city = session.get("order_city") or ""
+    ref = order_ref or session.get("order_ref") or "pending"
+    cart = session.get("order_cart") or []
+    if cart:
+        product_block = "\n".join(
+            f"• {item.get('product_name', 'N/A')} × "
+            f"{item.get('quantity', item.get('qty', 'N/A'))} strips"
+            for item in cart[:12]
+        )
+    else:
+        product_block = "• (empty cart)"
+    message = (
+        "📦 *SHIPPING QUOTE NEEDED*\n"
+        f"Phone: {phone}\n"
+        f"Order ref: {ref}\n"
+        f"Ship to: {city}, {country}\n"
+        f"Contact: {session.get('order_contact', 'N/A')}\n"
+        f"Cart:\n{product_block}\n"
+        "⚠️ Do NOT collect payment yet — buyer was *not* given wire details.\n"
+        "Confirm shipping + full T/T total, then share payment instructions.\n"
+        f"Time: {datetime.now(timezone.utc).isoformat()}"
+    )
+    return await send_order_team_alert(message)
+
+
 async def send_order_alert(order: dict) -> bool:
     order = order or {}
     lines = order.get("lines")

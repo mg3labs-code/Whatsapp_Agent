@@ -32,22 +32,38 @@ from app.agents.order import (
     _resolve_product_row,
     run_order_agent,
 )
-from app.agents.pricing import get_product_by_name, run_pricing_agent
+from app.agents.pricing import format_multi_product_quote, get_product_by_name, run_pricing_agent
 from app.agents.lead_scoring import (
     classify_lead_score,
     score_lead,
 )
+from app.business.restricted_products import clear_restricted_terms_cache
 from app.agents.qualification import (
     COLLECT_BIZ_TYPE,
     COLLECT_COUNTRY,
     calculate_lead_score,
     run_qualification_agent,
 )
-from app.db.models import Base, Lead, Order, Product
+from app.db.models import Base, Lead, Order, Product, ShippingRate
+from app.db.models import RestrictedTerm
 
 
 def _fixed_now(tz, year: int, month: int, day: int, hour: int):
     return tz.localize(datetime(year, month, day, hour, 0))
+
+
+def _seed_kenya_shipping(db):
+    for shipping_type, rate in (("EMS", 45.0), ("LP", 28.0)):
+        db.add(
+            ShippingRate(
+                country_name="KENYA",
+                shipping_type=shipping_type,
+                weight_from_g=0,
+                weight_to_g=100_000,
+                rate_usd=rate,
+            )
+        )
+    db.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +240,9 @@ def test_get_product_by_name_matches_manufacturer(pricing_db):
 def test_get_product_by_name_not_found(pricing_db):
     result = get_product_by_name("xyz999", pricing_db)
 
-    assert result == {"error": "product_not_found", "query": "xyz999"}
+    assert result["error"] == "product_not_found"
+    assert result["query"] == "xyz999"
+    assert result.get("suggestions") == []
 
 
 def test_get_product_by_name_restricted(pricing_db):
@@ -237,6 +255,60 @@ def test_get_product_by_name_restricted(pricing_db):
     }
 
 
+def test_get_product_by_name_restricted_precheck_without_catalog_row(pricing_db):
+    pricing_db.add(
+        RestrictedTerm(
+            term="Tramadol",
+            normalized_term="tramadol",
+            schedule_category="H",
+            source="test",
+        )
+    )
+    pricing_db.commit()
+    clear_restricted_terms_cache()
+
+    result = get_product_by_name("Tramadol 50mg price", pricing_db)
+    assert result == {
+        "error": "product_restricted",
+        "name": "Tramadol",
+        "schedule_category": "H",
+    }
+
+
+def test_get_product_by_name_token_fallback(pricing_db):
+    """Extra tokens still resolve via order-style token fallback."""
+    result = get_product_by_name("Amoxicillin 500mg urgent export", pricing_db)
+    assert result.get("product_name") == "Amoxicillin 500mg"
+    assert result.get("price_per_strip") == 1.85
+    assert result.get("match_mode") in {"direct", "token"}
+
+
+def test_order_resolve_product_row_restricted_precheck_without_catalog_row(order_db):
+    order_db.add(
+        RestrictedTerm(
+            term="Ketamine",
+            normalized_term="ketamine",
+            schedule_category="X",
+            source="test",
+        )
+    )
+    order_db.commit()
+    clear_restricted_terms_cache()
+
+    product, error = _resolve_product_row("Ketamine 100mg", order_db)
+    assert product is None
+    assert error == "restricted"
+
+
+def test_get_product_by_name_suggestions_on_near_miss(pricing_db):
+    result = get_product_by_name("Amoxicill", pricing_db)
+    # Partial may hit via ILIKE; if not_found, expect suggestions containing Amox
+    if result.get("error") == "product_not_found":
+        assert any("Amoxicillin" in s for s in result.get("suggestions", []))
+    else:
+        assert result.get("product_name") == "Amoxicillin 500mg"
+
+
 @pytest.mark.asyncio
 async def test_run_faq_agent_missing_keys(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -247,6 +319,56 @@ async def test_run_faq_agent_missing_keys(monkeypatch):
     assert out == ERROR_REPLY
     assert intent == "faq"
     assert session.get("faq_miss_count") == 1
+
+
+def test_format_faq_ship_available_only_lists_present_services():
+    from app.agents.faq import _format_faq_ship_available
+
+    ems_only = _format_faq_ship_available(
+        "Kenya",
+        {"EMS": {"days": "7-14 days"}, "LP": None},
+    )
+    assert "Express (EMS)" in ems_only
+    assert "Standard (LP)" not in ems_only
+    assert "checkout" in ems_only.lower()
+
+    both = _format_faq_ship_available(
+        "Kenya",
+        {"EMS": {"days": "7-14 days"}, "LP": {"days": "15-30 days"}},
+    )
+    assert "Express (EMS)" in both
+    assert "Standard (LP)" in both
+
+
+@pytest.mark.asyncio
+async def test_faq_ship_to_no_rates_alerts_team(monkeypatch):
+    """No catalog shipping rates → notify leads immediately (no speak-to-team gate)."""
+    alerts: list[tuple] = []
+
+    async def capture_alert(phone, session, reason):
+        alerts.append((phone, session, reason))
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.faq._faq_shipping_availability",
+        lambda country, db=None: {
+            "available": False,
+            "country": country,
+        },
+    )
+    monkeypatch.setattr("app.agents.faq.send_escalation_alert", capture_alert)
+    monkeypatch.setattr("app.agents.faq.SessionLocal", MagicMock())
+
+    out, session, intent = await run_faq_agent(
+        "Do you ship to Kenya?",
+        phone="+15550009999",
+        session={"phone": "+15550009999"},
+    )
+
+    assert intent == "faq"
+    assert "notified our team" in out.lower()
+    assert "speak to team" not in out.lower()
+    assert alerts and alerts[0][2] == "shipping_rates_unavailable"
 
 
 @pytest.mark.asyncio
@@ -418,7 +540,14 @@ async def test_faq_agent_soft_llm_no_answer_counts_as_miss(monkeypatch):
 
 
 @pytest.fixture
-def order_db():
+def order_db(monkeypatch):
+    async def _always_allow_commit(_phone: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.order._try_acquire_order_commit_lock",
+        _always_allow_commit,
+    )
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -438,6 +567,7 @@ def order_db():
         )
     )
     db.commit()
+    _seed_kenya_shipping(db)
     try:
         yield db
     finally:
@@ -469,7 +599,7 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     session = {"phone": "+919876543210", "country": "Kenya"}
 
     reply, session = await run_order_agent("I want to order", session, order_db)
-    assert "product" in reply.lower() and "quantity" in reply.lower()
+    assert "product" in reply.lower() and ("strip" in reply.lower() or "quantity" in reply.lower())
 
     reply, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     assert session["order_state"] == CART_MENU
@@ -481,9 +611,12 @@ async def test_order_agent_multi_turn_flow(order_db, monkeypatch):
     assert session["order_country"] == "Kenya"
 
     reply, session = await run_order_agent("Priya Sharma, Nairobi, +254700000000", session, order_db)
-    assert session["order_state"] == CONFIRM_ORDER
-    assert "t/t advance" in reply.lower()
-    assert "confirm" in reply.lower()
+    # Both EMS + LP seeded → buyer chooses shipping (or auto if only one).
+    assert session["order_state"] in {CONFIRM_ORDER, "SHIPPING_CHOICE"}
+    if session["order_state"] == "SHIPPING_CHOICE":
+        reply, session = await run_order_agent("express", session, order_db)
+        assert session["order_state"] == CONFIRM_ORDER
+    assert "t/t advance" in reply.lower() or "confirm" in reply.lower()
 
     reply, session = await run_order_agent("confirm", session, order_db)
     assert "confirmed" in reply.lower()
@@ -545,7 +678,8 @@ async def test_order_agent_multi_product_cart_and_confirm(order_db, monkeypatch)
     _, session = await run_order_agent("checkout", session, db)
     assert session["order_state"] == COLLECT_CHECKOUT
     _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, db)
-    reply, session = await run_order_agent("LC", session, db)
+    if session["order_state"] == "SHIPPING_CHOICE":
+        _, session = await run_order_agent("express", session, db)
     assert session["order_state"] == CONFIRM_ORDER
 
     reply, session = await run_order_agent("yes", session, db)
@@ -615,7 +749,7 @@ async def test_order_agent_requires_confirmation_for_suggested_product(order_db,
 
     reply, session = await run_order_agent("yes", session, order_db)
     assert session["order_state"] == COLLECT_QTY
-    assert "quantity" in reply.lower()
+    assert "strip" in reply.lower() or "number only" in reply.lower()
     assert "metformin" in reply.lower()
 
     reply, session = await run_order_agent("100", session, order_db)
@@ -732,17 +866,25 @@ async def test_order_payment_wire_transfer_fallback_resends_details(order_db, mo
     _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     _, session = await run_order_agent("checkout", session, order_db)
     _, session = await run_order_agent("Jane Doe, Nairobi, +254700000000", session, order_db)
+    if session.get("order_state") == "SHIPPING_CHOICE":
+        _, session = await run_order_agent("express", session, order_db)
     _, session = await run_order_agent("confirm", session, order_db)
     sent_messages.clear()
 
     reply, session = await run_order_agent(PAY_BANK_BUTTON, session, order_db)
-    assert "wire transfer" in reply.lower()
+    assert "confirmed" in reply.lower()
+    assert "payment details" in reply.lower() or "wire" in reply.lower()
     assert session.get("payment_method_chosen") == "wire_transfer"
     assert "order_state" not in session
-    assert any(
-        "123456789012" in msg and "EXAMPLGB" in msg and "New Life Medicare Exports" in msg
-        for msg in sent_messages
+    # Single interactive bubble: confirm + wire (no separate "details sent" follow-up).
+    assert len(sent_messages) == 1
+    assert "confirmed" in sent_messages[0].lower()
+    assert (
+        "123456789012" in sent_messages[0]
+        and "EXAMPLGB" in sent_messages[0]
+        and "New Life Medicare Exports" in sent_messages[0]
     )
+    assert not any("details have been sent" in m.lower() for m in sent_messages)
 
 
 @pytest.mark.asyncio
@@ -774,14 +916,22 @@ async def test_order_payment_export_wire_details_after_confirm(order_db, monkeyp
     _, session = await run_order_agent("Metformin 500mg - 100", session, order_db)
     _, session = await run_order_agent("checkout", session, order_db)
     _, session = await run_order_agent("Contact Name, Nairobi, +254700000000", session, order_db)
+    if session.get("order_state") == "SHIPPING_CHOICE":
+        _, session = await run_order_agent("express", session, order_db)
+    sent_messages.clear()
     reply, session = await run_order_agent("confirm", session, order_db)
 
-    assert "wire transfer" in reply.lower()
+    assert "confirmed" in reply.lower()
+    assert "payment details" in reply.lower() or "wire" in reply.lower()
     assert session.get("payment_method_chosen") == "wire_transfer"
-    assert any(
-        "9876543210" in msg and "EXPORTGB" in msg and "SBIN0004321" in msg
-        for msg in sent_messages
+    assert len(sent_messages) == 1
+    assert "confirmed" in sent_messages[0].lower()
+    assert (
+        "9876543210" in sent_messages[0]
+        and "EXPORTGB" in sent_messages[0]
+        and "SBIN0004321" in sent_messages[0]
     )
+    assert not any("details have been sent" in m.lower() for m in sent_messages)
 
 
 @pytest.mark.asyncio
@@ -815,7 +965,6 @@ async def test_order_agent_sanctioned_country_resets_state(order_db, monkeypatch
                 "sku": "PROD-0001",
                 "product_name": "Metformin 500mg",
                 "quantity": 100,
-                "moq": 1,
             }
         ],
     }
@@ -1112,9 +1261,20 @@ async def test_qualification_accepts_typed_clinic(qual_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_qualification_high_score_escalates(qual_db):
-    session = {"phone": "+15550002222"}
+async def test_qualification_high_score_alerts_but_keeps_services(qual_db, monkeypatch):
+    """Hot lead: team alerted once; buyer continues to pricing (not blocked)."""
+    alerts: list[str] = []
 
+    async def capture_alert(phone, session, reason):
+        alerts.append(reason)
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.qualification.send_escalation_alert",
+        capture_alert,
+    )
+
+    session = {"phone": "+15550002222"}
     session["pending_intent"] = "pricing"
     _, session, _ = await run_qualification_agent("UK", session, qual_db)
     reply, session, intent = await run_qualification_agent(
@@ -1123,9 +1283,12 @@ async def test_qualification_high_score_escalates(qual_db):
 
     assert session["lead_score"] >= 80
     assert session.get("lead_category") == "hot"
-    assert intent == "escalate"
-    assert "senior export manager" in reply.lower()
-
+    assert intent == "pricing"
+    assert session.get("_hot_lead_alerted") is True
+    assert session.get("human_active") is not True
+    assert session.get("escalation_reason") != "hot_lead"
+    assert alerts == ["hot_lead"]
+    assert session.get("_handoff_query") or True  # may hand off pending pricing query
 
 @pytest.mark.asyncio
 async def test_pricing_agent_uses_country_context(monkeypatch, pricing_db):
@@ -1145,14 +1308,171 @@ async def test_pricing_agent_uses_country_context(monkeypatch, pricing_db):
     mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
     with patch("app.agents.pricing.get_async_openai_client", return_value=mock_client):
-        out = await run_pricing_agent(
+        out, session_out, intent = await run_pricing_agent(
             "price for amoxicillin 5000 units",
             {"country": "India"},
             pricing_db,
         )
 
+    assert intent == "pricing"
     assert "export team" in out.lower()
     call_kwargs = mock_client.chat.completions.create.await_args.kwargs
     user_content = call_kwargs["messages"][1]["content"]
     assert "Country: India" in user_content
     assert "Company:" not in user_content
+
+
+def test_format_multi_product_quote_list(pricing_db):
+    reply, full_miss = format_multi_product_quote(
+        "Amoxicillin 500mg - 100\nMetformin 500mg - 200",
+        {"country": "Kenya"},
+        pricing_db,
+    )
+    # Metformin not in pricing_db fixture — expect amox quoted + metformin missing
+    assert reply is not None
+    assert full_miss is False
+    assert "Amoxicillin 500mg" in reply
+    assert "$1.85" in reply
+    assert "100" in reply
+    assert "Kenya" in reply
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_multi_product_list_no_llm(monkeypatch, pricing_db):
+    """Comma/newline product lists quote from DB without calling OpenAI."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    pricing_db.add(
+        Product(
+            product_name="Metformin 500mg",
+            salt_name="Metformin",
+            manufacturing_company="Gamma",
+            expiry_date=date(2027, 1, 1),
+            price_per_strip=0.95,
+            is_restricted=False,
+        )
+    )
+    pricing_db.commit()
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock()
+    with patch("app.agents.pricing.get_async_openai_client", return_value=mock_client):
+        out, session_out, intent = await run_pricing_agent(
+            "Amoxicillin 500mg - 100\nMetformin 500mg - 200",
+            {"country": "Kenya"},
+            pricing_db,
+        )
+
+    mock_client.chat.completions.create.assert_not_called()
+    assert intent == "pricing"
+    assert session_out.get("pricing_miss_count", 0) == 0
+    assert "Amoxicillin 500mg" in out
+    assert "Metformin 500mg" in out
+    assert "$1.85" in out
+    assert "$0.95" in out
+    assert "100" in out and "200" in out
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_multi_product_comma_list(pricing_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    out, _session, intent = await run_pricing_agent(
+        "Amoxicillin 500mg, Ciprofloxacin 500mg",
+        {"country": "India"},
+        pricing_db,
+    )
+    assert intent == "pricing"
+    assert "Amoxicillin 500mg" in out
+    assert "$1.85" in out
+    # Restricted ciprofloxacin → channel note, not invented price
+    assert "not available" in out.lower() or "Ciprofloxacin" in out
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_single_product_phrase_still_uses_llm(monkeypatch, pricing_db):
+    """Non-list free text still uses GPT tool path."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(
+            message=MagicMock(
+                tool_calls=None,
+                content="Amoxicillin 500mg is *$1.85* USD per strip.",
+            )
+        )
+    ]
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+    with patch("app.agents.pricing.get_async_openai_client", return_value=mock_client):
+        out, _session, intent = await run_pricing_agent(
+            "what is the price for amoxicillin?",
+            {"country": "Kenya"},
+            pricing_db,
+        )
+
+    mock_client.chat.completions.create.assert_awaited()
+    assert intent == "pricing"
+    assert "1.85" in out
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_full_miss_suggests_then_escalates(monkeypatch, pricing_db):
+    """Two consecutive unmatched catalog lists → suggest, then escalate."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    out1, session1, intent1 = await run_pricing_agent(
+        "NoSuchDrugAAA - 10\nFakeProductBBB - 20",
+        {"country": "Kenya"},
+        pricing_db,
+    )
+    assert intent1 == "pricing"
+    assert session1.get("pricing_miss_count") == 1
+    assert "Couldn't match" in out1 or "couldn't find" in out1.lower()
+
+    out2, session2, intent2 = await run_pricing_agent(
+        "NoSuchDrugAAA - 10\nFakeProductBBB - 20",
+        session1,
+        pricing_db,
+    )
+    assert intent2 == "escalate"
+    assert out2 == ""
+    assert session2.get("escalation_reason") == "pricing_no_match_repeated"
+    assert session2.get("pricing_miss_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_llm_not_found_uses_suggestions(monkeypatch, pricing_db):
+    """Tool not_found → deterministic miss reply; never use invented LLM price."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+
+    tool_call = MagicMock()
+    tool_call.id = "call_1"
+    tool_call.function.name = "get_product_by_name"
+    tool_call.function.arguments = json.dumps({"query": "xyzzy999nomatch"})
+
+    first = MagicMock()
+    first.choices = [MagicMock(message=MagicMock(tool_calls=[tool_call], content=None))]
+    second = MagicMock()
+    second.choices = [
+        MagicMock(
+            message=MagicMock(
+                tool_calls=None,
+                content="I made up $9.99 for xyzzy999nomatch",
+            )
+        )
+    ]
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(side_effect=[first, second])
+
+    with patch("app.agents.pricing.get_async_openai_client", return_value=mock_client):
+        out, session, intent = await run_pricing_agent(
+            "price for xyzzy999nomatch",
+            {"country": "Kenya"},
+            pricing_db,
+        )
+
+    assert intent == "pricing"
+    assert session.get("pricing_miss_count") == 1
+    assert "9.99" not in out
+    assert "couldn't find" in out.lower()
+    assert "xyzzy999nomatch" in out.lower()

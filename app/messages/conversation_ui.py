@@ -22,6 +22,8 @@ MENU_ACK_IDS = MENU_OPTION_IDS | {SPEAK_MENU_ID}
 SESSION_PENDING_MENU_ACK = "pending_menu_ack"
 SESSION_SUPPRESS_NAV_FOOTER = "suppress_nav_footer"
 SESSION_SHOW_MAIN_MENU = "show_main_menu_after_reply"
+# Agent already sent the buyer-facing WhatsApp bubble (e.g. interactive wire confirm).
+SESSION_REPLY_ALREADY_SENT = "reply_already_sent"
 
 NAV_FOOTER_BODY = "Anything else?"
 
@@ -41,7 +43,7 @@ MAIN_MENU_LIST_ROWS: list[dict[str, str]] = [
     {
         "id": "pricing",
         "title": "Get Pricing",
-        "description": "Product quotes and MOQ",
+        "description": "USD per-strip product quotes",
     },
     {
         "id": "faq",
@@ -58,26 +60,22 @@ MAIN_MENU_LIST_ROWS: list[dict[str, str]] = [
 MAIN_MENU_BUTTON = [{"id": MAIN_MENU_ID, "title": "Main Menu"}]
 
 MENU_SELECTION_ACK: dict[str, str] = {
-    "order": (
-        "You selected *Place an Order* 📦\n\n"
-        "Let's get started! Which product(s) would you like to order?"
-    ),
+    # Order format body comes from ORDER_START_PROMPT via the order agent / qual handoff.
+    "order": "You selected *Place an Order* 📦",
     MY_ORDERS_ID: (
         "You selected *My Orders* 📋\n\n"
         "Here is your order history for this number:"
     ),
     "pricing": (
         "You selected *Get Pricing* 💰\n\n"
-        "Please share the product name and quantity you need a quote for."
+        "Share a *product name* for a USD *per strip* quote.\n"
+        "Quantity is optional — only if you want a line total."
     ),
     "faq": (
         "You selected *FAQs* ❓\n\n"
         "What would you like to know about shipping, documents, or policies?"
     ),
-    SPEAK_MENU_ID: (
-        "You selected *Speak to Team* 👤\n\n"
-        "Connecting you with our export team."
-    ),
+    SPEAK_MENU_ID: "You selected *Speak to Team* 👤",
 }
 
 
@@ -100,8 +98,22 @@ def is_menu_option(message: str) -> bool:
     return (message or "").strip().lower() in MENU_OPTION_IDS
 
 
+# Free-text escape hatch mid-flow (same path as Main Menu button → menu_refresh).
+MAIN_MENU_FREE_TEXT_IDS = frozenset(
+    {
+        MAIN_MENU_ID,
+        "menu",
+        "main menu",
+        "show menu",
+        "options",
+    }
+)
+
+
 def is_main_menu_request(message: str) -> bool:
-    return (message or "").strip().lower() == MAIN_MENU_ID
+    """True for Main Menu button id or free-text menu / options requests."""
+    key = " ".join((message or "").strip().lower().split())
+    return key in MAIN_MENU_FREE_TEXT_IDS
 
 
 def mark_menu_selection(session: dict, message: str) -> dict:
@@ -128,19 +140,33 @@ def apply_menu_selection_ack(reply: str, session: dict) -> tuple[str, dict]:
     if not body:
         return ack, session
 
-    # Avoid repeating the same question when the agent already asks for products.
-    if key == "order" and any(
-        token in body.lower() for token in ("product", "sku", "which product", "add")
-    ):
-        return f"You selected *Place an Order* 📦\n\n{body}", session
+    # Avoid duplicating the order-start format when the agent already sent it.
+    if key == "order":
+        if any(
+            token in body.lower()
+            for token in ("product name - strips", "number of strips", "send each product")
+        ):
+            return f"You selected *Place an Order* 📦\n\n{body}", session
+        # Menu tap with empty agent body — attach canonical order-start prompt.
+        from app.messages.onboarding import ORDER_START_PROMPT
+
+        return f"You selected *Place an Order* 📦\n\n{ORDER_START_PROMPT}", session
 
     if key == "pricing" and any(
-        token in body.lower() for token in ("product", "quote", "price", "which")
+        token in body.lower() for token in ("product", "quote", "price", "strip", "per strip")
     ):
         return f"You selected *Get Pricing* 💰\n\n{body}", session
 
     if key == MY_ORDERS_ID and body.startswith("📊"):
         return f"You selected *My Orders* 📋\n\n{body}", session
+
+    # Speak / escalate: selection header only — escalation agent owns the handoff body.
+    if key == SPEAK_MENU_ID:
+        if not body:
+            return "You selected *Speak to Team* 👤", session
+        if "you selected *speak to team*" in body.lower():
+            return body, session
+        return f"You selected *Speak to Team* 👤\n\n{body}", session
 
     if body.startswith(ack.split("\n\n")[0]):
         return body, session

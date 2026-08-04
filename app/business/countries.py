@@ -257,7 +257,7 @@ _ALL_EXCLUDED_SORTED = sorted(SHIPMENT_EXCLUDED_NAMES, key=len, reverse=True)
 
 SHIPMENT_EXCLUDED_REFUSAL = (
     "I'm sorry, we're unable to process orders or quotes for that destination due to "
-    "export compliance requirements. Please contact our compliance team directly."
+    "export compliance requirements. Our compliance team has been notified."
 )
 
 

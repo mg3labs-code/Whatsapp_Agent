@@ -53,6 +53,22 @@ def test_clear_stale_qualification_flags_only_when_qualified():
     assert clear_stale_qualification_flags(mid_qual)["qual_state"] == "COLLECT_COUNTRY"
 
 
+def test_clear_mid_qualification_for_menu_unqualified():
+    from app.session.lead_hydration import clear_mid_qualification_for_menu
+
+    mid = {
+        "qual_state": "COLLECT_COUNTRY",
+        "country_picker_sent": True,
+        "pending_intent": "pricing",
+        "country": "Kenya",
+    }
+    cleaned = clear_mid_qualification_for_menu(mid)
+    assert cleaned.get("qual_state") is None
+    assert cleaned.get("country_picker_sent") is None
+    assert cleaned.get("pending_intent") is None
+    assert cleaned.get("country") == "Kenya"
+
+
 def test_mark_session_qualified_clears_mid_qual_flags():
     session = mark_session_qualified(
         {"qual_state": "COLLECT_BIZ_TYPE", "pending_intent": "pricing"}
@@ -163,6 +179,26 @@ def test_hydrate_session_from_db_restores_expired_redis_session(lead_db):
     assert session["lead_qualified"] is True
     assert session["company"] == "OldCo"
     assert session.get("qual_state") is None
+    assert session["greeted"] is True
+    assert session["greeting_buttons_sent"] is True
+    assert session["country_picker_sent"] is True
+    assert session.get("ai_disclosure_sent") is not True
+
+
+def test_hydrate_session_from_lead_allows_per_session_ai_disclosure(lead_db):
+    """Returning buyer skips onboarding UX but still gets disclosure on first reply."""
+    lead = Lead(phone="15550005555", company="Co", country="Kenya", lead_score=50)
+    lead_db.add(lead)
+    lead_db.commit()
+
+    session = hydrate_session_from_lead({}, lead)
+    assert session.get("ai_disclosure_sent") is not True
+
+    from app.messages.welcome import prepend_ai_disclosure
+
+    reply, session = prepend_ai_disclosure("Your pricing quote is ready.", session)
+    assert "AI assistant" in reply
+    assert session["ai_disclosure_sent"] is True
 
 
 def test_hydrate_session_from_db_restores_disqualified_lead(lead_db):

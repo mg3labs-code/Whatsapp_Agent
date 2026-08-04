@@ -28,24 +28,56 @@ COUNTRY_ID_TO_NAME: dict[str, str] = {
 
 COUNTRY_BUTTON_IDS = frozenset(COUNTRY_ID_TO_NAME.keys()) | {"country_other"}
 
+# Canonical order-start + multi-product format (strips). Use everywhere buyers start ordering.
 BULK_LIST_PROMPT = (
-    "📋 *Send product name and quantity on each line:*\n\n"
-    "Example:\n"
+    "📋 *Send each product like this (quantity = number of strips):*\n\n"
+    "*Example:*\n"
     "JGLUT 2000MG 30ML - 350\n"
     "Metformin 500mg - 100\n"
     "Amoxicillin 500mg - 200\n\n"
-    "One line or many — type the quantity beside each product."
+    "Reply with *Product name - strips* — one line or many."
 )
+
+# Alias for a single consistent order-entry path.
+ORDER_START_PROMPT = BULK_LIST_PROMPT
 
 
 def product_qty_prompt(product_name: str) -> str:
-    """Ask for typed quantity when a product was matched without a qty."""
+    """Ask for strip quantity when a product was matched without a qty."""
     safe = (product_name or "Product").strip()
     return (
         f"Found: *{safe}*\n\n"
-        f"Reply with quantity only (e.g. *350*) or full line:\n"
-        f"*{safe} - 350*"
+        f"How many *strips* do you need?\n"
+        f"Reply with a *number only* (example: *350*)."
     )
+
+
+# Buyers sometimes echo the old "full line" instruction instead of typing a qty.
+_QTY_INSTRUCTION_ECHOES = frozenset(
+    {
+        "full line",
+        "fullline",
+        "full-line",
+        "fulliline",
+        "quantity only",
+        "qty only",
+        "reply with quantity",
+        "reply with quantity only",
+    }
+)
+
+
+def is_qty_instruction_echo(message: str) -> bool:
+    """True when the buyer echoed qty-prompt instructions instead of a number."""
+    key = (message or "").strip().lower()
+    if not key:
+        return False
+    if key in _QTY_INSTRUCTION_ECHOES:
+        return True
+    # Soft match: message is only the words "full" + "line" (any separators).
+    compact = re.sub(r"[\s\-_/]+", " ", key).strip()
+    return compact in _QTY_INSTRUCTION_ECHOES
+
 
 _COUNTRY_PROMPT = "🌎 *Select your country* from the list below."
 _COUNTRY_REMINDER = "Please select your country from the list above 👆"
@@ -155,27 +187,31 @@ def checkout_prompt(country: str) -> str:
     return (
         "Almost done! 🎉\n\n"
         f"Ship to: *{ship}*\n\n"
-        "Reply in *one message* with your details:\n"
-        "*Name, City, Phone*\n\n"
-        "Example: Jane Doe, Sydney, +61412345678"
+        "Reply in *one message* with:\n"
+        "*Name, City*\n\n"
+        "Example: Jane Doe, Sydney\n\n"
+        "We'll use your WhatsApp number for contact."
     )
 
 
-def parse_checkout_oneline(text: str, default_country: str | None) -> dict[str, str] | None:
-    """Parse 'Name, City, Phone' (or 'Name, Company, City')."""
+def parse_checkout_oneline(
+    text: str,
+    default_country: str | None,
+    *,
+    whatsapp_phone: str | None = None,
+) -> dict[str, str] | None:
+    """Parse 'Name, City'. Optional trailing phone is ignored; WhatsApp phone is used."""
     parts = [p.strip() for p in (text or "").split(",") if p.strip()]
     if len(parts) < 2:
         return None
 
     country = (default_country or "").strip()
-    if len(parts) == 2:
-        contact, city = parts[0], parts[1]
-    else:
-        contact = parts[0]
-        city = parts[1]
-        phone = ", ".join(parts[2:])
-        if phone:
-            contact = f"{contact} ({phone})"
+    contact = parts[0]
+    city = parts[1]
+    # Ignore extra comma fields (legacy Name, City, Phone) — WA number is source of truth.
+    wa = (whatsapp_phone or "").strip()
+    if wa:
+        contact = f"{contact} ({wa})"
 
     if len(contact) < 2 or len(city) < 2:
         return None

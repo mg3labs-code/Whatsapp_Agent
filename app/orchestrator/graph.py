@@ -43,6 +43,7 @@ from app.guardrails.check import (
 )
 from app.db.models import Conversation
 from app.session.lead_hydration import (
+    clear_mid_qualification_for_menu,
     clear_stale_qualification_flags,
     hydrate_session_from_db,
     is_session_disqualified,
@@ -61,6 +62,7 @@ from app.messages.session_flow import (
     should_resume_from_human_handoff,
 )
 from app.messages.conversation_ui import (
+    SESSION_REPLY_ALREADY_SENT,
     SESSION_SHOW_MAIN_MENU,
     SESSION_SUPPRESS_NAV_FOOTER,
     apply_menu_selection_ack,
@@ -69,7 +71,7 @@ from app.messages.conversation_ui import (
     should_send_navigation_footer,
 )
 from app.messages.onboarding import SESSION_SKIP_WELCOME_COMPOSE
-from app.messages.welcome import prepend_ai_disclosure
+from app.messages.welcome import prepend_ai_disclosure, should_send_ai_disclosure
 from app.session.manager import get_session, save_session
 from app.utils.security import user_ref
 
@@ -213,22 +215,63 @@ async def pre_guardrails_node(state: MessageState) -> dict:
             "pre",
             state.get("message") or "",
         )
+        # Compliance blocks that never reach escalation_agent still need a team ping
+        # (once per Redis session) so ops see the attempt.
+        session = dict(state.get("session") or {})
+        if result.reason in {"disqualified_lead", "sanctioned_country"}:
+            if not session.get("_compliance_block_alerted"):
+                try:
+                    from app.integrations.alerts import send_escalation_alert
+
+                    await send_escalation_alert(
+                        state.get("phone") or session.get("phone") or "unknown",
+                        session,
+                        result.reason,
+                    )
+                    session["_compliance_block_alerted"] = True
+                except Exception:
+                    logger.exception("pre_guardrails compliance alert failed")
         return {
             "guardrail_blocked": True,
             "final_reply": result.refusal_message,
+            "session": session,
         }
     return {"guardrail_blocked": False}
 
 
 async def menu_refresh_node(state: MessageState) -> dict:
-    """Resend main menu when buyer taps Main Menu (no agent logic change)."""
+    """Resend main menu (Main Menu tap or pure greeting). No agent / no FAQ."""
+    phone = state.get("phone") or ""
     session = clear_human_handoff(dict(state.get("session") or {}))
     for key in ORDER_SESSION_KEYS:
         session.pop(key, None)
-    # Escape hatch: qualified users leave any stale mid-qual loop via Main Menu.
+    # Escape hatch: drop mid-qual sticky for qualified *and* unfinished new buyers.
+    session = clear_mid_qualification_for_menu(session)
     session = clear_stale_qualification_flags(session)
-    await send_main_menu_list(state["phone"])
+
+    # Meta compliance: AI disclosure once per Redis session (not skipped on hydration).
+    if phone and should_send_ai_disclosure(session):
+        disclosure, session = prepend_ai_disclosure("", session)
+        if disclosure:
+            try:
+                await send_message(phone, disclosure)
+            except Exception:
+                logger.exception(
+                    "AI disclosure send failed user_ref=%s",
+                    user_ref(phone),
+                )
+
+    if phone:
+        try:
+            await send_main_menu_list(phone)
+        except Exception:
+            logger.exception(
+                "send_main_menu_list failed user_ref=%s",
+                user_ref(phone),
+            )
     session[SESSION_SUPPRESS_NAV_FOOTER] = True
+    # Menu already sent here — don't send again from greeting flag in send_reply.
+    session[SESSION_SKIP_WELCOME_COMPOSE] = True
     return {"session": session, "final_reply": None}
 
 
@@ -238,13 +281,18 @@ async def router_node(state: MessageState) -> dict:
     msg_key = message.strip().lower()
 
     if session.get("human_active") and should_resume_from_human_handoff(message):
-        session = clear_human_handoff(session)
+        # Never reopen the bot for compliance-locked / disqualified buyers.
+        if is_session_disqualified(session) or session.get("compliance_locked"):
+            session["human_active"] = False
+        else:
+            session = clear_human_handoff(session)
 
     # Permanent qualify-once: never re-trap already-qualified buyers in mid-qual UI.
     session = clear_stale_qualification_flags(session)
 
     # Excluded-country lock: never reopen agents (pre_guardrails also blocks).
     if is_session_disqualified(session):
+        session.setdefault("escalation_reason", "disqualified")
         return {"intent": "escalate", "session": session}
 
     if is_main_menu_request(message):
@@ -273,6 +321,7 @@ async def router_node(state: MessageState) -> dict:
         if msg_key in {"my_orders", "my orders"}:
             return {"intent": "order", "session": session}
         if msg_key == "speak" or is_speak_to_team_request(message):
+            session.setdefault("escalation_reason", "speak_to_team")
             return {"intent": "escalate", "session": session}
         if is_order_cancel_request(message) or is_order_restart_request(message):
             return {"intent": "order", "session": session}
@@ -283,14 +332,28 @@ async def router_node(state: MessageState) -> dict:
     if session.get("awaiting_faq_ship_country"):
         return {"intent": "faq", "session": session}
 
+    # Mid-qual escapes: speak / FAQ must not be trapped in country/biz-type sticky.
+    if msg_key == "speak" or is_speak_to_team_request(message):
+        session.setdefault("escalation_reason", "speak_to_team")
+        return {"intent": "escalate", "session": session}
+    if msg_key in {"faq", "faqs"}:
+        return {"intent": "faq", "session": session}
+
     # Only unfinished NEW buyers continue qualification.
     if session.get("qual_state") and not session.get("lead_qualified"):
         return {"intent": "qualify", "session": session}
 
-    intent, session = await classify_intent(
-        state.get("message") or "",
-        session,
-    )
+    # Catalog-aware free-text routing needs DB (bare product names → pricing).
+    gen = _get_db_generator()
+    db = next(gen)
+    try:
+        intent, session = await classify_intent(
+            state.get("message") or "",
+            session,
+            db=db,
+        )
+    finally:
+        gen.close()
     return {"intent": intent, "session": session}
 
 
@@ -305,28 +368,55 @@ async def pricing_agent_node(state: MessageState) -> dict:
     session = dict(state.get("session") or {})
     gen = _get_db_generator()
     db = next(gen)
-    if state.get("phone") and not session.get("phone"):
-        session["phone"] = state["phone"]
+    phone = state.get("phone") or ""
+    if phone and not session.get("phone"):
+        session["phone"] = phone
     session["last_agent"] = "pricing"
+    # Interim WhatsApp ping only — not stored in agent_response, so _merge_prior_reply is unchanged.
+    if phone:
+        try:
+            await send_message(phone, "One moment, checking that for you...")
+        except Exception:
+            logger.exception(
+                "interim pricing ack failed user_ref=%s",
+                user_ref(phone),
+            )
     try:
-        reply = await run_pricing_agent(
+        reply, updated_session, next_intent = await run_pricing_agent(
             state["message"],
             session,
             db,
         )
-        return {"agent_response": _merge_prior_reply(state, reply), "session": session}
+        result: dict = {"session": updated_session}
+        if next_intent == "escalate":
+            # Escalation agent owns the buyer-facing copy (avoid duplicate handoff text).
+            result["intent"] = "escalate"
+            result["agent_response"] = ""
+        else:
+            result["agent_response"] = _merge_prior_reply(state, reply)
+        return result
     finally:
         gen.close()
 
 
 async def faq_agent_node(state: MessageState) -> dict:
     session = dict(state.get("session") or {})
-    if state.get("phone") and not session.get("phone"):
-        session["phone"] = state["phone"]
+    phone = state.get("phone") or ""
+    if phone and not session.get("phone"):
+        session["phone"] = phone
     session["last_agent"] = "faq"
+    # Interim WhatsApp ping only — not stored in agent_response, so _merge_prior_reply is unchanged.
+    if phone:
+        try:
+            await send_message(phone, "One moment, checking that for you...")
+        except Exception:
+            logger.exception(
+                "interim faq ack failed user_ref=%s",
+                user_ref(phone),
+            )
     reply, updated_session, next_intent = await run_faq_agent(
         state["message"],
-        phone=state.get("phone") or "",
+        phone=phone,
         session=session,
     )
     result: dict = {"session": updated_session}
@@ -373,12 +463,19 @@ async def qualify_agent_node(state: MessageState) -> dict:
             db,
         )
         updated_session["last_agent"] = "qualifier"
-        result: dict = {"agent_response": reply, "session": updated_session}
-        if next_intent != "continue_qual":
+        result: dict = {"session": updated_session}
+        if next_intent == "escalate":
+            # Escalation agent owns the single buyer-facing message (no double copy).
+            result["intent"] = "escalate"
+            result["agent_response"] = ""
+        elif next_intent != "continue_qual":
             result["intent"] = next_intent
+            result["agent_response"] = reply
             handoff_query = updated_session.pop("_handoff_query", None)
             if handoff_query and next_intent in {"pricing", "faq", "order"}:
                 result["message"] = handoff_query
+        else:
+            result["agent_response"] = reply
         return result
     finally:
         gen.close()
@@ -404,8 +501,9 @@ async def escalation_agent_node(state: MessageState) -> dict:
         phone=state.get("phone") or "",
     )
     updated_session["last_agent"] = "escalation"
+    # Do not merge prior agent text — one escalation message only.
     return {
-        "agent_response": _merge_prior_reply(state, reply),
+        "agent_response": reply,
         "session": updated_session,
     }
 
@@ -415,6 +513,26 @@ async def human_active_node(state: MessageState) -> dict:
     phone = state.get("phone") or ""
     session = dict(state.get("session") or {})
     logger.info("human_active hold user_ref=%s", user_ref(phone))
+
+    # Compliance-locked buyers must not get "Continue with Bot".
+    if is_session_disqualified(session) or session.get("compliance_locked"):
+        session["human_active"] = False
+        reply = (
+            "Thank you for your interest. We're unable to process this request through "
+            "our automated channel due to export compliance requirements. "
+            "Our compliance team has been notified and will follow up if applicable."
+        )
+        if phone:
+            try:
+                await send_message(phone, reply)
+            except Exception:
+                logger.exception(
+                    "compliance lock hold send failed user_ref=%s",
+                    user_ref(phone),
+                )
+        session[SESSION_SUPPRESS_NAV_FOOTER] = True
+        return {"session": session, "final_reply": None}
+
     reply = (
         "Our team has been notified and will contact you shortly.\n\n"
         "You can keep using the assistant while you wait — type *menu*, *hello*, "
@@ -462,10 +580,12 @@ async def send_reply_node(state: MessageState) -> dict:
         final_reply, session = apply_menu_selection_ack(final_reply, session)
         final_reply, session = prepend_ai_disclosure(final_reply, session)
         skip_main_menu = bool(session.get(SESSION_SKIP_WELCOME_COMPOSE))
-        try:
-            await send_message(phone, final_reply)
-        except Exception:
-            logger.exception("send_message failed user_ref=%s", user_ref(phone))
+        already_sent = bool(session.pop(SESSION_REPLY_ALREADY_SENT, None))
+        if not already_sent:
+            try:
+                await send_message(phone, final_reply)
+            except Exception:
+                logger.exception("send_message failed user_ref=%s", user_ref(phone))
         if state.get("greeting") and not skip_main_menu:
             try:
                 await send_main_menu_list(phone)
@@ -536,12 +656,19 @@ def _after_faq(state: MessageState) -> str:
     return "post_guardrails"
 
 
+def _after_pricing(state: MessageState) -> str:
+    if state.get("intent") == "escalate":
+        return "escalate"
+    return "post_guardrails"
+
+
 def _route_to_agent(state: MessageState) -> str:
     if state.get("guardrail_blocked"):
         return "send_reply"
 
     session = state.get("session") or {}
     if session.get("human_active"):
+        # Compliance-locked sessions clear hold in human_active_node (no resume CTA).
         return "human_active"
 
     intent = state.get("intent")
@@ -615,7 +742,16 @@ def _build_graph():
         },
     )
 
-    for agent_node in ("pricing_agent", "order_agent", "escalation_agent"):
+    graph.add_conditional_edges(
+        "pricing_agent",
+        _after_pricing,
+        {
+            "post_guardrails": "post_guardrails",
+            "escalate": "escalation_agent",
+        },
+    )
+
+    for agent_node in ("order_agent", "escalation_agent"):
         graph.add_edge(agent_node, "post_guardrails")
 
     graph.add_edge("post_guardrails", "send_reply")

@@ -42,6 +42,25 @@ class Product(Base):
         return f"<Product {self.product_name!r}>"
 
 
+class RestrictedTerm(Base):
+    """Restricted product/salt term list maintained from client schedule sheet."""
+
+    __tablename__ = "restricted_terms"
+    __table_args__ = (
+        UniqueConstraint("normalized_term", name="uq_restricted_terms_normalized_term"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    term = Column(String(512), nullable=False)
+    normalized_term = Column(String(512), nullable=False, index=True)
+    schedule_category = Column(String(8), nullable=True)  # X, H, or H1
+    source = Column(String(64), nullable=False, default="manual")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RestrictedTerm {self.term!r} ({self.schedule_category or '-'})>"
+
+
 class BoxSpec(Base):
     __tablename__ = "box_specs"
 
