@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.business.restricted_products import match_restricted_term
 from app.agents.escalation import SESSION_ESCALATION_BUYER_REPLY
 from app.db.models import Product
+from app.messages.conversation_ui import MENU_SELECTION_ACK
 from app.messages.onboarding import looks_like_bulk_order, parse_bulk_order_lines
 from app.utils.tracing import get_async_openai_client, set_span_io
 
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_CALLS_PER_TURN = 3
 PRICING_MISS_ESCALATE_AFTER = 2
 CONTINUE_PRICING = "pricing"
+# WhatsApp list/button id — open pricing, not a product quote request.
+PRICING_MENU_OPEN_IDS = frozenset({"pricing"})
 
 PRICING_SYSTEM_PROMPT = (
     "You are a pharmaceutical export pricing specialist for New Life Medicare.\n"
@@ -310,6 +313,11 @@ def format_multi_product_quote(
     return "\n".join(parts).strip(), full_miss
 
 
+def is_pricing_menu_open(message: str) -> bool:
+    """True when buyer only opened Get Pricing via menu (no product name yet)."""
+    return (message or "").strip().lower() in PRICING_MENU_OPEN_IDS
+
+
 @observe(name="pricing_agent", capture_input=False)
 async def run_pricing_agent(
     message: str, session: dict, db: Session
@@ -332,6 +340,16 @@ async def run_pricing_agent(
             "country": country,
         }
     )
+
+    # Menu tap "pricing" is not a product query — ask for a name, no LLM/DB miss.
+    if is_pricing_menu_open(message):
+        intro = MENU_SELECTION_ACK.get("pricing") or (
+            "You selected *Get Pricing* 💰\n\n"
+            "Share a *product name* for a USD *per strip* quote.\n"
+            "Quantity is optional — only if you want a line total."
+        )
+        set_span_io(output_data={"status": "menu_open", "agent": "pricing"})
+        return intro, session, CONTINUE_PRICING
 
     # Phase 3: list / multi-product quotes — no LLM required.
     try:

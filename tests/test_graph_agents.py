@@ -133,6 +133,69 @@ async def test_faq_agent_node_calls_run_faq_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_faq_agent_node_skips_interim_on_menu_open(monkeypatch):
+    async def fake_run(message: str, phone: str = "", session: dict | None = None):
+        return "You selected *FAQs* ❓\n\nAsk away.", dict(session or {}), "faq"
+
+    monkeypatch.setattr(graph_mod, "run_faq_agent", fake_run)
+    interim = AsyncMock(return_value=True)
+    monkeypatch.setattr(graph_mod, "send_message", interim)
+    state: graph_mod.MessageState = {
+        "phone": "+1",
+        "message": "faq",
+        "message_id": "x",
+        "session": {},
+        "intent": "faq",
+        "agent_response": None,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    out = await graph_mod.faq_agent_node(state)
+    assert "FAQs" in out["agent_response"]
+    interim.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pricing_agent_node_skips_interim_on_menu_open(monkeypatch):
+    closed: list[str] = []
+
+    async def fake_run(message: str, session: dict, db):
+        return "You selected *Get Pricing* 💰", session, "pricing"
+
+    mock_db = MagicMock()
+
+    def mock_factory():
+        def mock_get_db():
+            try:
+                yield mock_db
+            finally:
+                closed.append("gen_finally")
+
+        return mock_get_db()
+
+    monkeypatch.setattr(graph_mod, "run_pricing_agent", fake_run)
+    monkeypatch.setattr(graph_mod, "_get_db_generator", mock_factory)
+    interim = AsyncMock(return_value=True)
+    monkeypatch.setattr(graph_mod, "send_message", interim)
+
+    out = await graph_mod.pricing_agent_node(
+        {
+            "phone": "+1",
+            "message": "pricing",
+            "message_id": "m1",
+            "session": {"lead_qualified": True},
+            "intent": "pricing",
+            "agent_response": None,
+            "guardrail_blocked": False,
+            "final_reply": None,
+        }
+    )
+    assert "Pricing" in out["agent_response"] or "product" in out["agent_response"].lower()
+    interim.assert_not_awaited()
+    assert closed == ["gen_finally"]
+
+
+@pytest.mark.asyncio
 async def test_faq_agent_node_escalates_on_repeated_miss(monkeypatch):
     async def fake_run(message: str, phone: str = "", session: dict | None = None):
         updated = dict(session or {})

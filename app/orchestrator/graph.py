@@ -67,6 +67,7 @@ from app.messages.conversation_ui import (
     SESSION_SUPPRESS_NAV_FOOTER,
     apply_menu_selection_ack,
     is_main_menu_request,
+    mark_menu_selection,
     send_main_menu_list,
     should_send_navigation_footer,
 )
@@ -315,12 +316,16 @@ async def router_node(state: MessageState) -> dict:
 
     if session.get("order_state"):
         if msg_key in {"faq", "faqs"}:
+            session = mark_menu_selection(session, message)
             return {"intent": "faq", "session": session}
         if msg_key == "pricing":
+            session = mark_menu_selection(session, message)
             return {"intent": "pricing", "session": session}
         if msg_key in {"my_orders", "my orders"}:
+            session = mark_menu_selection(session, message)
             return {"intent": "order", "session": session}
         if msg_key == "speak" or is_speak_to_team_request(message):
+            session = mark_menu_selection(session, message)
             session.setdefault("escalation_reason", "speak_to_team")
             return {"intent": "escalate", "session": session}
         if is_order_cancel_request(message) or is_order_restart_request(message):
@@ -334,9 +339,11 @@ async def router_node(state: MessageState) -> dict:
 
     # Mid-qual escapes: speak / FAQ must not be trapped in country/biz-type sticky.
     if msg_key == "speak" or is_speak_to_team_request(message):
+        session = mark_menu_selection(session, message)
         session.setdefault("escalation_reason", "speak_to_team")
         return {"intent": "escalate", "session": session}
     if msg_key in {"faq", "faqs"}:
+        session = mark_menu_selection(session, message)
         return {"intent": "faq", "session": session}
 
     # Only unfinished NEW buyers continue qualification.
@@ -365,6 +372,8 @@ def _merge_prior_reply(state: MessageState, new_reply: str) -> str:
 
 
 async def pricing_agent_node(state: MessageState) -> dict:
+    from app.agents.pricing import is_pricing_menu_open
+
     session = dict(state.get("session") or {})
     gen = _get_db_generator()
     db = next(gen)
@@ -373,7 +382,8 @@ async def pricing_agent_node(state: MessageState) -> dict:
         session["phone"] = phone
     session["last_agent"] = "pricing"
     # Interim WhatsApp ping only — not stored in agent_response, so _merge_prior_reply is unchanged.
-    if phone:
+    # Skip for bare menu open (no catalog lookup yet).
+    if phone and not is_pricing_menu_open(state.get("message") or ""):
         try:
             await send_message(phone, "One moment, checking that for you...")
         except Exception:
@@ -400,13 +410,16 @@ async def pricing_agent_node(state: MessageState) -> dict:
 
 
 async def faq_agent_node(state: MessageState) -> dict:
+    from app.agents.faq import is_faq_menu_open
+
     session = dict(state.get("session") or {})
     phone = state.get("phone") or ""
     if phone and not session.get("phone"):
         session["phone"] = phone
     session["last_agent"] = "faq"
     # Interim WhatsApp ping only — not stored in agent_response, so _merge_prior_reply is unchanged.
-    if phone:
+    # Skip for bare menu open (no Pinecone lookup yet).
+    if phone and not is_faq_menu_open(state.get("message") or ""):
         try:
             await send_message(phone, "One moment, checking that for you...")
         except Exception:
