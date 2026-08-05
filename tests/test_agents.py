@@ -321,6 +321,29 @@ async def test_run_faq_agent_missing_keys(monkeypatch):
     assert session.get("faq_miss_count") == 1
 
 
+@pytest.mark.asyncio
+async def test_run_faq_agent_menu_open_skips_rag(monkeypatch):
+    """Bare FAQ menu id must not hit Pinecone or count as a miss."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PINECONE_API_KEY", raising=False)
+
+    out, session, intent = await run_faq_agent("faq")
+
+    assert "FAQs" in out or "shipping" in out.lower()
+    assert "don't have specific information" not in out.lower()
+    assert intent == "faq"
+    assert session.get("faq_miss_count") in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_run_pricing_agent_menu_open_skips_llm(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    reply, session, intent = await run_pricing_agent("pricing", {}, order_db)
+    assert "product" in reply.lower() or "pricing" in reply.lower()
+    assert intent == "pricing"
+    assert session.get("pricing_miss_count") in (None, 0)
+
+
 def test_format_faq_ship_available_only_lists_present_services():
     from app.agents.faq import _format_faq_ship_available
 

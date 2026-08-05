@@ -24,9 +24,13 @@ from app.business.countries import (
 from app.business.shipping import get_shipping_options
 from app.db.database import SessionLocal
 from app.integrations.alerts import send_escalation_alert
+from app.messages.conversation_ui import MENU_SELECTION_ACK
 from app.utils.tracing import get_async_openai_client, set_span_io
 
 logger = logging.getLogger(__name__)
+
+# WhatsApp list/button ids — open FAQ, not a real knowledge question.
+FAQ_MENU_OPEN_IDS = frozenset({"faq", "faqs"})
 
 # Sample cart weights so FAQ availability matches checkout better than total_g=0 only.
 _FAQ_SHIP_WEIGHT_SAMPLES_G = (500, 1500, 5000)
@@ -196,6 +200,11 @@ def _format_faq_ship_available(destination: str, options: dict) -> str:
     return " ".join(parts)
 
 
+def is_faq_menu_open(message: str) -> bool:
+    """True when buyer only opened FAQs via menu/button (no real question yet)."""
+    return (message or "").strip().lower() in FAQ_MENU_OPEN_IDS
+
+
 @observe(name="faq_agent", capture_input=False)
 async def run_faq_agent(
     message: str,
@@ -212,6 +221,15 @@ async def run_faq_agent(
     reply text is empty — escalation_agent provides the buyer-facing handoff message.
     """
     session = dict(session or {})
+    # Menu tap "faq"/"faqs" is not a question — never RAG / never miss-count.
+    if is_faq_menu_open(message):
+        intro = MENU_SELECTION_ACK.get("faq") or (
+            "You selected *FAQs* ❓\n\n"
+            "What would you like to know about shipping, documents, or policies?"
+        )
+        set_span_io(output_data={"status": "menu_open", "agent": "faq"})
+        return intro, session, CONTINUE_FAQ
+
     buyer_phone = phone or session.get("phone") or ""
     destination = _extract_destination_country(message)
     if destination:

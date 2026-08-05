@@ -163,6 +163,8 @@ Uses `app/agents/lead_scoring.score_lead()` (client SOP, 0–100). At `QUAL_COMP
 - **Pure greeting** (`hi` / `hello` / … with no pricing/order/FAQ substance) → `menu_refresh` (disclosure once per Redis session + main menu; never FAQ miss)
 - **Main menu escape** (`main_menu` button or free text `menu` / `main menu` / `show menu` / `options`) → `menu_refresh` even mid-order / mid-qual (clears unfinished `qual_state` so buyers are not re-trapped)
 - Mid-qual **Speak to Team** / **FAQs** short-circuit to escalate / faq (not stuck in country picker)
+- Menu tap **`faq` / `faqs`** → FAQ intro only (ask what they want to know); **no Pinecone / no miss counter / no “One moment…”**
+- Menu tap **`pricing`** → pricing intro only (ask for product name); **no LLM catalog miss / no “One moment…”**
 - Mixed greeting + request (e.g. `hi, price for metformin`) → LLM → primary intent
 - **Catalog product name** (DB match, e.g. `KLENSMART 60MG`) → `pricing` (or `qualify` + `pending_intent=pricing` if unqualified). Skipped when message is clearly FAQ-process (`ship`/`documents`/…) or clear order request.
 
