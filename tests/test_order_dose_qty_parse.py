@@ -118,6 +118,22 @@ def catalog_db():
                 price_per_strip=0.95,
                 is_restricted=False,
             ),
+            Product(
+                product_name="KLENSMART 60MG TAB 1X10",
+                salt_name="Test salt",
+                manufacturing_company="Test",
+                expiry_date=date(2027, 1, 1),
+                price_per_strip=2.50,
+                is_restricted=False,
+            ),
+            Product(
+                product_name="BACLOHEAL 25MG TAB 1X10",
+                salt_name="Baclofen",
+                manufacturing_company="Test",
+                expiry_date=date(2027, 1, 1),
+                price_per_strip=1.80,
+                is_restricted=False,
+            ),
         ]
     )
     db.commit()
@@ -225,3 +241,257 @@ async def test_yes_confirm_with_explicit_qty_uses_db_price_not_zero(
     assert float(line["unit_price"]) == pytest.approx(1.25)
     assert "$0.00" not in reply
     assert "150.00" in reply or "$150" in reply
+
+
+@pytest.mark.asyncio
+async def test_cart_menu_bare_product_name_asks_quantity_not_assumes_one(
+    catalog_db, monkeypatch
+):
+    """Regression: screenshot bug — Bacloheal in CART_MENU must not add × 1."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    session = {"phone": "+15550001115", "lead_qualified": True}
+
+    # First product: name only → ask qty → add 200
+    _, session = await run_order_agent("ARKACAN 100 MCG TAB 1X30", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    _, session = await run_order_agent("200", session, catalog_db)
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 1
+    assert session["order_cart"][0]["quantity"] == 200
+
+    # Second product from cart menu: name only → must ask qty, not add × 1
+    reply, session = await run_order_agent("KLENSMART 60MG TAB 1X10", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert len(session["order_cart"]) == 1
+    assert "Found:" in reply or "strip" in reply.lower()
+    assert "number only" in reply.lower()
+
+    _, session = await run_order_agent("100", session, catalog_db)
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 2
+    assert session["order_cart"][1]["quantity"] == 100
+
+    # Third product: bare name while cart has items — still no qty assumption
+    reply, session = await run_order_agent("BACLOHEAL 25MG TAB 1X10", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert len(session["order_cart"]) == 2
+    cart_qtys = [line["quantity"] for line in session["order_cart"]]
+    assert 1 not in cart_qtys
+
+
+@pytest.mark.asyncio
+async def test_cart_menu_with_llm_enabled_still_uses_rules_for_product_add(
+    catalog_db, monkeypatch
+):
+    """CART_MENU product adds must stay deterministic even when LLM is on."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    llm_called = {"n": 0}
+
+    async def fake_create(*_args, **_kwargs):
+        llm_called["n"] += 1
+        raise AssertionError("LLM must not run for CART_MENU product collection")
+
+    mock_client = AsyncMock()
+    mock_client.chat.completions.create = fake_create
+    monkeypatch.setattr(
+        "app.agents.order.get_async_openai_client",
+        lambda **_: mock_client,
+    )
+
+    session = {
+        "phone": "+15550001116",
+        "lead_qualified": True,
+        "order_state": CART_MENU,
+        "order_cart": [
+            {
+                "sku": "PROD-0001",
+                "product_name": "ARKACAN 100 MCG TAB 1X30",
+                "quantity": 200,
+                "qty": 200,
+                "unit_price": 1.25,
+            }
+        ],
+    }
+
+    reply, session = await run_order_agent(
+        "BACLOHEAL 25MG TAB 1X10", session, catalog_db
+    )
+    assert llm_called["n"] == 0
+    assert session["order_state"] == COLLECT_QTY
+    assert len(session["order_cart"]) == 1
+    assert "strip" in reply.lower() or "Found:" in reply
+
+
+@pytest.mark.asyncio
+async def test_llm_add_to_cart_without_stated_qty_blocks_assumption(
+    catalog_db, monkeypatch
+):
+    """Tool guard: add_to_cart rejects invented quantity when buyer did not state it."""
+    from app.agents.order import _tool_add_to_cart
+
+    session = {
+        "phone": "+15550001117",
+        "_order_turn_message": "BACLOHEAL 25MG TAB 1X10",
+    }
+    result = _tool_add_to_cart(
+        {"product_query": "BACLOHEAL 25MG TAB 1X10", "quantity": 1},
+        session,
+        catalog_db,
+    )
+    assert result.get("error") == "needs_quantity"
+    assert session.get("order_state") == COLLECT_QTY
+    assert not session.get("order_cart")
+
+
+@pytest.mark.asyncio
+async def test_bulk_queue_advances_without_double_ask(catalog_db, monkeypatch):
+    """Multi-name bulk without qty: ask A → qty → ask B → qty → done."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    session = {"phone": "+15550001118", "lead_qualified": True}
+    reply, session = await run_order_agent(
+        "ARKACAN 100 MCG TAB 1X30\nKLENSMART 60MG TAB 1X10",
+        session,
+        catalog_db,
+    )
+    assert session["order_state"] == COLLECT_QTY
+    assert session.get("order_product_name") == "ARKACAN 100 MCG TAB 1X30"
+    assert len(session.get("order_bulk_queue") or []) == 1
+
+    _, session = await run_order_agent("200", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert session.get("order_product_name") == "KLENSMART 60MG TAB 1X10"
+    assert not session.get("order_bulk_queue")
+
+    reply, session = await run_order_agent("100", session, catalog_db)
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 2
+    assert session["order_cart"][0]["quantity"] == 200
+    assert session["order_cart"][1]["quantity"] == 100
+    assert "KLENSMART" in reply
+
+
+@pytest.mark.asyncio
+async def test_bulk_mixed_qty_adds_explicit_and_queues_missing(catalog_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    session = {"phone": "+15550001119", "lead_qualified": True}
+    reply, session = await run_order_agent(
+        "ARKACAN 100 MCG TAB 1X30 - 200\nKLENSMART 60MG TAB 1X10",
+        session,
+        catalog_db,
+    )
+    assert session["order_state"] == COLLECT_QTY
+    assert len(session["order_cart"]) == 1
+    assert session["order_cart"][0]["quantity"] == 200
+
+    _, session = await run_order_agent("100", session, catalog_db)
+    assert session["order_state"] == CART_MENU
+    assert len(session["order_cart"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_collect_qty_product_switch_preserves_bulk_queue(catalog_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    session = {"phone": "+15550001120", "lead_qualified": True}
+    _, session = await run_order_agent(
+        "ARKACAN 100 MCG TAB 1X30\nKLENSMART 60MG TAB 1X10",
+        session,
+        catalog_db,
+    )
+    # Switch while qty pending for ARKACAN — use short name to avoid pack-size false qty
+    reply, session = await run_order_agent("bacloheal", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert session.get("order_product_name") == "BACLOHEAL 25MG TAB 1X10"
+    queue = session.get("order_bulk_queue") or []
+    assert len(queue) == 2
+    assert queue[0]["query"] == "ARKACAN 100 MCG TAB 1X30"
+    assert queue[1]["query"] == "KLENSMART 60MG TAB 1X10"
+
+    _, session = await run_order_agent("50", session, catalog_db)
+    assert session["order_state"] == COLLECT_QTY
+    assert session.get("order_product_name") == "ARKACAN 100 MCG TAB 1X30"
+
+
+@pytest.mark.asyncio
+async def test_cart_menu_change_line_qty_natural_language(catalog_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    session = {
+        "phone": "+15550001121",
+        "lead_qualified": True,
+        "order_state": CART_MENU,
+        "order_cart": [
+            {
+                "sku": "PROD-0001",
+                "product_name": "ARKACAN 100 MCG TAB 1X30",
+                "quantity": 200,
+                "qty": 200,
+                "unit_price": 1.25,
+            },
+            {
+                "sku": "PROD-0002",
+                "product_name": "KLENSMART 60MG TAB 1X10",
+                "quantity": 100,
+                "qty": 100,
+                "unit_price": 2.50,
+            },
+        ],
+    }
+    reply, session = await run_order_agent("change line 2 to 600", session, catalog_db)
+    assert session["order_cart"][1]["quantity"] == 600
+    assert "600" in reply
+
+
+@pytest.mark.asyncio
+async def test_short_product_miss_does_not_invoke_llm(catalog_db, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "true")
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons", AsyncMock(return_value=True)
+    )
+
+    llm_called = {"n": 0}
+
+    async def fake_create(*_args, **_kwargs):
+        llm_called["n"] += 1
+        raise AssertionError("LLM must not run for short catalog miss")
+
+    mock_client = AsyncMock()
+    mock_client.chat.completions.create = fake_create
+    monkeypatch.setattr(
+        "app.agents.order.get_async_openai_client",
+        lambda **_: mock_client,
+    )
+
+    session = {"phone": "+15550001122", "lead_qualified": True}
+    reply, session = await run_order_agent("xyznotaproduct", session, catalog_db)
+    assert llm_called["n"] == 0
+    assert "couldn't find" in reply.lower()

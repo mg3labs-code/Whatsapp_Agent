@@ -367,9 +367,19 @@ async def test_pending_shipping_quote_no_wire_details(order_db, monkeypatch):
         "app.agents.order.send_message",
         AsyncMock(return_value=True),
     )
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons",
+        AsyncMock(return_value=True),
+    )
+    # Isolate from live Redis: a leftover pending-quote lock would skip
+    # draft persistence and never set last_order_awaiting_shipping_quote.
+    monkeypatch.setattr(
+        "app.agents.order._try_acquire_pending_quote_lock",
+        AsyncMock(return_value=True),
+    )
 
     session = {"phone": "+919876543299", "country": "Atlantis"}
-    await run_order_agent("order", session, order_db)
+    _, session = await run_order_agent("order", session, order_db)
     _, session = await run_order_agent("Metformin 500mg - 50", session, order_db)
     _, session = await run_order_agent("checkout", session, order_db)
     reply, session = await run_order_agent("Sam Buyer, Nowhere", session, order_db)
@@ -526,4 +536,4 @@ async def test_order_bulk_list_adds_multiple_products(order_db, monkeypatch):
     )
     assert session["order_state"] == CART_MENU
     assert len(session["order_cart"]) == 2
-    assert "Added to cart" in reply
+    assert "Added *" in reply

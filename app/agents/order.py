@@ -143,6 +143,8 @@ ORDER_SYSTEM_PROMPT = (
     "- Always call lookup_product before add_to_cart; use the exact catalog name from lookup.\n"
     "- add_to_cart requires a positive integer quantity of *strips* "
     "(parse '2k' as 2000, 'two thousand' as 2000).\n"
+    "- Never call add_to_cart unless the buyer's *current* message states the quantity.\n"
+    "- If a product is found but quantity is missing, ask how many strips — never assume 1.\n"
     "- update_cart_line / remove_from_cart: use line_number OR product_query.\n"
     "- proceed_to_checkout only when the buyer wants to finish adding products and the cart is non-empty.\n"
     "- At checkout, reuse session.country as order_country when present — do not re-ask country.\n"
@@ -442,6 +444,7 @@ async def _apply_product_match_result(
     match_mode: str,
     qty: int | None,
     phone: str,
+    db: Session,
 ) -> tuple[str, dict]:
     """Add direct match to cart, confirm fuzzy match, or ask for missing quantity."""
     # Only keep explicit order qty (dose digits never become pending_qty).
@@ -465,12 +468,14 @@ async def _apply_product_match_result(
 
     if explicit_qty is not None:
         _add_resolved_product_to_cart(session, product, explicit_qty)
+        continued = await _continue_bulk_queue(session, db, phone)
+        if continued:
+            return continued
         session["order_state"] = CART_MENU
         if phone:
             await _send_cart_action_buttons(phone)
         return (
-            f"Added *{product.product_name}* × {explicit_qty} to cart.\n\n"
-            f"{_format_cart_lines(_get_cart(session))}",
+            _format_added_to_cart_reply(product.product_name, explicit_qty, session),
             session,
         )
 
@@ -527,16 +532,47 @@ def _prefill_order_country(session: dict) -> str | None:
     return None
 
 
-def _get_bulk_queue(session: dict) -> list[str]:
-    queue = session.get("order_bulk_queue")
-    return list(queue) if isinstance(queue, list) else []
+def _normalize_bulk_queue_item(item: str | dict[str, Any]) -> dict[str, Any]:
+    """Normalize queue entries to {query, qty} (supports legacy string-only queues)."""
+    if isinstance(item, str):
+        return {"query": item.strip(), "qty": None}
+    if isinstance(item, dict):
+        query = (item.get("query") or "").strip()
+        qty_raw = item.get("qty")
+        qty: int | None
+        try:
+            qty = int(qty_raw) if qty_raw is not None else None
+        except (TypeError, ValueError):
+            qty = None
+        if qty is not None and qty < 1:
+            qty = None
+        return {"query": query, "qty": qty}
+    return {"query": "", "qty": None}
 
 
-def _set_bulk_queue(session: dict, queue: list[str]) -> None:
-    if queue:
-        session["order_bulk_queue"] = queue
+def _get_bulk_queue(session: dict) -> list[dict[str, Any]]:
+    raw = session.get("order_bulk_queue")
+    if not isinstance(raw, list):
+        return []
+    return [_normalize_bulk_queue_item(item) for item in raw if _normalize_bulk_queue_item(item)["query"]]
+
+
+def _set_bulk_queue(session: dict, queue: list[dict[str, Any]]) -> None:
+    normalized = [_normalize_bulk_queue_item(item) for item in queue]
+    normalized = [item for item in normalized if item["query"]]
+    if normalized:
+        session["order_bulk_queue"] = normalized
     else:
         session.pop("order_bulk_queue", None)
+
+
+def _prepend_bulk_queue_item(session: dict, query: str, qty: int | None = None) -> None:
+    query = (query or "").strip()
+    if not query:
+        return
+    queue = _get_bulk_queue(session)
+    queue.insert(0, {"query": query, "qty": qty})
+    _set_bulk_queue(session, queue)
 
 
 def _prompt_product_quantity(session: dict, product: Product) -> tuple[str, dict]:
@@ -559,7 +595,7 @@ async def _process_bulk_order(
     if not lines:
         return BULK_LIST_PROMPT, session
 
-    added: list[str] = []
+    added: list[tuple[str, int]] = []
     failed: list[str] = []
     pending: list[tuple[str, int | None]] = []
 
@@ -575,26 +611,26 @@ async def _process_bulk_order(
             pending.append((query, qty))
             continue
         _add_resolved_product_to_cart(session, product, qty)
-        added.append(f"{product.product_name} × {qty}")
+        added.append((product.product_name, qty))
 
     if pending:
         first_query, first_qty = pending[0]
-        _set_bulk_queue(session, [query for query, _ in pending[1:]])
+        _set_bulk_queue(
+            session,
+            [{"query": query, "qty": qty} for query, qty in pending[1:]],
+        )
         product, error, match_mode = _resolve_product_match(first_query, db)
         if product is not None and error != "restricted":
             return await _apply_product_match_result(
-                session, product, match_mode, first_qty, phone
+                session, product, match_mode, first_qty, phone, db
             )
 
     if added:
         session["order_state"] = CART_MENU
-        reply_lines = ["✅ Added to cart:", *[f"• {line}" for line in added]]
-        if failed:
-            reply_lines.append("\nCouldn't match: " + ", ".join(failed))
-        reply_lines.append(f"\n{_format_cart_lines(_get_cart(session))}")
+        reply = _format_multi_added_reply(added, session, failed=failed or None)
         if phone:
             await _send_cart_action_buttons(phone)
-        return "\n".join(reply_lines), session
+        return reply, session
 
     suggestions: list[str] = []
     for query, _ in lines[:3]:
@@ -609,19 +645,25 @@ async def _continue_bulk_queue(session: dict, db: Session, phone: str) -> tuple[
     queue = _get_bulk_queue(session)
     if not queue:
         return None
-    next_query = queue[0]
-    product, error, _ = _resolve_product_match(next_query, db)
+    item = queue.pop(0)
+    _set_bulk_queue(session, queue)
+    next_query = item["query"]
+    pending_qty = item.get("qty")
+    product, error, match_mode = _resolve_product_match(next_query, db)
     if product is None or error == "restricted":
-        queue.pop(0)
-        _set_bulk_queue(session, queue)
         if not queue:
             session["order_state"] = CART_MENU
+            if phone:
+                await _send_cart_action_buttons(phone)
             return (
-                f"Couldn't match *{next_query}*. Skipped.\n\n{_format_cart_lines(_get_cart(session))}",
+                f"Couldn't match *{next_query}*. Skipped.\n\n"
+                f"{_format_cart_lines(_get_cart(session))}",
                 session,
             )
         return await _continue_bulk_queue(session, db, phone)
-    return _prompt_product_quantity(session, product)
+    return await _apply_product_match_result(
+        session, product, match_mode, pending_qty, phone, db
+    )
 
 
 def _format_money(amount: float) -> str:
@@ -635,6 +677,30 @@ def _cart_total(cart: list[dict[str, Any]]) -> float:
         unit_price = float(item.get("unit_price") or 0.0)
         total += qty * unit_price
     return round(total, 2)
+
+
+def _format_added_to_cart_reply(product_name: str, qty: int, session: dict) -> str:
+    """Single consistent confirmation after a cart line is added."""
+    return (
+        f"Added *{product_name}* × {qty} to cart.\n\n"
+        f"{_format_cart_lines(_get_cart(session))}"
+    )
+
+
+def _format_multi_added_reply(
+    added: list[tuple[str, int]],
+    session: dict,
+    *,
+    failed: list[str] | None = None,
+) -> str:
+    """Bulk add confirmation using the same wording as single-line adds."""
+    lines = [
+        f"Added *{name}* × {qty} to cart." for name, qty in added
+    ]
+    if failed:
+        lines.append("\nCouldn't match: " + ", ".join(failed))
+    lines.append(f"\n{_format_cart_lines(_get_cart(session))}")
+    return "\n".join(lines)
 
 
 def _format_cart_lines(cart: list[dict[str, Any]]) -> str:
@@ -1315,6 +1381,18 @@ def _tool_lookup_product(args: dict, db: Session) -> dict:
     }
 
 
+def _quantity_stated_in_turn(session: dict, qty: int) -> bool:
+    """True when qty was explicitly provided by the buyer this turn (never assume)."""
+    pending = session.get("order_pending_qty")
+    if pending is not None and int(pending) == qty:
+        return True
+    message = (session.get("_order_turn_message") or "").strip()
+    if not message:
+        return False
+    stated = _extract_positive_int(message)
+    return stated is not None and stated == qty
+
+
 def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
     qty = args.get("quantity")
     try:
@@ -1341,6 +1419,32 @@ def _tool_add_to_cart(args: dict, session: dict, db: Session) -> dict:
             "error": "product_not_found",
             "suggestions": _suggest_products(args.get("product_query", ""), db),
         }
+
+    if not _quantity_stated_in_turn(session, qty):
+        if match_mode == "token":
+            _set_pending_product(
+                session,
+                sku=_product_sku(product),
+                product_name=product.product_name,
+                qty=None,
+            )
+            session["order_state"] = COLLECT_SKU_CONFIRM
+            return {
+                "error": "needs_product_confirmation",
+                "candidate": product.product_name,
+                "query": product_query,
+            }
+        session["order_sku"] = _product_sku(product)
+        session["order_product_name"] = product.product_name
+        session["order_unit_price"] = float(product.price_per_strip or 0.0)
+        session["order_state"] = COLLECT_QTY
+        session.pop("order_qty_custom", None)
+        return {
+            "error": "needs_quantity",
+            "product_name": product.product_name,
+            "message": product_qty_prompt(product.product_name),
+        }
+
     if match_mode == "token":
         _set_pending_product(
             session,
@@ -2319,6 +2423,56 @@ def _parse_qty_command(text: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2).replace(",", ""))
 
 
+def _parse_change_line_qty(text: str) -> tuple[int, int] | None:
+    """Parse 'change line 2 to 600' / 'update #2 500' / 'make line 2 600'."""
+    match = re.search(
+        r"\b(?:change|update|set|make)\s+(?:line\s+)?#?(\d+)\s+(?:to\s+)?(\d[\d,]*)\s*(?:strips?)?\b",
+        (text or "").strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2).replace(",", ""))
+
+
+def _parse_change_product_qty(text: str) -> tuple[str, int] | None:
+    """Parse 'change bacloheal to 600' / 'update metformin 500'."""
+    match = re.search(
+        r"\b(?:change|update|set|make)\s+(.+?)\s+to\s+(\d[\d,]*)\s*(?:strips?)?\b",
+        (text or "").strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    product_query = match.group(1).strip()
+    if not product_query:
+        return None
+    return product_query, int(match.group(2).replace(",", ""))
+
+
+def _should_use_llm_product_fallback(message: str) -> bool:
+    """Only use LLM product miss fallback for natural-language order phrasing."""
+    text = (message or "").strip()
+    if len(text) < 12:
+        return False
+    lowered = text.lower()
+    natural_markers = (
+        "i need",
+        "i want",
+        "looking for",
+        "please send",
+        "can you",
+        "do you have",
+        "send me",
+        "order ",
+        "buy ",
+        "purchase ",
+    )
+    if any(marker in lowered for marker in natural_markers):
+        return True
+    return len(text.split()) >= 6
+
+
 def _normalize_menu_action(text: str) -> str | None:
     lowered = (text or "").strip().lower()
     if not lowered:
@@ -2387,7 +2541,91 @@ def _try_cart_edit_commands(
         if result.get("error"):
             return f"Could not update line {line_no}.", session
         return f"Updated line {line_no} to {qty} strips.", session
+    line_qty_edit = _parse_change_line_qty(text)
+    if line_qty_edit is not None:
+        line_no, qty = line_qty_edit
+        result = _tool_update_cart_line({"line_number": line_no, "quantity": qty}, session)
+        if result.get("error"):
+            return f"Could not update line {line_no}.", session
+        return (
+            f"Updated line {line_no} to {qty} strips.\n\n"
+            f"{_format_cart_lines(_get_cart(session))}",
+            session,
+        )
+    product_qty_edit = _parse_change_product_qty(text)
+    if product_qty_edit is not None:
+        product_query, qty = product_qty_edit
+        idx = _find_cart_line(cart, None, product_query)
+        if idx is None:
+            return f"Couldn't find *{product_query}* in your cart.", session
+        line_name = cart[idx].get("product_name") or product_query
+        result = _tool_update_cart_line(
+            {"line_number": idx + 1, "quantity": qty}, session
+        )
+        if result.get("error"):
+            return f"Could not update *{product_query}*.", session
+        return (
+            f"Updated *{line_name}* to {qty} strips.\n\n"
+            f"{_format_cart_lines(_get_cart(session))}",
+            session,
+        )
     return None
+
+
+async def _handle_product_add_message(
+    text: str,
+    message: str,
+    session: dict,
+    db: Session,
+    phone: str,
+    *,
+    in_cart: bool = False,
+) -> tuple[str, dict]:
+    """Resolve a product line and add, confirm, or ask for strips — never assume qty."""
+    if _is_order_status_query(text) or _is_order_account_query(text):
+        return await _handle_order_lookup(message, session, db)
+    if _is_filler_message(text):
+        filler = await _handle_order_filler(session, text)
+        if filler:
+            return filler
+    if not text or (not in_cart and any(m in text.lower() for m in _ORDER_INTENT_MARKERS)):
+        return BULK_LIST_PROMPT, session
+    if looks_like_bulk_order(text):
+        return await _process_bulk_order(text, session, db, phone)
+
+    product_query, parsed_qty = _split_product_query_and_qty(text)
+    product, error, match_mode = _resolve_product_match(product_query, db)
+    if product is None and product_query != text:
+        product, error, match_mode = _resolve_product_match(text, db)
+    if error == "restricted":
+        return (
+            "I'm unable to assist with that product through this channel. "
+            "Please contact our medical compliance team directly.",
+            session,
+        )
+    if product is None:
+        if _looks_like_off_topic_question(text):
+            return _OFF_TOPIC_QUESTION_REPLY, session
+        suggestions = _suggest_products(product_query, db)
+        reply = _PRODUCT_NOT_FOUND_REPLY
+        if suggestions:
+            reply += "\n\nDid you mean:\n• " + "\n• ".join(suggestions)
+        if in_cart and _get_cart(session):
+            reply += f"\n\n{_format_cart_lines(_get_cart(session))}"
+        return reply, session
+    return await _apply_product_match_result(
+        session, product, match_mode, parsed_qty, phone, db
+    )
+
+
+def _cart_menu_fallback_reply(session: dict) -> str:
+    """When cart is open and input isn't checkout/add/product — show cart + next steps."""
+    cart_text = _format_cart_lines(_get_cart(session))
+    return (
+        f"{cart_text}\n\n"
+        "Send a *product name* to add more (we'll ask for strips), "
+        "or *Product name - strips*. Type *checkout* when done."
+    )
 
 
 async def _run_order_rules(
@@ -2434,11 +2672,16 @@ async def _run_order_rules(
             if pending_qty:
                 _add_resolved_product_to_cart(session, product, int(pending_qty))
                 _clear_pending_product(session)
+                continued = await _continue_bulk_queue(session, db, phone)
+                if continued:
+                    return continued
                 session["order_state"] = CART_MENU
                 if phone:
                     await _send_cart_action_buttons(phone)
                 return (
-                    f"Added to cart.\n\n{_format_cart_lines(_get_cart(session))}",
+                    _format_added_to_cart_reply(
+                        product.product_name, int(pending_qty), session
+                    ),
                     session,
                 )
             _clear_pending_product(session)
@@ -2452,36 +2695,8 @@ async def _run_order_rules(
         state = COLLECT_SKU
 
     if state == COLLECT_SKU:
-        if _is_order_status_query(text) or _is_order_account_query(text):
-            return await _handle_order_lookup(message, session, db)
-        if _is_filler_message(text):
-            filler = await _handle_order_filler(session, text)
-            if filler:
-                return filler
-        if not text or any(m in text.lower() for m in _ORDER_INTENT_MARKERS):
-            return BULK_LIST_PROMPT, session
-        if looks_like_bulk_order(text):
-            return await _process_bulk_order(text, session, db, phone)
-        product_query, parsed_qty = _split_product_query_and_qty(text)
-        product, error, match_mode = _resolve_product_match(product_query, db)
-        if product is None and product_query != text:
-            product, error, match_mode = _resolve_product_match(text, db)
-        if error == "restricted":
-            return (
-                "I'm unable to assist with that product through this channel. "
-                "Please contact our medical compliance team directly.",
-                session,
-            )
-        if product is None:
-            if _looks_like_off_topic_question(text):
-                return _OFF_TOPIC_QUESTION_REPLY, session
-            suggestions = _suggest_products(product_query, db)
-            reply = _PRODUCT_NOT_FOUND_REPLY
-            if suggestions:
-                reply += "\n\nDid you mean:\n• " + "\n• ".join(suggestions)
-            return reply, session
-        return await _apply_product_match_result(
-            session, product, match_mode, parsed_qty, phone
+        return await _handle_product_add_message(
+            text, message, session, db, phone, in_cart=False
         )
 
     if state == COLLECT_QTY:
@@ -2498,9 +2713,7 @@ async def _run_order_rules(
         if is_qty_instruction_echo(text):
             name = session.get("order_product_name") or "your product"
             return (
-                f"Still adding *{name}*.\n\n"
-                f"How many *strips* do you need?\n"
-                f"Reply with a *number only* (example: *350*).",
+                f"Still adding *{name}*.\n\n{product_qty_prompt(name)}",
                 session,
             )
 
@@ -2522,7 +2735,7 @@ async def _run_order_rules(
                     if match_mode == "token":
                         _clear_pending_product(session)
                         return await _apply_product_match_result(
-                            session, product, match_mode, parsed_qty, phone
+                            session, product, match_mode, parsed_qty, phone, db
                         )
                     _clear_pending_product(session)
                     _add_resolved_product_to_cart(session, product, parsed_qty)
@@ -2533,8 +2746,9 @@ async def _run_order_rules(
                     if phone:
                         await _send_cart_action_buttons(phone)
                     return (
-                        f"Added *{product.product_name}* × {parsed_qty} to cart.\n\n"
-                        f"{_format_cart_lines(_get_cart(session))}",
+                        _format_added_to_cart_reply(
+                            product.product_name, parsed_qty, session
+                        ),
                         session,
                     )
                 # Same pending product with explicit "Name - qty"
@@ -2552,13 +2766,14 @@ async def _run_order_rules(
                     session,
                 )
             if product is not None:
+                current_name = (session.get("order_product_name") or "").strip()
+                if current_name and current_name != product.product_name:
+                    _prepend_bulk_queue_item(session, current_name, None)
                 _clear_pending_product(session)
                 return _prompt_product_quantity(session, product)
             name = session.get("order_product_name") or "your product"
             return (
-                f"Still adding *{name}*.\n\n"
-                f"How many *strips* do you need?\n"
-                f"Reply with a *number only* (example: *350*).",
+                f"Still adding *{name}*.\n\n{product_qty_prompt(name)}",
                 session,
             )
 
@@ -2580,10 +2795,15 @@ async def _run_order_rules(
             return continued
 
         session["order_state"] = CART_MENU
-        cart_text = _format_cart_lines(_get_cart(session))
+        product_name = session.get("order_product_name") or ""
         if phone:
             await _send_cart_action_buttons(phone)
-        return cart_text, session
+        if product_name:
+            return (
+                _format_added_to_cart_reply(product_name, qty, session),
+                session,
+            )
+        return _format_cart_lines(_get_cart(session)), session
 
     if state == CART_MENU:
         action = _normalize_menu_action(text)
@@ -2601,7 +2821,17 @@ async def _run_order_rules(
             if phone:
                 await _send_cart_action_buttons(phone)
             return cart_text, session
-        return "Tap *Checkout* or type *checkout*. Send more lines as *Product - strips* to add.", session
+        if looks_like_bulk_order(text):
+            return await _process_bulk_order(text, session, db, phone)
+        product_query, parsed_qty = _split_product_query_and_qty(text)
+        product, error, match_mode = _resolve_product_match(product_query, db)
+        if product is None and product_query != text:
+            product, error, match_mode = _resolve_product_match(text, db)
+        if product is not None or error == "restricted" or parsed_qty is not None:
+            return await _handle_product_add_message(
+                text, message, session, db, phone, in_cart=True
+            )
+        return _cart_menu_fallback_reply(session), session
 
     if state == COLLECT_CHECKOUT:
         parsed = parse_checkout_oneline(
@@ -2729,18 +2959,22 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
 
     _ensure_order_started(session)
     state = session.get("order_state") or COLLECT_SKU
+    session["_order_turn_message"] = text
     use_llm = os.getenv("ORDER_AGENT_USE_LLM", "true").lower() in {"1", "true", "yes"}
 
-    # Deterministic UX guards regardless of LLM mode.
+    # Deterministic cart-building and checkout — LLM must not invent quantities.
     if state in {
         COLLECT_SKU,
         COLLECT_QTY,
         COLLECT_SKU_CONFIRM,
+        CART_MENU,
+        COLLECT_COUNTRY,
+        COLLECT_CITY,
+        COLLECT_CONTACT,
         SHIPPING_CHOICE,
         COLLECT_CHECKOUT,
         CONFIRM_ORDER,
         PENDING_SHIPPING_QUOTE,
-        SHIPPING_CHOICE,
     }:
         reply, session = await _run_order_rules(message, session, db)
         if (
@@ -2748,26 +2982,23 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
             and use_llm
             and os.getenv("OPENAI_API_KEY")
             and reply.startswith(_PRODUCT_NOT_FOUND_REPLY)
+            and _should_use_llm_product_fallback(message)
         ):
             try:
                 reply, session = await _run_order_llm(message, session, db)
             except Exception:
                 logger.exception("Order LLM fallback failed after product lookup miss")
-        return await _finish_order_turn(reply, session)
-    if state == CART_MENU and (
-        not text
-        or text.lower() in {"done", "checkout", "add"}
-        or _normalize_menu_action(text) in {"done", "add"}
-    ):
-        reply, session = await _run_order_rules(message, session, db)
+        session.pop("_order_turn_message", None)
         return await _finish_order_turn(reply, session)
 
     if use_llm and os.getenv("OPENAI_API_KEY"):
         try:
             reply, session = await _run_order_llm(message, session, db)
+            session.pop("_order_turn_message", None)
             return await _finish_order_turn(reply, session)
         except Exception:
             logger.exception("Order LLM agent failed; using rule fallback")
 
     reply, session = await _run_order_rules(message, session, db)
+    session.pop("_order_turn_message", None)
     return await _finish_order_turn(reply, session)
