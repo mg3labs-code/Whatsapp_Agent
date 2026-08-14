@@ -81,3 +81,4 @@ def match_restricted_term(query: str, db: Session) -> RestrictedTermHit | None:
         if normalized_term in normalized_query:
             return RestrictedTermHit(term=original, schedule_category=category)
     return None
+  

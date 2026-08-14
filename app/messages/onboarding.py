@@ -30,12 +30,13 @@ COUNTRY_BUTTON_IDS = frozenset(COUNTRY_ID_TO_NAME.keys()) | {"country_other"}
 
 # Canonical order-start + multi-product format (strips). Use everywhere buyers start ordering.
 BULK_LIST_PROMPT = (
-    "📋 *Send each product like this (quantity = number of strips):*\n\n"
+    "📋 *Add products to your order:*\n\n"
+    "• Send a *product name* — we'll ask how many *strips*\n"
+    "• Or send *Product name - strips* (one line or many)\n\n"
     "*Example:*\n"
     "JGLUT 2000MG 30ML - 350\n"
     "Metformin 500mg - 100\n"
-    "Amoxicillin 500mg - 200\n\n"
-    "Reply with *Product name - strips* — one line or many."
+    "Amoxicillin 500mg - 200"
 )
 
 # Alias for a single consistent order-entry path.
