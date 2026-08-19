@@ -1,6 +1,6 @@
 """Phase 1 UX — country once, bulk list, quantity buttons, single checkout."""
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,7 +13,10 @@ from app.agents.order import (
     COLLECT_CHECKOUT,
     COLLECT_QTY,
     CONFIRM_ORDER,
+    POST_PAYMENT_BUTTONS,
     _extract_order_status_ref,
+    _format_order_review,
+    _handle_bank_transfer,
     is_order_account_message,
     is_order_tracking_message,
     run_order_agent,
@@ -437,7 +440,10 @@ async def test_order_cancel_from_collect_qty(order_db, monkeypatch):
     assert session.get("show_main_menu_after_reply") is True
     assert "faq_miss_count" not in session
     assert "clarification_count" not in session
-    assert "order cancelled" in reply.lower()
+    assert "stopped" in reply.lower()
+    assert "cart was cleared" not in reply.lower()
+    assert "order cancelled" not in reply.lower()
+    assert "nothing was placed" in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -537,3 +543,418 @@ async def test_order_bulk_list_adds_multiple_products(order_db, monkeypatch):
     assert session["order_state"] == CART_MENU
     assert len(session["order_cart"]) == 2
     assert "Added *" in reply
+
+
+@pytest.mark.asyncio
+async def test_cart_stage_sends_clear_cart_button(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    captured: list[tuple] = []
+
+    async def fake_buttons(phone, body, buttons):
+        captured.append((phone, body, buttons))
+        return True
+
+    monkeypatch.setattr("app.agents.order.send_interactive_buttons", fake_buttons)
+    session = {"phone": "+919876543250", "country": "Kenya", "lead_qualified": True}
+    await run_order_agent("order", session, order_db)
+    await run_order_agent("Metformin 500mg - 100", session, order_db)
+    assert captured
+    body, buttons = captured[-1][1], captured[-1][2]
+    ids = [btn["id"] for btn in buttons]
+    assert "clear_cart" in ids
+    assert "checkout" in ids
+    assert "add" in ids
+    assert "cancel_order" not in ids
+    assert "clear cart" in body.lower()
+    assert "does not cancel a placed order" in body.lower()
+
+
+def _add_order_row(
+    db,
+    *,
+    phone: str,
+    order_ref: str,
+    payment_status: str,
+    status: str,
+    created_at: datetime,
+    sku: str = "PROD-1",
+):
+    db.add(
+        Order(
+            phone=phone,
+            sku=sku,
+            product_name="Metformin 500mg",
+            quantity=100,
+            country="Kenya",
+            city="Nairobi",
+            contact_name="Jane",
+            order_ref=order_ref,
+            status=status,
+            payment_status=payment_status,
+            created_at=created_at,
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_cart_without_touching_placed_order(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_order_cancelled_alert",
+        AsyncMock(return_value=True),
+    )
+    phone = "+919876543240"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-1111-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "order_state": CART_MENU,
+        "order_cart": [
+            {
+                "sku": "PROD-1",
+                "product_name": "Metformin 500mg",
+                "quantity": 50,
+                "qty": 50,
+                "unit_price": 0.95,
+            }
+        ],
+    }
+
+    reply, session = await run_order_agent("cancel", session, order_db)
+    assert "stopped" in reply.lower()
+    assert "cart was cleared" in reply.lower()
+    assert "order cancelled" not in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-1111-L01").one()
+    assert row.payment_status == "awaiting_payment"
+    assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_new_order_does_not_cancel_placed_order(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    phone = "+919876543241"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-2222-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "last_order_ref": "ORD-20260618-2222",
+        "order_state": None,
+    }
+    reply, session = await run_order_agent("new order", session, order_db)
+    assert "cart cleared" in reply.lower() or "strips" in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-2222-L01").one()
+    assert row.payment_status == "awaiting_payment"
+
+
+@pytest.mark.asyncio
+async def test_cancel_placed_awaiting_payment_updates_my_orders(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    alerts: list[dict] = []
+
+    async def fake_cancel_alert(payload):
+        alerts.append(payload)
+        return True
+
+    monkeypatch.setattr("app.agents.order.send_order_cancelled_alert", fake_cancel_alert)
+    phone = "+919876543242"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-3333-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "last_order_ref": "ORD-20260618-3333",
+        "last_order_total": 95.0,
+    }
+
+    reply, session = await run_order_agent("cancel the order placed", session, order_db)
+    assert "ORD-20260618-3333" in reply
+    assert "cancelled" in reply.lower()
+    assert "my orders" in reply.lower()
+    assert session.get("last_order_ref") is None
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-3333-L01").one()
+    assert row.status == "cancelled"
+    assert row.payment_status == "cancelled"
+    assert alerts and alerts[0]["order_ref"] == "ORD-20260618-3333"
+
+    listing, _ = await run_order_agent("my orders", session, order_db)
+    assert "Cancelled" in listing
+    assert "ORD-20260618-3333" in listing
+    assert "Awaiting payment" not in listing
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_shipping_quote_updates_my_orders(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_order_cancelled_alert",
+        AsyncMock(return_value=True),
+    )
+    phone = "+919876543243"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-4444-L01",
+        payment_status="pending_shipping_quote",
+        status="pending_quote",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "last_order_ref": "ORD-20260618-4444",
+        "last_order_awaiting_shipping_quote": True,
+    }
+    reply, session = await run_order_agent("cancel", session, order_db)
+    assert "ORD-20260618-4444" in reply
+    assert "cancelled" in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-4444-L01").one()
+    assert row.payment_status == "cancelled"
+    listing, _ = await run_order_agent("my orders", session, order_db)
+    assert "Cancelled" in listing
+
+
+@pytest.mark.asyncio
+async def test_cancel_paid_order_is_refused(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    phone = "+919876543244"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-5555-L01",
+        payment_status="payment_received",
+        status="processing",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "last_order_ref": "ORD-20260618-5555",
+    }
+    reply, session = await run_order_agent("cancel order", session, order_db)
+    assert "can't be cancelled here" in reply.lower()
+    assert "speak" in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-5555-L01").one()
+    assert row.payment_status == "payment_received"
+    listing, _ = await run_order_agent("my orders", session, order_db)
+    assert "Paid / processing" in listing
+    assert "Cancelled" not in listing
+
+
+@pytest.mark.asyncio
+async def test_cancel_specific_ref_while_cart_open_keeps_cart(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_order_cancelled_alert",
+        AsyncMock(return_value=True),
+    )
+    phone = "+919876543245"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-6666-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "order_state": CART_MENU,
+        "order_cart": [
+            {
+                "sku": "PROD-1",
+                "product_name": "Metformin 500mg",
+                "quantity": 20,
+                "qty": 20,
+                "unit_price": 0.95,
+            }
+        ],
+    }
+    reply, session = await run_order_agent(
+        "cancel ORD-20260618-6666", session, order_db
+    )
+    assert "ORD-20260618-6666" in reply
+    assert session.get("order_state") == CART_MENU
+    assert len(session.get("order_cart") or []) == 1
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-6666-L01").one()
+    assert row.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_from_select_payment_cancels_placed_order(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_order_cancelled_alert",
+        AsyncMock(return_value=True),
+    )
+    phone = "+919876543246"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-7777-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "order_state": "SELECT_PAYMENT",
+        "last_order_ref": "ORD-20260618-7777",
+        "last_order_total": 95.0,
+    }
+    reply, session = await run_order_agent("cancel", session, order_db)
+    assert "ORD-20260618-7777" in reply
+    assert "cancelled" in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-7777-L01").one()
+    assert row.payment_status == "cancelled"
+    assert session.get("order_state") is None
+
+
+def test_post_payment_buttons_use_cancel_order_not_speak():
+    ids = [btn["id"] for btn in POST_PAYMENT_BUTTONS]
+    titles = [btn["title"] for btn in POST_PAYMENT_BUTTONS]
+    assert ids == ["new_order", "cancel_order", "order_status"]
+    assert "Cancel order" in titles
+    assert "Speak to Team" not in titles
+    assert len(POST_PAYMENT_BUTTONS) == 3
+
+
+def test_confirm_review_explains_cancel_clears_cart_only():
+    review = _format_order_review(
+        {
+            "order_cart": [
+                {
+                    "sku": "PROD-1",
+                    "product_name": "Metformin 500mg",
+                    "quantity": 10,
+                    "qty": 10,
+                    "unit_price": 0.95,
+                }
+            ],
+            "order_city": "Nairobi",
+            "order_country": "Kenya",
+            "order_contact": "Jane",
+        }
+    )
+    lowered = review.lower()
+    assert "confirm" in lowered
+    assert "clears your cart only" in lowered
+    assert "my orders" in lowered
+    assert "recheck your cart" in lowered
+    assert "cannot be modified" in lowered
+
+
+@pytest.mark.asyncio
+async def test_payment_details_include_no_modify_after_pay_disclaimer(monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.order.send_interactive_buttons",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.agents.order.get_static_payment_details_text",
+        lambda *args, **kwargs: "Wire details here",
+    )
+    session = {"phone": "+919876543260"}
+    reply, _ = await _handle_bank_transfer(
+        session, None, "ORD-20260618-1001", 95.0, "+919876543260"
+    )
+    assert "cannot be modified" in reply.lower()
+    assert "once payment is made" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_clear_cart_button_does_not_cancel_placed_order(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    phone = "+919876543247"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-8888-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "order_state": CART_MENU,
+        "order_cart": [
+            {
+                "sku": "PROD-1",
+                "product_name": "Metformin 500mg",
+                "quantity": 20,
+                "qty": 20,
+                "unit_price": 0.95,
+            }
+        ],
+    }
+    reply, session = await run_order_agent("clear_cart", session, order_db)
+    assert "cart cleared" in reply.lower()
+    assert "my orders" in reply.lower()
+    assert session.get("order_state") == "COLLECT_SKU"
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-8888-L01").one()
+    assert row.payment_status == "awaiting_payment"
+    assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_button_cancels_placed_order(order_db, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ORDER_AGENT_USE_LLM", "false")
+    monkeypatch.setattr(
+        "app.agents.order.send_order_cancelled_alert",
+        AsyncMock(return_value=True),
+    )
+    phone = "+919876543248"
+    _add_order_row(
+        order_db,
+        phone=phone,
+        order_ref="ORD-20260618-9999-L01",
+        payment_status="awaiting_payment",
+        status="pending",
+        created_at=datetime(2026, 6, 18, 10, 0, 0),
+    )
+    session = {
+        "phone": phone,
+        "lead_qualified": True,
+        "last_order_ref": "ORD-20260618-9999",
+        "last_order_total": 95.0,
+    }
+    reply, session = await run_order_agent("cancel_order", session, order_db)
+    assert "ORD-20260618-9999" in reply
+    assert "cancelled" in reply.lower()
+    assert "my orders" in reply.lower()
+    row = order_db.query(Order).filter(Order.order_ref == "ORD-20260618-9999-L01").one()
+    assert row.status == "cancelled"
+    assert row.payment_status == "cancelled"

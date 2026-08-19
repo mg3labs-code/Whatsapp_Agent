@@ -139,6 +139,20 @@ async def send_shipping_quote_alert(session: dict, *, order_ref: str = "") -> bo
     return await send_order_team_alert(message)
 
 
+async def send_order_cancelled_alert(order: dict) -> bool:
+    """Notify export desk that a buyer cancelled a placed / quote-pending order."""
+    order = order or {}
+    message = (
+        "❌ *ORDER CANCELLED*\n"
+        f"Ref: {order.get('order_ref', 'N/A')}\n"
+        f"Phone: {order.get('phone', 'N/A')}\n"
+        f"Contact: {order.get('contact_name', 'N/A')}\n"
+        f"Ship to: {order.get('city', '')}, {order.get('country', '')}\n"
+        "Do not process payment or shipment for this reference."
+    )
+    return await send_order_team_alert(message)
+
+
 async def send_order_alert(order: dict) -> bool:
     order = order or {}
     lines = order.get("lines")

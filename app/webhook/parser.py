@@ -9,8 +9,8 @@ Meta sends many webhook event types to the same endpoint:
 
 Only inbound user messages contain entry[].changes[].value.messages[].
 Anything else (status updates, template events, etc.) lacks the
-"messages" key and should be silently ignored — `parse_meta_payload`
-returns None in those cases so the webhook handler can drop them.
+"messages" key and should be silently ignored — parsers return empty/None
+so the webhook handler can drop them.
 """
 
 from __future__ import annotations
@@ -42,24 +42,51 @@ def _extract_message_text(message: dict) -> str | None:
     return None
 
 
-def parse_meta_payload(payload: dict) -> dict | None:
-    """Extract phone, text, message_id from a Meta Cloud API webhook payload.
-
-    Returns:
-        {"phone": str, "text": str, "message_id": str} for inbound text or
-        interactive button_reply / list_reply messages.
-        None for any non-message webhook (status updates, template events, etc.)
-        or malformed payloads. Callers should treat None as "ignore silently".
-    """
+def _message_timestamp(message: dict) -> int:
     try:
-        message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
-        text = _extract_message_text(message)
-        if not text:
-            return None
-        return {
-            "phone": message["from"],
-            "text": text,
-            "message_id": message["id"],
-        }
-    except (KeyError, IndexError, TypeError):
-        return None
+        return int(message.get("timestamp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_meta_messages(payload: dict) -> list[dict]:
+    """Extract every inbound text / interactive message in a Meta payload.
+
+    Returns items oldest-first by WhatsApp ``timestamp``, then ``message_id``.
+    Empty list for status-only, malformed, or unsupported payloads.
+    """
+    results: list[dict] = []
+    try:
+        for entry in payload.get("entry") or []:
+            for change in entry.get("changes") or []:
+                value = (change or {}).get("value") or {}
+                for message in value.get("messages") or []:
+                    if not isinstance(message, dict):
+                        continue
+                    text = _extract_message_text(message)
+                    phone = message.get("from")
+                    message_id = message.get("id")
+                    if not text or not phone or not message_id:
+                        continue
+                    results.append(
+                        {
+                            "phone": phone,
+                            "text": text,
+                            "message_id": message_id,
+                            "timestamp": _message_timestamp(message),
+                        }
+                    )
+    except (AttributeError, TypeError):
+        return []
+
+    results.sort(key=lambda item: (item["timestamp"], item["message_id"]))
+    return results
+
+
+def parse_meta_payload(payload: dict) -> dict | None:
+    """First (oldest) inbound message, or None if the payload has none.
+
+    Prefer ``parse_meta_messages`` when a payload may contain several messages.
+    """
+    items = parse_meta_messages(payload)
+    return items[0] if items else None

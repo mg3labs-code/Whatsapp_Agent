@@ -1,4 +1,7 @@
 from app.messages.session_flow import (
+    CANCEL_ORDER_BUTTON,
+    CART_ACTION_BUTTONS,
+    CLEAR_CART_BUTTON,
     clear_human_handoff,
     is_discount_request,
     is_order_cancel_request,
@@ -58,6 +61,12 @@ def test_clear_human_handoff():
 def test_is_order_cancel_request_phrases():
     assert is_order_cancel_request("cancel") is True
     assert is_order_cancel_request("order cancel") is True
+    assert is_order_cancel_request("cancel the order placed") is True
+    assert is_order_cancel_request("cancel my order") is True
+    assert is_order_cancel_request("cancel ORD-20260618-6666") is True
+    assert is_order_cancel_request("cancel_order") is True
+    assert is_order_cancel_request("Cancel order") is True
+    assert is_order_cancel_request("clear_cart") is False
     assert is_order_cancel_request("not needed cancel") is True
     assert is_order_cancel_request("I need new order") is False
     assert is_order_cancel_request("350") is False
@@ -68,8 +77,19 @@ def test_is_order_restart_request_phrases():
     assert is_order_restart_request("new order") is True
     assert is_order_restart_request("start over") is True
     assert is_order_restart_request("clear cart") is True
+    assert is_order_restart_request("clear_cart") is True
     assert is_order_restart_request("cancel") is False
+    assert is_order_restart_request("cancel_order") is False
     assert is_order_restart_request("350") is False
+
+
+def test_cart_and_cancel_buttons_are_separate():
+    ids = [btn["id"] for btn in CART_ACTION_BUTTONS]
+    titles = [btn["title"] for btn in CART_ACTION_BUTTONS]
+    assert CLEAR_CART_BUTTON in ids
+    assert "Clear cart" in titles
+    assert CANCEL_ORDER_BUTTON not in ids
+    assert len(CART_ACTION_BUTTONS) == 3
 
 
 def test_is_order_reset_request_union():

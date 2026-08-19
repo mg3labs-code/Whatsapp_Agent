@@ -32,6 +32,7 @@ from app.db.models import Order, Product
 from app.integrations.alerts import (
     send_escalation_alert,
     send_order_alert,
+    send_order_cancelled_alert,
     send_shipping_quote_alert,
 )
 from app.integrations.cashfree import get_static_payment_details_text
@@ -59,6 +60,7 @@ from app.messages.conversation_ui import (
     SESSION_SUPPRESS_NAV_FOOTER,
 )
 from app.messages.session_flow import (
+    CANCEL_ORDER_BUTTON,
     CART_ACTION_BUTTONS,
     CONFIRM_ORDER_BUTTONS,
     PRODUCT_CONFIRM_BUTTONS,
@@ -94,6 +96,45 @@ SELECT_PAYMENT = "SELECT_PAYMENT"
 PAYMENT_METHOD = "T/T Advance"
 ORDER_COMPLETE = "ORDER_COMPLETE"
 
+# In-progress cart / checkout — not yet a row in `orders`.
+UNCOMMITTED_ORDER_STATES = frozenset(
+    {
+        COLLECT_SKU,
+        COLLECT_SKU_CONFIRM,
+        COLLECT_QTY,
+        CART_MENU,
+        COLLECT_COUNTRY,
+        COLLECT_CITY,
+        COLLECT_CONTACT,
+        SHIPPING_CHOICE,
+        COLLECT_CHECKOUT,
+        CONFIRM_ORDER,
+    }
+)
+_CANCELLED_STATUSES = frozenset({"cancelled", "canceled"})
+_CANCELLABLE_PAYMENT_STATUSES = frozenset(
+    {
+        "awaiting_payment",
+        "pending",
+        "",
+        "pending_shipping_quote",
+    }
+)
+_PAID_OR_SHIPPED_PAYMENT = frozenset(
+    {
+        "payment_received",
+        "shipped",
+        "delivered",
+    }
+)
+_PAID_OR_SHIPPED_STATUS = frozenset(
+    {
+        "processing",
+        "shipped",
+        "delivered",
+    }
+)
+
 PAY_BANK_BUTTON = "pay_bank"
 PAYMENT_BUTTON_IDS = frozenset({PAY_BANK_BUTTON})
 
@@ -103,8 +144,8 @@ SHIPPING_BUTTON_IDS = frozenset({SHIP_EXPRESS_BUTTON, SHIP_NORMAL_BUTTON})
 
 POST_PAYMENT_BUTTONS = [
     {"id": "new_order", "title": "New Order"},
+    {"id": CANCEL_ORDER_BUTTON, "title": "Cancel order"},
     {"id": "order_status", "title": "Order Status"},
-    {"id": "speak", "title": "Speak to Team"},
 ]
 
 SANCTIONED_COUNTRY_REFUSAL = SHIPMENT_EXCLUDED_REFUSAL
@@ -915,7 +956,7 @@ async def _submit_pending_shipping_quote(
         "We've notified the export desk. They'll confirm shipping and the "
         "*full amount* for T/T Advance. "
         "Payment / wire details will be shared only after that total is ready.\n\n"
-        "Type *my orders* anytime to check status."
+        f"{_placed_order_buttons_hint(order_ref, quote=True)}"
     )
 
     _clear_order_session(session)
@@ -937,6 +978,19 @@ async def _submit_pending_shipping_quote(
             "Lead upsert after pending quote failed order_ref=%s",
             order_ref,
         )
+
+    if phone:
+        if len(buyer_reply) <= 1024:
+            await _send_post_payment_buttons(phone, buyer_reply)
+        else:
+            await send_message(phone, buyer_reply)
+            await _send_post_payment_buttons(
+                phone,
+                f"Request *{order_ref}* received.\n"
+                f"{_placed_order_buttons_hint(order_ref, quote=True)}",
+            )
+        session[SESSION_REPLY_ALREADY_SENT] = True
+        session[SESSION_SUPPRESS_NAV_FOOTER] = True
 
     return buyer_reply, session
 
@@ -1030,7 +1084,8 @@ async def _send_cart_action_buttons(phone: str) -> None:
     if phone:
         await send_interactive_buttons(
             phone,
-            "Ready when you are 👇",
+            "Checkout, add more, or *Clear cart* 👇\n"
+            "*Clear cart* empties this cart only — it does not cancel a placed order.",
             CART_ACTION_BUTTONS,
         )
 
@@ -1039,7 +1094,9 @@ async def _send_confirm_order_buttons(phone: str) -> None:
     if phone:
         await send_interactive_buttons(
             phone,
-            "Review your order and confirm 👇",
+            "Review your order and confirm 👇\n"
+            "Recheck cart before payment. Once paid, the order cannot be changed.\n"
+            "Type *cancel* to stop without placing (clears cart only).",
             CONFIRM_ORDER_BUTTONS,
         )
 
@@ -1057,27 +1114,271 @@ def _had_active_order(session: dict) -> bool:
     return bool(_get_cart(session) or session.get("order_state"))
 
 
-def _clear_order_flow_state(session: dict) -> None:
-    session.pop("last_order_ref", None)
-    session.pop("last_order_total", None)
-    session.pop("payment_method_chosen", None)
-    _clear_order_session(session)
+def _is_building_uncommitted_order(session: dict) -> bool:
+    """True while the buyer is still in cart/checkout (nothing placed yet)."""
+    state = session.get("order_state")
+    if state in UNCOMMITTED_ORDER_STATES:
+        return True
+    # Quote path may still have a cart before the draft is persisted.
+    if state == PENDING_SHIPPING_QUOTE and _get_cart(session):
+        return True
+    return False
 
 
-async def _cancel_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
-    """Exit ordering — clear cart/state and surface the main menu on send_reply."""
-    had_active = _had_active_order(session)
+def _base_order_ref(order_ref: str | None) -> str:
+    return (order_ref or "ORD-UNKNOWN").rsplit("-L", 1)[0]
+
+
+def _line_status_pair(order: Order) -> tuple[str, str]:
+    pay = (order.payment_status or "").strip().lower()
+    status = (order.status or "").strip().lower()
+    return pay, status
+
+
+def _is_line_cancelled(order: Order) -> bool:
+    pay, status = _line_status_pair(order)
+    return pay in _CANCELLED_STATUSES or status in _CANCELLED_STATUSES
+
+
+def _is_line_paid_or_shipped(order: Order) -> bool:
+    pay, status = _line_status_pair(order)
+    return pay in _PAID_OR_SHIPPED_PAYMENT or status in _PAID_OR_SHIPPED_STATUS
+
+
+def _is_line_cancellable(order: Order) -> bool:
+    if _is_line_cancelled(order) or _is_line_paid_or_shipped(order):
+        return False
+    pay, status = _line_status_pair(order)
+    if pay in _CANCELLABLE_PAYMENT_STATUSES:
+        return True
+    return status in {"pending", "pending_quote", ""}
+
+
+def _lines_are_cancellable(lines: list[Order]) -> bool:
+    return bool(lines) and all(_is_line_cancellable(line) for line in lines)
+
+
+def _lines_are_cancelled(lines: list[Order]) -> bool:
+    return bool(lines) and all(_is_line_cancelled(line) for line in lines)
+
+
+def _apply_cancelled_status(lines: list[Order], db: Session) -> None:
+    for line in lines:
+        line.status = "cancelled"
+        line.payment_status = "cancelled"
+    db.commit()
+
+
+def _forget_cancelled_session_ref(session: dict, base_ref: str) -> None:
+    if session.get("last_order_ref") == base_ref:
+        session.pop("last_order_ref", None)
+        session.pop("last_order_total", None)
+        session.pop("payment_method_chosen", None)
+        session.pop("last_order_awaiting_shipping_quote", None)
+        if session.get("order_state") == SELECT_PAYMENT:
+            session.pop("order_state", None)
+
+
+def _exit_cancel_session(session: dict) -> dict:
     _clear_order_flow_state(session)
     session = clear_conversation_counters(session)
     session[SESSION_SHOW_MAIN_MENU] = True
     session[SESSION_SUPPRESS_NAV_FOOTER] = True
-    if had_active:
+    return session
+
+
+async def _notify_order_cancelled(lines: list[Order], base_ref: str, phone: str) -> None:
+    primary = lines[0]
+    try:
+        await send_order_cancelled_alert(
+            {
+                "order_ref": base_ref,
+                "phone": phone or primary.phone,
+                "contact_name": primary.contact_name,
+                "city": primary.city,
+                "country": primary.country,
+            }
+        )
+    except Exception:
+        logger.exception("send_order_cancelled_alert failed order_ref=%s", base_ref)
+
+
+def _placed_cancel_reply(base_ref: str, lines: list[Order]) -> str:
+    pay = (lines[0].payment_status or "").strip().lower() if lines else ""
+    status = (lines[0].status or "").strip().lower() if lines else ""
+    if pay == "pending_shipping_quote" or status == "pending_quote":
         return (
-            "❌ Order cancelled.\n\n"
-            "Your cart was cleared. What would you like to do next?",
+            f"❌ Request *{base_ref}* cancelled.\n\n"
+            "The shipping-quote request is closed. "
+            "It now shows as *Cancelled* in *my orders*."
+        )
+    return (
+        f"❌ Order *{base_ref}* cancelled.\n\n"
+        "It now shows as *Cancelled* in *my orders*. "
+        "No payment is needed for this order."
+    )
+
+
+def _cannot_cancel_placed_reply(base_ref: str, lines: list[Order]) -> str:
+    if _lines_are_cancelled(lines):
+        return (
+            f"Order *{base_ref}* is already cancelled. "
+            "Type *my orders* to see your list."
+        )
+    return (
+        f"Order *{base_ref}* can't be cancelled here once payment is received "
+        "or the shipment is moving.\n\n"
+        "Type *speak* to reach the team."
+    )
+
+
+async def _cancel_placed_order_lines(
+    session: dict,
+    db: Session,
+    phone: str,
+    base_ref: str,
+    lines: list[Order],
+    *,
+    keep_cart: bool,
+) -> tuple[str, dict]:
+    if not lines:
+        reply = (
+            f"I couldn't find order *{base_ref}* for this number. "
+            "Type *my orders* to see your list."
+        )
+        if keep_cart:
+            return reply, session
+        return reply, _exit_cancel_session(session)
+
+    if not _lines_are_cancellable(lines):
+        reply = _cannot_cancel_placed_reply(base_ref, lines)
+        if keep_cart:
+            return reply, session
+        return reply, _exit_cancel_session(session)
+
+    # Snapshot quote vs paid wording before we overwrite statuses.
+    reply = _placed_cancel_reply(base_ref, lines)
+    _apply_cancelled_status(lines, db)
+    await _notify_order_cancelled(lines, base_ref, phone)
+    _forget_cancelled_session_ref(session, base_ref)
+    if keep_cart:
+        return reply, session
+    return reply, _exit_cancel_session(session)
+
+
+def _latest_cancellable_lines(
+    db: Session, phone: str, preferred_ref: str | None = None
+) -> tuple[str | None, list[Order]]:
+    if preferred_ref:
+        lines = _orders_for_base_ref(db, phone, preferred_ref)
+        if lines:
+            return _base_order_ref(preferred_ref), lines
+
+    variants = phone_lookup_variants(phone)
+    if not variants:
+        return None, []
+    rows = (
+        db.query(Order)
+        .filter(Order.phone.in_(variants))
+        .order_by(Order.created_at.desc(), Order.id.desc())
+        .all()
+    )
+    by_ref: dict[str, list[Order]] = {}
+    order_keys: list[str] = []
+    for row in rows:
+        base = _base_order_ref(row.order_ref)
+        if base not in by_ref:
+            order_keys.append(base)
+        by_ref.setdefault(base, []).append(row)
+
+    for base in order_keys:
+        lines = by_ref[base]
+        if _lines_are_cancellable(lines):
+            return base, lines
+    if order_keys:
+        latest = order_keys[0]
+        return latest, by_ref[latest]
+    return None, []
+
+
+def _clear_order_flow_state(session: dict) -> None:
+    session.pop("last_order_ref", None)
+    session.pop("last_order_total", None)
+    session.pop("payment_method_chosen", None)
+    session.pop("last_order_awaiting_shipping_quote", None)
+    _clear_order_session(session)
+
+
+async def _stop_uncommitted_order_flow(session: dict) -> tuple[str, dict]:
+    """Leave cart/checkout. Does not change placed orders in My Orders."""
+    had_cart = bool(_get_cart(session))
+    session = _exit_cancel_session(session)
+    if had_cart:
+        return (
+            "Stopped — your cart was cleared.\n\n"
+            "Nothing was placed, so *my orders* is unchanged. "
+            "This is not the same as *Cancel order* after payment.\n\n"
+            "What would you like to do next?",
             session,
         )
-    return "❌ Order cancelled.\n\nWhat would you like to do next?", session
+    return (
+        "Stopped.\n\n"
+        "Nothing was placed, so *my orders* is unchanged.\n\n"
+        "What would you like to do next?",
+        session,
+    )
+
+
+async def _cancel_order_flow(
+    session: dict,
+    phone: str = "",
+    db: Session | None = None,
+    message: str = "",
+) -> tuple[str, dict]:
+    """Cancel a placed order in the DB, or stop an in-progress cart.
+
+    - Cart / checkout (not yet placed): clear session only. Copy says stopped/cart cleared.
+    - Awaiting payment or pending shipping quote: mark cancelled so My Orders updates.
+    - Paid / shipped / delivered: do not cancel; send to the team.
+    """
+    requested_ref = _extract_order_status_ref(message) if message else None
+    building = _is_building_uncommitted_order(session)
+
+    if requested_ref and db is not None and phone:
+        lines = _orders_for_base_ref(db, phone, requested_ref)
+        return await _cancel_placed_order_lines(
+            session,
+            db,
+            phone,
+            _base_order_ref(requested_ref),
+            lines,
+            keep_cart=building,
+        )
+
+    if building:
+        return await _stop_uncommitted_order_flow(session)
+
+    if db is None or not phone:
+        session = _exit_cancel_session(session)
+        return (
+            "Nothing to cancel. Type *my orders* to check your orders, "
+            "or *new order* to start.",
+            session,
+        )
+
+    preferred = session.get("last_order_ref")
+    base_ref, lines = _latest_cancellable_lines(db, phone, preferred)
+    if not lines:
+        session = _exit_cancel_session(session)
+        return (
+            "Nothing to cancel. Type *my orders* to check your orders, "
+            "or *new order* to start.",
+            session,
+        )
+    return await _cancel_placed_order_lines(
+        session, db, phone, base_ref or _base_order_ref(lines[0].order_ref), lines,
+        keep_cart=False,
+    )
 
 
 async def _restart_order_flow(session: dict, phone: str = "") -> tuple[str, dict]:
@@ -1086,7 +1387,11 @@ async def _restart_order_flow(session: dict, phone: str = "") -> tuple[str, dict
     _clear_order_flow_state(session)
     session["order_state"] = COLLECT_SKU
     if had_active:
-        return f"🔄 Cart cleared — starting fresh.\n\n{BULK_LIST_PROMPT}", session
+        return (
+            "🔄 *Cart cleared* — starting fresh.\n"
+            "Placed orders in *my orders* are unchanged.\n\n"
+            f"{BULK_LIST_PROMPT}"
+        ), session
     return BULK_LIST_PROMPT, session
 
 
@@ -1118,7 +1423,11 @@ def _format_order_review(session: dict) -> str:
         f"Contact: {session.get('order_contact', '')}\n"
         f"Payment: {PAYMENT_METHOD}\n\n"
         f"{pending_note}"
-        "Tap *Confirm Order* or type *CONFIRM* to place the order."
+        "Please recheck your cart and shipping details before payment.\n"
+        "Once payment is made, the order cannot be modified.\n\n"
+        "Tap *Confirm Order* or type *CONFIRM* to place the order.\n"
+        "Type *cancel* to stop without placing — this clears your cart only "
+        "(*my orders* is unchanged)."
     )
 
 
@@ -1787,6 +2096,15 @@ async def _send_post_payment_buttons(phone: str, body: str) -> None:
         await send_interactive_buttons(phone, body, POST_PAYMENT_BUTTONS)
 
 
+def _placed_order_buttons_hint(order_ref: str, *, quote: bool = False) -> str:
+    kind = "request" if quote else "order"
+    return (
+        f"Tap *Cancel order* to cancel this {kind} *{order_ref}* "
+        f"(it will show as *Cancelled* in *my orders*). "
+        f"Tap *New Order* to start another cart — this {kind} stays until cancelled."
+    )
+
+
 def _order_payment_currency() -> str:
     """Cart totals and shipping in this agent are priced in USD."""
     return "USD"
@@ -1815,7 +2133,9 @@ async def _handle_bank_transfer(
     combined = (
         f"✅ *Order {order_ref} confirmed!*\n"
         f"Total: {_format_money(amount)}\n\n"
-        f"{instructions}"
+        f"{instructions}\n\n"
+        "Once payment is made, this order cannot be modified.\n\n"
+        f"{_placed_order_buttons_hint(order_ref)}"
     )
     if phone:
         # Interactive body max 1024; fall back to text + short button prompt if needed.
@@ -1825,7 +2145,8 @@ async def _handle_bank_transfer(
             await send_message(phone, combined)
             await _send_post_payment_buttons(
                 phone,
-                f"Order *{order_ref}* confirmed. Use the buttons below.",
+                f"Order *{order_ref}* confirmed.\n"
+                f"{_placed_order_buttons_hint(order_ref)}",
             )
         session[SESSION_REPLY_ALREADY_SENT] = True
         session[SESSION_SUPPRESS_NAV_FOOTER] = True
@@ -1879,7 +2200,8 @@ async def _try_payment_actions(
     message: str, session: dict, db: Session
 ) -> tuple[str, dict] | None:
     text = (message or "").strip().lower()
-    state = session.get("order_state")
+    if is_order_cancel_request(message) or is_order_restart_request(message):
+        return None
 
     if _is_payment_button_message(message, session):
         return await _handle_payment_selection(message, session, db)
@@ -1954,6 +2276,8 @@ def _order_ref_bucket(lines: list) -> str:
     primary = lines[0]
     pay = (primary.payment_status or "").strip().lower()
     order_st = (primary.status or "").strip().lower()
+    if pay in _CANCELLED_STATUSES or order_st in _CANCELLED_STATUSES:
+        return "cancelled"
     if pay in {"awaiting_payment", "pending", ""}:
         return "awaiting_payment"
     if order_st == "delivered" or pay == "delivered":
@@ -1971,6 +2295,7 @@ def _order_ref_status_label(bucket: str) -> str:
         "processing": "Paid / processing",
         "shipped": "Shipped",
         "delivered": "Delivered",
+        "cancelled": "Cancelled",
         "other": "In review",
     }
     return labels.get(bucket, bucket.replace("_", " ").title())
@@ -1983,6 +2308,7 @@ def _format_my_orders_summary(by_ref: dict[str, list], db: Session) -> str:
         ("processing", "🔄 *Paid / processing*"),
         ("shipped", "🚚 *Shipped*"),
         ("delivered", "✅ *Delivered*"),
+        ("cancelled", "❌ *Cancelled*"),
         ("other", "📋 *Other*"),
     )
     buckets: dict[str, list[str]] = {key: [] for key, _ in bucket_config}
@@ -2048,7 +2374,7 @@ async def _handle_order_lookup(
 
         by_ref: dict[str, list[Order]] = {}
         for row in rows:
-            base = (row.order_ref or "ORD-UNKNOWN").rsplit("-L", 1)[0]
+            base = _base_order_ref(row.order_ref)
             by_ref.setdefault(base, []).append(row)
 
         return _format_my_orders_summary(by_ref, db), session
@@ -2092,14 +2418,16 @@ async def _handle_order_lookup(
     return reply, session
 
 
-async def _handle_order_filler(session: dict, text: str) -> tuple[str, dict] | None:
+async def _handle_order_filler(
+    session: dict, text: str, db: Session | None = None
+) -> tuple[str, dict] | None:
     """Greetings mid-order should not be parsed as product names or quantities."""
     state = session.get("order_state")
     product = session.get("order_product_name") or ""
     phone = session.get("phone") or ""
 
     if is_order_cancel_request(text):
-        return await _cancel_order_flow(session, phone)
+        return await _cancel_order_flow(session, phone, db=db, message=text)
 
     if is_order_restart_request(text):
         return await _restart_order_flow(session, phone)
@@ -2108,22 +2436,34 @@ async def _handle_order_filler(session: dict, text: str) -> tuple[str, dict] | N
         return (
             f"Still adding *{product}*.\n\n"
             f"{product_qty_prompt(product)}\n\n"
-            "Or type *cancel* to stop, or *new order* to start over.",
+            "Tap *Clear cart* to empty this cart, or type *cancel* to stop "
+            "(neither cancels a placed order).",
             session,
         )
 
     if state in {COLLECT_SKU, COLLECT_SKU_CONFIRM, CART_MENU}:
         return (
             f"{BULK_LIST_PROMPT}\n\n"
-            "Or type *cancel* to stop, or *new order* to clear your cart and start fresh.",
+            "Tap *Clear cart* to empty this cart and start over. "
+            "Type *cancel* to stop. Neither changes *my orders*.",
             session,
         )
 
-    if state in {COLLECT_CHECKOUT, CONFIRM_ORDER, SELECT_PAYMENT}:
+    if state in {COLLECT_CHECKOUT, CONFIRM_ORDER}:
         return (
             "You have checkout in progress. "
-            "Reply with your details or *CONFIRM*, type *cancel* to stop, "
-            "or *new order* to start over.",
+            "Reply with your details or *CONFIRM* to place the order. "
+            "Type *cancel* to stop without placing (clears cart only). "
+            "Type *new order* to start over — *my orders* is unchanged.",
+            session,
+        )
+
+    if state == SELECT_PAYMENT:
+        return (
+            "You have an order awaiting payment. "
+            "Reply *wire transfer* for details. "
+            "Tap *Cancel order* to cancel this order in *my orders*. "
+            "Tap *New Order* to start another cart — this order stays until cancelled.",
             session,
         )
 
@@ -2140,6 +2480,11 @@ def _format_order_summary_for_status(
     payment_status = (order.payment_status or "").strip().lower()
     order_status = (order.status or "processing").strip().lower()
     lines = [f"📋 *Order {base_ref}*"]
+
+    if payment_status in _CANCELLED_STATUSES or order_status in _CANCELLED_STATUSES:
+        lines.append("Status: Cancelled")
+        lines.append(_status_message("cancelled"))
+        return "\n".join(lines)
 
     if payment_status in {
         "awaiting_payment",
@@ -2211,6 +2556,8 @@ def _status_message(status: str, eta: str = "") -> str:
         "processing": "Being prepared for shipment.",
         "shipped": f"On the way! Expected delivery: {eta or 'To be shared soon.'}",
         "delivered": "Delivered ✅",
+        "cancelled": "This order was cancelled.",
+        "canceled": "This order was cancelled.",
     }
     return mapping.get(status, "We are reviewing your order and will update you shortly.")
 
@@ -2585,7 +2932,7 @@ async def _handle_product_add_message(
     if _is_order_status_query(text) or _is_order_account_query(text):
         return await _handle_order_lookup(message, session, db)
     if _is_filler_message(text):
-        filler = await _handle_order_filler(session, text)
+        filler = await _handle_order_filler(session, text, db)
         if filler:
             return filler
     if not text or (not in_cart and any(m in text.lower() for m in _ORDER_INTENT_MARKERS)):
@@ -2634,7 +2981,7 @@ async def _run_order_rules(
     text = (message or "").strip()
     phone = session.get("phone") or ""
     if is_order_cancel_request(text):
-        return await _cancel_order_flow(session, phone)
+        return await _cancel_order_flow(session, phone, db=db, message=text)
 
     if is_order_restart_request(text):
         return await _restart_order_flow(session, phone)
@@ -2701,11 +3048,11 @@ async def _run_order_rules(
 
     if state == COLLECT_QTY:
         if is_order_cancel_request(text):
-            return await _cancel_order_flow(session, phone)
+            return await _cancel_order_flow(session, phone, db=db, message=text)
         if is_order_restart_request(text):
             return await _restart_order_flow(session, phone)
         if _is_filler_message(text):
-            filler = await _handle_order_filler(session, text)
+            filler = await _handle_order_filler(session, text, db)
             if filler:
                 return filler
 
@@ -2922,6 +3269,7 @@ async def _run_order_rules(
             return _format_order_review(session), session
         return (
             "Tap *Confirm Order* or type *CONFIRM*. "
+            "Please recheck your cart before payment — once paid, the order cannot be changed. "
             "Tap *Edit Cart* to change items, or *Edit Details* to fix name/city."
         ), session
 
@@ -2944,7 +3292,7 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
         return payment_result
 
     if is_order_cancel_request(text):
-        return await _cancel_order_flow(session, phone)
+        return await _cancel_order_flow(session, phone, db=db, message=text)
 
     if is_order_restart_request(text):
         return await _restart_order_flow(session, phone)
@@ -2953,7 +3301,7 @@ async def run_order_agent(message: str, session: dict, db: Session) -> tuple[str
     if _is_order_status_query(text) or _is_order_account_query(text):
         return await _handle_order_lookup(message, session, db)
 
-    filler_result = await _handle_order_filler(session, text) if _is_filler_message(text) else None
+    filler_result = await _handle_order_filler(session, text, db) if _is_filler_message(text) else None
     if filler_result:
         return filler_result
 

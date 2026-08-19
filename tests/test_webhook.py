@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.orchestrator import graph as orchestrator_graph
 from app.session import manager as session_manager
 from app.webhook import router as webhook_router_module
-from app.webhook.parser import parse_meta_payload
+from app.webhook.parser import parse_meta_messages, parse_meta_payload
 from app.webhook.router import webhook_router
 
 
@@ -192,6 +192,44 @@ def test_parse_malformed_payload_returns_none():
     assert parse_meta_payload({"entry": [{"changes": []}]}) is None
 
 
+def test_parse_meta_messages_orders_by_timestamp():
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "messages": [
+                                {
+                                    "from": "919876543210",
+                                    "id": "wamid.SECOND",
+                                    "timestamp": "1715500002",
+                                    "text": {"body": "100"},
+                                    "type": "text",
+                                },
+                                {
+                                    "from": "919876543210",
+                                    "id": "wamid.FIRST",
+                                    "timestamp": "1715500001",
+                                    "text": {"body": "Metformin 500mg"},
+                                    "type": "text",
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        ],
+    }
+    items = parse_meta_messages(payload)
+    assert [item["text"] for item in items] == ["Metformin 500mg", "100"]
+    assert [item["message_id"] for item in items] == ["wamid.FIRST", "wamid.SECOND"]
+    first = parse_meta_payload(payload)
+    assert first is not None
+    assert first["message_id"] == "wamid.FIRST"
+
+
 def _build_test_app() -> FastAPI:
     """Minimal app with only the webhook router — no DB startup event."""
     app = FastAPI()
@@ -199,8 +237,8 @@ def _build_test_app() -> FastAPI:
     return app
 
 
-def _patch_redis_and_orchestrator(monkeypatch) -> AsyncMock:
-    """Shared setup: fake redis + mocked orchestrator. Returns the ainvoke mock."""
+def _patch_redis_and_orchestrator(monkeypatch) -> tuple[AsyncMock, object]:
+    """Shared setup: fake redis + mocked orchestrator. Returns (ainvoke mock, redis)."""
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(session_manager, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(webhook_router_module, "_get_redis_client", lambda: fake_redis)
@@ -219,7 +257,7 @@ def _patch_redis_and_orchestrator(monkeypatch) -> AsyncMock:
 
     mock_invoke = AsyncMock(return_value={})
     monkeypatch.setattr(orchestrator_graph.compiled_graph, "ainvoke", mock_invoke)
-    return mock_invoke
+    return mock_invoke, fake_redis
 
 
 def test_get_webhook_verify_succeeds_with_correct_token(monkeypatch):
@@ -283,7 +321,7 @@ def test_post_webhook_invalid_json_returns_200(monkeypatch):
 
 
 def test_dedup_drops_duplicate(monkeypatch):
-    mock_invoke = _patch_redis_and_orchestrator(monkeypatch)
+    mock_invoke, _redis = _patch_redis_and_orchestrator(monkeypatch)
     client = TestClient(_build_test_app())
 
     r1 = client.post("/webhook", json=META_TEXT_MESSAGE_PAYLOAD)
@@ -292,6 +330,67 @@ def test_dedup_drops_duplicate(monkeypatch):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert mock_invoke.call_count == 1
+
+
+def test_batched_messages_processed_oldest_first(monkeypatch):
+    mock_invoke, _redis = _patch_redis_and_orchestrator(monkeypatch)
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "messages": [
+                                {
+                                    "from": "919876543210",
+                                    "id": "wamid.LATER",
+                                    "timestamp": "1715500099",
+                                    "text": {"body": "checkout"},
+                                    "type": "text",
+                                },
+                                {
+                                    "from": "919876543210",
+                                    "id": "wamid.EARLIER",
+                                    "timestamp": "1715500001",
+                                    "text": {"body": "Metformin 500mg - 100"},
+                                    "type": "text",
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        ],
+    }
+    client = TestClient(_build_test_app())
+    response = client.post("/webhook", json=payload)
+    assert response.status_code == 200
+    assert mock_invoke.call_count == 2
+    texts = [call.args[0]["message"] for call in mock_invoke.call_args_list]
+    assert texts == ["Metformin 500mg - 100", "checkout"]
+
+
+def test_lock_busy_queues_then_drains(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(webhook_router_module, "LOCK_RETRY_COUNT", 1)
+    monkeypatch.setattr(webhook_router_module, "LOCK_RETRY_DELAY_SECONDS", 0)
+    mock_invoke, fake_redis = _patch_redis_and_orchestrator(monkeypatch)
+    phone = "919876543210"
+    asyncio.run(fake_redis.set(f"wasa:lock:{phone}", "1"))
+
+    client = TestClient(_build_test_app())
+    response = client.post("/webhook", json=META_TEXT_MESSAGE_PAYLOAD)
+    assert response.status_code == 200
+    assert mock_invoke.call_count == 0
+    queued = asyncio.run(fake_redis.llen(f"wasa:inbox:{phone}"))
+    assert queued == 1
+
+    asyncio.run(fake_redis.delete(f"wasa:lock:{phone}"))
+    asyncio.run(webhook_router_module._drain_phone_inbox(phone, fake_redis))
+    assert mock_invoke.call_count == 1
+    assert mock_invoke.call_args.args[0]["message_id"] == "wamid.TEST_MSG_ID_123"
 
 
 def test_post_webhook_rejects_unsigned_payload(monkeypatch):
