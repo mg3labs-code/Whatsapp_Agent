@@ -283,9 +283,13 @@ async def test_send_reply_node_shows_main_menu_after_order_cancel(monkeypatch):
             "intent": "order",
             "agent_response": None,
             "guardrail_blocked": False,
-            "final_reply": "❌ Order cancelled.\n\nWhat would you like to do next?",
+            "final_reply": (
+                "Stopped — your cart was cleared.\n\n"
+                "What would you like to do next?"
+            ),
         }
     )
 
-    assert "order cancelled" in sent[0].lower()
+    assert "stopped" in sent[0].lower()
+    assert "cart was cleared" in sent[0].lower()
     assert menus == ["91999"]

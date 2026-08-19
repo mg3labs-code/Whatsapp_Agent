@@ -34,17 +34,25 @@ RESUME_AFTER_HANDOFF_IDS = frozenset(
     }
 ) | GREETING_IDS
 
+CLEAR_CART_BUTTON = "clear_cart"
+CANCEL_ORDER_BUTTON = "cancel_order"
+
 ORDER_CANCEL_IDS = frozenset(
     {
         "cancel",
         "stop",
         "abort",
+        CANCEL_ORDER_BUTTON,
     }
 )
 
 ORDER_CANCEL_PHRASES = (
+    "cancel the order",
+    "cancel my order",
+    "cancel this order",
     "cancel order",
     "order cancel",
+    "please cancel",
     "not needed",
     "don't need",
     "do not need",
@@ -55,6 +63,7 @@ ORDER_RESTART_IDS = frozenset(
     {
         "new_order",
         "clear",
+        CLEAR_CART_BUTTON,
         "reset",
         "start_over",
     }
@@ -102,6 +111,7 @@ SPEAK_TO_TEAM_KEYWORDS = (
 CART_ACTION_BUTTONS = [
     {"id": "checkout", "title": "Checkout"},
     {"id": "add", "title": "Add More"},
+    {"id": CLEAR_CART_BUTTON, "title": "Clear cart"},
 ]
 
 CONFIRM_ORDER_BUTTONS = [
@@ -250,7 +260,7 @@ def _normalized_message_key(message: str) -> str:
 
 
 def is_order_cancel_request(message: str) -> bool:
-    """Buyer wants to leave the order flow (cart cleared, show main menu)."""
+    """Stop an in-progress cart, or cancel a placed / quote-pending order."""
     key = _normalized_message_key(message)
     if not key:
         return False
@@ -258,11 +268,14 @@ def is_order_cancel_request(message: str) -> bool:
         return True
     if key.replace(" ", "_") in ORDER_CANCEL_IDS:
         return True
+    # "cancel ORD-…" / "cancel this order please"
+    if key.startswith("cancel ") or key.startswith("cancel_"):
+        return True
     return any(phrase in key for phrase in ORDER_CANCEL_PHRASES)
 
 
 def is_order_restart_request(message: str) -> bool:
-    """Buyer wants to clear the cart and start ordering again."""
+    """Clear the current cart and start ordering again (does not cancel placed orders)."""
     key = _normalized_message_key(message)
     if not key:
         return False

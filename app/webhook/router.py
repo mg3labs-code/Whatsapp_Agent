@@ -14,12 +14,14 @@ from app.orchestrator.graph import compiled_graph
 from app.session.manager import _get_redis_client, get_session, save_session
 from app.utils.security import user_ref
 from app.utils.tracing import flush_langfuse, message_trace_context
-from app.webhook.parser import parse_meta_payload
+from app.webhook.parser import parse_meta_messages
 
 DEDUP_TTL_SECONDS = 86400
 LOCK_TTL_SECONDS = 30
 LOCK_RETRY_COUNT = 10
 LOCK_RETRY_DELAY_SECONDS = 0.1
+INBOX_TTL_SECONDS = 600
+INBOX_DRAIN_MAX_PASSES = 50
 
 logger = logging.getLogger(__name__)
 
@@ -165,31 +167,85 @@ async def _is_duplicate(message_id: str, client) -> bool:
         return False
 
 
-async def process_message(payload: dict) -> None:
-    """Background pipeline for a single inbound webhook payload."""
+def _inbox_key(phone: str) -> str:
+    return f"wasa:inbox:{phone}"
+
+
+def _lock_key(phone: str) -> str:
+    return f"wasa:lock:{phone}"
+
+
+async def _enqueue_inbound(client, phone: str, parsed: dict) -> bool:
+    """Push one inbound message onto the per-phone FIFO. False if Redis fails."""
     try:
-        parsed = parse_meta_payload(payload)
-        if parsed is None:
-            return
+        await client.rpush(
+            _inbox_key(phone),
+            json.dumps(
+                {
+                    "phone": phone,
+                    "text": parsed["text"],
+                    "message_id": parsed["message_id"],
+                    "timestamp": parsed.get("timestamp") or 0,
+                }
+            ),
+        )
+        await client.expire(_inbox_key(phone), INBOX_TTL_SECONDS)
+        return True
+    except Exception:
+        logger.exception(
+            "Inbox enqueue failed user_ref=%s message_id=%s",
+            user_ref(phone),
+            parsed.get("message_id"),
+        )
+        return False
 
-        from app.session.manager import normalize_phone
 
-        phone = normalize_phone(parsed["phone"])
-        text = parsed["text"]
-        message_id = parsed["message_id"]
+async def _handle_inbound(parsed: dict) -> None:
+    """Run the orchestrator for one already-dequeued inbound message."""
+    from app.utils.request_context import set_request_id
+    from app.utils.tracing import hash_user_id
 
-        from app.utils.request_context import set_request_id
-        from app.utils.tracing import hash_user_id
+    phone = parsed["phone"]
+    text = parsed["text"]
+    message_id = parsed["message_id"]
+    set_request_id(hash_user_id(phone), message_id)
 
-        set_request_id(hash_user_id(phone), message_id)
+    session = await get_session(phone)
+    state = {
+        "phone": phone,
+        "message": text,
+        "message_id": message_id,
+        "session": session,
+        "intent": None,
+        "agent_response": None,
+        "guardrail_blocked": False,
+        "final_reply": None,
+    }
+    with message_trace_context(
+        trace_name="whatsapp_message",
+        phone=phone,
+        message_id=message_id,
+        feature="orchestrator",
+    ):
+        result = await compiled_graph.ainvoke(state)
+    updated = (result or {}).get("session")
+    if updated:
+        try:
+            await save_session(phone, updated)
+        except Exception:
+            logger.exception(
+                "Backup session save failed user_ref=%s message_id=%s",
+                user_ref(phone),
+                message_id,
+            )
 
-        client = _get_redis_client()
 
-        if await _is_duplicate(message_id, client):
-            logger.info("Dropping duplicate message_id=%s", message_id)
-            return
+async def _drain_phone_inbox(phone: str, client) -> None:
+    """Process queued messages for one phone FIFO. Never skip leftovers after unlock."""
+    lock_key = _lock_key(phone)
+    inbox_key = _inbox_key(phone)
 
-        lock_key = f"wasa:lock:{phone}"
+    for _pass in range(INBOX_DRAIN_MAX_PASSES):
         acquired = False
         for _ in range(LOCK_RETRY_COUNT):
             acquired = await client.set(lock_key, "1", ex=LOCK_TTL_SECONDS, nx=True)
@@ -198,46 +254,86 @@ async def process_message(payload: dict) -> None:
             await asyncio.sleep(LOCK_RETRY_DELAY_SECONDS)
 
         if not acquired:
-            logger.warning(
-                "Could not acquire lock for phone; skipping message_id=%s",
-                message_id,
+            logger.info(
+                "Phone lock busy; inbound stays queued user_ref=%s",
+                user_ref(phone),
             )
             return
 
         try:
-            session = await get_session(phone)
-
-            state = {
-                "phone": phone,
-                "message": text,
-                "message_id": message_id,
-                "session": session,
-                "intent": None,
-                "agent_response": None,
-                "guardrail_blocked": False,
-                "final_reply": None,
-            }
-
-            with message_trace_context(
-                trace_name="whatsapp_message",
-                phone=phone,
-                message_id=message_id,
-                feature="orchestrator",
-            ):
-                result = await compiled_graph.ainvoke(state)
-            updated = (result or {}).get("session")
-            if updated:
+            while True:
+                raw = await client.lpop(inbox_key)
+                if raw is None:
+                    break
                 try:
-                    await save_session(phone, updated)
+                    parsed = json.loads(raw)
+                except Exception:
+                    logger.exception("Corrupt inbox item user_ref=%s", user_ref(phone))
+                    continue
+                try:
+                    await _handle_inbound(parsed)
                 except Exception:
                     logger.exception(
-                        "Backup session save failed user_ref=%s message_id=%s",
+                        "Inbound handle failed user_ref=%s message_id=%s",
                         user_ref(phone),
-                        message_id,
+                        (parsed or {}).get("message_id"),
                     )
         finally:
             await client.delete(lock_key)
+
+        leftover = 0
+        try:
+            leftover = int(await client.llen(inbox_key) or 0)
+        except Exception:
+            logger.exception("Inbox llen failed user_ref=%s", user_ref(phone))
+        if leftover <= 0:
+            return
+
+    logger.warning("Inbox drain hit pass cap user_ref=%s", user_ref(phone))
+
+
+async def process_message(payload: dict) -> None:
+    """Background pipeline for one inbound webhook payload (possibly many messages)."""
+    try:
+        parsed_list = parse_meta_messages(payload)
+        if not parsed_list:
+            return
+
+        from app.session.manager import normalize_phone
+
+        client = _get_redis_client()
+        phones: list[str] = []
+        seen_phones: set[str] = set()
+
+        for parsed in parsed_list:
+            phone = normalize_phone(parsed["phone"])
+            parsed = {**parsed, "phone": phone}
+            message_id = parsed["message_id"]
+
+            if await _is_duplicate(message_id, client):
+                logger.info("Dropping duplicate message_id=%s", message_id)
+                continue
+
+            queued = await _enqueue_inbound(client, phone, parsed)
+            if not queued:
+                try:
+                    await _handle_inbound(parsed)
+                except Exception:
+                    logger.exception(
+                        "Inline inbound handle failed user_ref=%s message_id=%s",
+                        user_ref(phone),
+                        message_id,
+                    )
+                continue
+
+            if phone not in seen_phones:
+                seen_phones.add(phone)
+                phones.append(phone)
+
+        for phone in phones:
+            await _drain_phone_inbox(phone, client)
     except Exception:
         logger.exception("process_message failed")
     finally:
         flush_langfuse()
+
